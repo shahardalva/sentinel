@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
@@ -115,13 +116,12 @@ func TestNew_ConnectionPool(t *testing.T) {
 }
 
 func TestAllowResponseHeader(t *testing.T) {
-	p := New(Config{})
 	allowed := []string{
 		"Content-Type", "content-type", "Retry-After", "Request-Id", "X-Should-Retry",
 		"anthropic-ratelimit-requests-limit", "Anthropic-Ratelimit-Tokens-Reset",
 	}
 	for _, h := range allowed {
-		if !p.AllowResponseHeader(h) {
+		if !allowResponseHeader(h) {
 			t.Errorf("%s dropped, want allowed", h)
 		}
 	}
@@ -130,8 +130,65 @@ func TestAllowResponseHeader(t *testing.T) {
 		"Connection", "Transfer-Encoding", "Content-Length", "X-Request-Id",
 	}
 	for _, h := range denied {
-		if p.AllowResponseHeader(h) {
+		if allowResponseHeader(h) {
 			t.Errorf("%s allowed, want dropped", h)
 		}
+	}
+}
+
+func TestForward_Response(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-Id", "req_up_1")
+		w.Header().Set("Retry-After", "3")
+		w.Header().Set("Anthropic-Organization-Id", "org-secret")
+		w.Header().Set("Set-Cookie", "__cf_bm=abc")
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, "body")
+	}))
+	defer upstream.Close()
+
+	resp, err := New(Config{BaseURL: upstream.URL}).Forward(t.Context(), &proxy.Request{Header: http.Header{}})
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Status != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", resp.Status)
+	}
+	if resp.RequestID != "req_up_1" {
+		t.Errorf("RequestID = %q, want req_up_1", resp.RequestID)
+	}
+	if resp.Header.Get("Retry-After") != "3" {
+		t.Error("allowed header Retry-After dropped")
+	}
+	for _, k := range []string{"Anthropic-Organization-Id", "Set-Cookie", "Date"} {
+		if v := resp.Header.Get(k); v != "" {
+			t.Errorf("header %s returned: %q", k, v)
+		}
+	}
+	if b, _ := io.ReadAll(resp.Body); string(b) != "body" {
+		t.Errorf("body = %q", b)
+	}
+}
+
+func TestForward_RejectsInvalidVersion(t *testing.T) {
+	var called atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+	}))
+	defer upstream.Close()
+	p := New(Config{BaseURL: upstream.URL})
+
+	for _, v := range []string{"latest", "2023-6-1", "2023-13-01", "2023-06-01x", "2023-06-01\x00"} {
+		h := http.Header{}
+		h["Anthropic-Version"] = []string{v}
+		_, err := p.Forward(t.Context(), &proxy.Request{Header: h})
+		if _, ok := errors.AsType[*proxy.RequestError](err); !ok {
+			t.Errorf("version %q: err = %v, want *proxy.RequestError", v, err)
+		}
+	}
+	if called.Load() {
+		t.Error("upstream called for an invalid version")
 	}
 }

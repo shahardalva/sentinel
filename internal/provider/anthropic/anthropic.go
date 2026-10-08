@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
@@ -55,15 +56,19 @@ func (p *Provider) Name() string { return "anthropic" }
 
 // Forward sends the body to the Messages API. Only anthropic-version and
 // anthropic-beta are taken from the client; credentials always come from the
-// gateway's config.
-func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*http.Response, error) {
-	up, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(req.Body))
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: build request: %w", err)
-	}
+// gateway's config. Only allowlisted response headers are returned.
+func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Response, error) {
 	version := req.Header.Get("Anthropic-Version")
 	if version == "" {
 		version = DefaultVersion
+	}
+	if !validVersion(version) {
+		return nil, &proxy.RequestError{Message: "anthropic-version must be a date in YYYY-MM-DD form"}
+	}
+
+	up, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(req.Body))
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: build request: %w", err)
 	}
 	up.Header.Set("Content-Type", "application/json")
 	up.Header.Set("X-Api-Key", p.apiKey)
@@ -75,13 +80,31 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*http.Respo
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: forward: %w", err)
 	}
-	return resp, nil
+
+	header := make(http.Header)
+	for k, vv := range resp.Header {
+		if allowResponseHeader(k) {
+			header[k] = vv
+		}
+	}
+	return &proxy.Response{
+		Status:    resp.StatusCode,
+		Header:    header,
+		Body:      resp.Body,
+		RequestID: resp.Header.Get("Request-Id"),
+	}, nil
 }
 
-// AllowResponseHeader reports whether an upstream response header may reach
+// validVersion reports whether v is an API version date like 2023-06-01.
+func validVersion(v string) bool {
+	_, err := time.Parse(time.DateOnly, v)
+	return err == nil
+}
+
+// allowResponseHeader reports whether an upstream response header may reach
 // the client. Everything else (organization ID, cookies, CDN headers) is
 // dropped.
-func (p *Provider) AllowResponseHeader(name string) bool {
+func allowResponseHeader(name string) bool {
 	name = http.CanonicalHeaderKey(name)
 	switch name {
 	case "Content-Type", "Retry-After", "Request-Id", "X-Should-Retry":

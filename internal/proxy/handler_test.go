@@ -538,43 +538,86 @@ func TestHandler_FiltersResponseHeaders(t *testing.T) {
 
 // stubProvider shows the handler depends only on the Provider interface.
 type stubProvider struct {
-	resp  *http.Response
-	allow func(string) bool
+	resp *proxy.Response
+	err  error
 }
 
 func (s stubProvider) Name() string { return "stub" }
-func (s stubProvider) Forward(context.Context, *proxy.Request) (*http.Response, error) {
-	return s.resp, nil
+func (s stubProvider) Forward(context.Context, *proxy.Request) (*proxy.Response, error) {
+	return s.resp, s.err
 }
-func (s stubProvider) AllowResponseHeader(name string) bool { return s.allow(name) }
 
-func TestHandler_UsesProviderHeaderAllowlist(t *testing.T) {
-	h := http.Header{}
-	h.Set("X-Kept", "yes")
-	h.Set("X-Dropped", "no")
-	h.Set("X-Request-Id", "spoofed")
-	p := stubProvider{
-		resp: &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     h,
-			Body:       io.NopCloser(strings.NewReader("ok")),
-		},
-		// Even a provider that allows X-Request-Id can't override the gateway's.
-		allow: func(name string) bool { return name == "X-Kept" || name == "X-Request-Id" },
-	}
-	handler := proxy.NewHandler(p, slog.New(slog.DiscardHandler), proxy.Options{})
-
+func serveStub(t *testing.T, p stubProvider) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	var logs bytes.Buffer
+	handler := proxy.NewHandler(p, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}")))
+	return rec, logLine(t, &logs)
+}
 
+func TestHandler_UsesProviderResponse(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Kept", "yes")
+	h.Set("X-Request-Id", "spoofed")
+	rec, line := serveStub(t, stubProvider{resp: &proxy.Response{
+		Status:    http.StatusAccepted,
+		Header:    h,
+		Body:      io.NopCloser(strings.NewReader("ok")),
+		RequestID: "up-123",
+	}})
+
+	if rec.Code != http.StatusAccepted || rec.Body.String() != "ok" {
+		t.Errorf("response = %d %q, want 202 \"ok\"", rec.Code, rec.Body.String())
+	}
 	if rec.Header().Get("X-Kept") != "yes" {
-		t.Error("allowed header dropped")
+		t.Error("provider header dropped")
 	}
-	if v := rec.Header().Get("X-Dropped"); v != "" {
-		t.Errorf("disallowed header forwarded: %q", v)
-	}
+	// Even a provider that returns X-Request-Id can't override the gateway's.
 	if v := rec.Header().Values("X-Request-Id"); len(v) != 1 || v[0] == "spoofed" {
 		t.Errorf("X-Request-Id = %v, want gateway-generated id", v)
+	}
+	if line["upstream_request_id"] != "up-123" {
+		t.Errorf("log upstream_request_id = %v, want up-123", line["upstream_request_id"])
+	}
+}
+
+func TestHandler_ProviderRejectsRequest(t *testing.T) {
+	rec, line := serveStub(t, stubProvider{err: &proxy.RequestError{Message: "bad version"}})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "invalid_request_error" {
+		t.Errorf("error type = %q", typ)
+	}
+	if !strings.Contains(rec.Body.String(), "bad version") {
+		t.Errorf("body = %q, want the provider's message", rec.Body.String())
+	}
+	if line["level"] != "WARN" {
+		t.Errorf("log level = %v, want WARN", line["level"])
+	}
+}
+
+func TestGateway_InvalidAnthropicVersion(t *testing.T) {
+	var called atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("X-Api-Key", gatewayKey)
+	req.Header.Set("Anthropic-Version", "latest")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if called.Load() {
+		t.Error("upstream called for an invalid version")
 	}
 }
 

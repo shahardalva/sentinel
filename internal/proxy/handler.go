@@ -21,10 +21,9 @@ import (
 // which upstream response headers are passed back.
 type Provider interface {
 	Name() string
-	Forward(ctx context.Context, req *Request) (*http.Response, error)
-	// AllowResponseHeader reports whether an upstream response header may be
-	// sent to the client. It must reject hop-by-hop headers.
-	AllowResponseHeader(name string) bool
+	// Forward sends req upstream. It returns a *RequestError to reject the
+	// client's request without contacting upstream.
+	Forward(ctx context.Context, req *Request) (*Response, error)
 }
 
 // Request is a client request as handed to a Provider.
@@ -32,6 +31,25 @@ type Request struct {
 	Body   []byte
 	Header http.Header // client headers, untrusted
 }
+
+// Response is an upstream response as handed back by a Provider.
+type Response struct {
+	Status int
+	// Header holds only headers safe to send to the client; the Provider has
+	// already dropped hop-by-hop and internal ones.
+	Header http.Header
+	Body   io.ReadCloser
+	// RequestID is the upstream's ID for this request, for the log. May be empty.
+	RequestID string
+}
+
+// RequestError rejects a client request as invalid. The handler answers it
+// with a 400 carrying Message, so Message must be safe to show the client.
+type RequestError struct {
+	Message string
+}
+
+func (e *RequestError) Error() string { return e.Message }
 
 const (
 	// A non-streaming request sends no headers until generation finishes, so
@@ -195,7 +213,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ttfbDur = time.Since(upStart)
 	if err != nil {
 		failure = err
+		reqErr, invalid := errors.AsType[*RequestError](err)
 		switch {
+		case invalid:
+			status = http.StatusBadRequest
+			writeError(w, status, "invalid_request_error", reqErr.Message)
 		case r.Context().Err() != nil:
 			status = 499 // client closed request; nobody to answer
 		case errors.Is(context.Cause(ctx), errHeaderTimeout):
@@ -210,14 +232,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	upstreamID = resp.Header.Get("Request-Id")
+	upstreamID = resp.RequestID
 	for k, vv := range resp.Header {
-		if h.provider.AllowResponseHeader(k) {
-			w.Header()[k] = append(w.Header()[k], vv...)
-		}
+		w.Header()[k] = append(w.Header()[k], vv...)
 	}
-	w.Header().Set("X-Request-Id", reqID)
-	status = resp.StatusCode
+	w.Header().Set("X-Request-Id", reqID) // always the gateway's own
+	status = resp.Status
 	w.WriteHeader(status)
 
 	phase = phaseStream
