@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -39,6 +40,9 @@ const (
 	DefaultIdleTimeout   = 60 * time.Second
 	DefaultBodyTimeout   = 2 * time.Minute
 	DefaultMaxBodyBytes  = 32 << 20 // Anthropic's request size limit
+	// Bounds buffered request bodies to MaxConcurrent × MaxBodyBytes (4 GiB
+	// with the defaults). Lower either for a smaller deployment.
+	DefaultMaxConcurrent = 128
 
 	maxLoggedModel = 128 // bytes; the model field is client-controlled
 )
@@ -59,6 +63,8 @@ type Options struct {
 	// BodyTimeout bounds reading the client's request body.
 	BodyTimeout  time.Duration
 	MaxBodyBytes int64
+	// MaxConcurrent caps requests in flight; requests beyond it get a 503.
+	MaxConcurrent int
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
@@ -69,6 +75,7 @@ type Handler struct {
 	idleTimeout   time.Duration
 	bodyTimeout   time.Duration
 	maxBody       int64
+	slots         chan struct{} // counting semaphore of MaxConcurrent
 }
 
 func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
@@ -84,6 +91,9 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = DefaultMaxBodyBytes
 	}
+	if opts.MaxConcurrent <= 0 {
+		opts.MaxConcurrent = DefaultMaxConcurrent
+	}
 	return &Handler{
 		provider:      p,
 		logger:        logger,
@@ -91,6 +101,7 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 		idleTimeout:   opts.IdleTimeout,
 		bodyTimeout:   opts.BodyTimeout,
 		maxBody:       opts.MaxBodyBytes,
+		slots:         make(chan struct{}, opts.MaxConcurrent),
 	}
 }
 
@@ -98,6 +109,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := rand.Text()
 	w.Header().Set("X-Request-Id", reqID)
+
+	// Shed load rather than queue: a queued request still holds its
+	// connection, and waiting only moves the memory pressure elsewhere.
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	default:
+		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "overloaded",
+			slog.String("request_id", reqID),
+			slog.Int("max_concurrent", cap(h.slots)),
+		)
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "overloaded_error", "gateway is at capacity")
+		return
+	}
 
 	var (
 		model, upstreamID           string
@@ -135,7 +161,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// would be treated as the client going away.
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(h.bodyTimeout))
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBody))
+	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength, h.maxBody)
 	_ = rc.SetReadDeadline(time.Time{})
 	readDur = time.Since(start)
 	if err != nil {
@@ -276,6 +302,19 @@ func copyFlush(w http.ResponseWriter, src io.Reader, writeTimeout time.Duration)
 			return err
 		}
 	}
+}
+
+// readBody reads r to the end. When the declared length is known and within
+// limit, the buffer is allocated once at that size instead of grown by
+// repeated doubling.
+func readBody(r io.Reader, contentLength, limit int64) ([]byte, error) {
+	if contentLength <= 0 || contentLength > limit {
+		return io.ReadAll(r)
+	}
+	// MinRead of headroom lets ReadFrom see EOF without growing the buffer.
+	buf := bytes.NewBuffer(make([]byte, 0, contentLength+bytes.MinRead))
+	_, err := buf.ReadFrom(r)
+	return buf.Bytes(), err
 }
 
 // extractModel returns the "model" field of a JSON body, or "" if absent.

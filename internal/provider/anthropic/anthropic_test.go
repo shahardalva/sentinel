@@ -92,6 +92,20 @@ func TestForward_WrapsErrors(t *testing.T) {
 	}
 }
 
+func TestNew_ConnectionPool(t *testing.T) {
+	tr, ok := New(Config{}).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("default client has no *http.Transport")
+	}
+	if tr.MaxIdleConnsPerHost != maxIdleConns || tr.MaxIdleConns != maxIdleConns {
+		t.Errorf("idle conns = %d per host, %d total; want %d",
+			tr.MaxIdleConnsPerHost, tr.MaxIdleConns, maxIdleConns)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("shares http.DefaultTransport; must be a clone")
+	}
+}
+
 func TestAllowResponseHeader(t *testing.T) {
 	p := New(Config{})
 	allowed := []string{

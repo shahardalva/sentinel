@@ -441,6 +441,56 @@ func TestHandler_BodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestHandler_ConcurrencyCap(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	defer close(release) // runs first if the test fails before releasing
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{MaxConcurrent: 1})
+
+	first := make(chan int, 1)
+	go func() { first <- post(gw, reqBody).Code }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached upstream")
+	}
+
+	rec := post(gw, reqBody) // the only slot is taken
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "overloaded_error" {
+		t.Errorf("error type = %q", typ)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After")
+	}
+	if !strings.Contains(logs.String(), `"msg":"overloaded"`) {
+		t.Errorf("no overloaded log line:\n%s", logs)
+	}
+
+	release <- struct{}{}
+	if code := <-first; code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", code)
+	}
+
+	// The slot is freed once a request finishes.
+	go func() { <-started; release <- struct{}{} }()
+	if code := post(gw, reqBody).Code; code != http.StatusOK {
+		t.Errorf("request after release: status = %d, want 200", code)
+	}
+}
+
 func TestHandler_MethodNotAllowed(t *testing.T) {
 	gw, _ := newGateway(t, "http://unused", proxy.Options{})
 	rec := httptest.NewRecorder()

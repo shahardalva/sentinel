@@ -15,6 +15,8 @@ import (
 const (
 	DefaultBaseURL = "https://api.anthropic.com"
 	DefaultVersion = "2023-06-01"
+
+	maxIdleConns = 128 // matches proxy.DefaultMaxConcurrent
 )
 
 type Config struct {
@@ -34,7 +36,13 @@ func New(cfg Config) *Provider {
 		cfg.BaseURL = DefaultBaseURL
 	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		// All traffic goes to one host. The default keeps only 2 idle
+		// connections per host, so under load most requests would pay for a
+		// fresh TLS handshake.
+		t.MaxIdleConns = maxIdleConns
+		t.MaxIdleConnsPerHost = maxIdleConns
+		cfg.Client = &http.Client{Transport: t}
 	}
 	return &Provider{
 		apiKey:   cfg.APIKey,
