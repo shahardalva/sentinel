@@ -23,6 +23,10 @@ func TestRequireKey(t *testing.T) {
 		{"non-bearer scheme", map[string]string{"Authorization": "Basic key-one"}, http.StatusUnauthorized},
 		{"valid x-api-key", map[string]string{"X-Api-Key": "key-one"}, http.StatusOK},
 		{"valid bearer", map[string]string{"Authorization": "Bearer key-one"}, http.StatusOK},
+		{"lowercase bearer", map[string]string{"Authorization": "bearer key-one"}, http.StatusOK},
+		{"uppercase bearer", map[string]string{"Authorization": "BEARER key-one"}, http.StatusOK},
+		{"bearer without token", map[string]string{"Authorization": "Bearer"}, http.StatusUnauthorized},
+		{"bearer-like scheme", map[string]string{"Authorization": "Bearerx key-one"}, http.StatusUnauthorized},
 		{"second key", map[string]string{"X-Api-Key": "key-two"}, http.StatusOK},
 	}
 	for _, tt := range tests {
@@ -76,7 +80,7 @@ func TestRequireKey_NoKeysRejectsAll(t *testing.T) {
 }
 
 func TestGateway_UnauthenticatedPartialBody(t *testing.T) {
-	gw, _ := newGateway(t, "http://unused", proxy.Options{})
+	gw, _ := newGateway(t, unusedUpstream, proxy.Options{})
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 

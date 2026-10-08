@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -32,9 +34,15 @@ type Provider struct {
 	client   *http.Client
 }
 
-func New(cfg Config) *Provider {
+// New returns a Provider for cfg. It fails if BaseURL isn't an https URL;
+// plain http is allowed only to a loopback host, for local test servers,
+// since the upstream key would otherwise cross the network in the clear.
+func New(cfg Config) (*Provider, error) {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL
+	}
+	if err := validateBaseURL(cfg.BaseURL); err != nil {
+		return nil, err
 	}
 	if cfg.Client == nil {
 		t := http.DefaultTransport.(*http.Transport).Clone()
@@ -49,7 +57,32 @@ func New(cfg Config) *Provider {
 		apiKey:   cfg.APIKey,
 		endpoint: strings.TrimRight(cfg.BaseURL, "/") + "/v1/messages",
 		client:   cfg.Client,
+	}, nil
+}
+
+func validateBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("anthropic: base URL: %w", err)
 	}
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("anthropic: base URL %q must be scheme://host[/path] with no credentials, query, or fragment", raw)
+	}
+	switch {
+	case u.Scheme == "https":
+		return nil
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
+		return nil
+	}
+	return fmt.Errorf("anthropic: base URL %q must use https (http is allowed only for loopback hosts)", raw)
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (p *Provider) Name() string { return "anthropic" }
@@ -74,6 +107,11 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 	up.Header.Set("X-Api-Key", p.apiKey)
 	up.Header.Set("Anthropic-Version", version)
 	if beta := req.Header.Values("Anthropic-Beta"); len(beta) > 0 {
+		// Control characters (CR and LF above all) would make the HTTP
+		// client refuse the request, which would surface as a 502.
+		if slices.ContainsFunc(beta, hasControlChar) {
+			return nil, &proxy.RequestError{Message: "anthropic-beta contains invalid characters"}
+		}
 		up.Header["Anthropic-Beta"] = slices.Clone(beta)
 	}
 	resp, err := p.client.Do(up)
@@ -99,6 +137,14 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 func validVersion(v string) bool {
 	_, err := time.Parse(time.DateOnly, v)
 	return err == nil
+}
+
+// hasControlChar reports whether s contains an ASCII control character other
+// than horizontal tab, which header values may not.
+func hasControlChar(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool {
+		return (r < ' ' && r != '\t') || r == 0x7f
+	})
 }
 
 // allowResponseHeader reports whether an upstream response header may reach

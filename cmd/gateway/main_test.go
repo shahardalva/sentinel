@@ -16,11 +16,13 @@ func TestRun_RequiresEnv(t *testing.T) {
 		{"no upstream key", "", "k1", "ANTHROPIC_API_KEY"},
 		{"no client keys", "sk", "", "SENTINEL_API_KEYS"},
 		{"blank client keys", "sk", " , ,", "SENTINEL_API_KEYS"},
+		{"plain-http base URL", "sk", "k1", "ANTHROPIC_BASE_URL"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("ANTHROPIC_API_KEY", tt.upstreamKey)
 			t.Setenv("SENTINEL_API_KEYS", tt.clientKeys)
+			t.Setenv("ANTHROPIC_BASE_URL", "http://api.anthropic.com")
 			err := run(slog.New(slog.DiscardHandler))
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("run() = %v, want error mentioning %s", err, tt.wantErr)

@@ -60,8 +60,10 @@ func clientKey(h http.Header) string {
 	if k := h.Get("X-Api-Key"); k != "" {
 		return k
 	}
-	if tok, ok := strings.CutPrefix(h.Get("Authorization"), "Bearer "); ok {
-		return tok
+	// The scheme name is case-insensitive (RFC 9110 §11.1).
+	scheme, tok, ok := strings.Cut(h.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
 	}
-	return ""
+	return tok
 }

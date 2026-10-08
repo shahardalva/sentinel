@@ -28,6 +28,8 @@ const (
 	reqBody     = `{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
 	upstreamKey = "upstream-secret"
 	gatewayKey  = "gateway-client-secret"
+	// For tests that never reach upstream; loopback, so it passes validation.
+	unusedUpstream = "http://127.0.0.1:1"
 )
 
 // newGateway wires the authenticated handler to an Anthropic provider pointed
@@ -36,7 +38,10 @@ func newGateway(t *testing.T, upstreamURL string, opts proxy.Options) (http.Hand
 	t.Helper()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	p := anthropic.New(anthropic.Config{APIKey: upstreamKey, BaseURL: upstreamURL})
+	p, err := anthropic.New(anthropic.Config{APIKey: upstreamKey, BaseURL: upstreamURL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey}, logger, proxy.NewHandler(p, logger, opts)))
 	return mux, &logs
@@ -332,8 +337,103 @@ func TestHandler_ClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestHandler_ClientDisconnectMidStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for {
+			io.WriteString(w, "event: tick\ndata: {}\n\n")
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gw.ServeHTTP(w, r)
+		close(done)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/messages", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Api-Key", gatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	cancel() // the client hangs up mid-stream
+	resp.Body.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish after the client hung up")
+	}
+	line := logLine(t, logs)
+	if line["level"] != "WARN" || line["phase"] != "stream" || line["status"] != float64(http.StatusOK) {
+		t.Errorf("log = %v, want WARN 200 in phase stream", line)
+	}
+}
+
+func TestHandler_RejectsContentEncoding(t *testing.T) {
+	var called atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+		io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+
+	for _, ce := range []string{"gzip", "br", "deflate", "gzip, identity"} {
+		t.Run(ce, func(t *testing.T) {
+			gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+			req.Header.Set("X-Api-Key", gatewayKey)
+			req.Header.Set("Content-Encoding", ce)
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("status = %d, want 415", rec.Code)
+			}
+			if typ := errorType(t, rec); typ != "invalid_request_error" {
+				t.Errorf("error type = %q", typ)
+			}
+			if line := logLine(t, logs); line["level"] != "WARN" || line["phase"] != "read_body" {
+				t.Errorf("log = %v, want WARN in phase read_body", line)
+			}
+		})
+	}
+	if called.Load() {
+		t.Error("upstream called for an encoded body")
+	}
+
+	// identity means no encoding and is accepted.
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("X-Api-Key", gatewayKey)
+	req.Header.Set("Content-Encoding", "identity")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("identity: status = %d, want 200", rec.Code)
+	}
+}
+
 func TestHandler_BodyReadError(t *testing.T) {
-	gw, logs := newGateway(t, "http://unused", proxy.Options{})
+	gw, logs := newGateway(t, unusedUpstream, proxy.Options{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", iotest.ErrReader(errors.New("connection reset")))
 	req.Header.Set("X-Api-Key", gatewayKey)
 	rec := httptest.NewRecorder()
@@ -432,7 +532,7 @@ func TestHandler_StalledStreamAborted(t *testing.T) {
 }
 
 func TestHandler_SlowRequestBody(t *testing.T) {
-	gw, _ := newGateway(t, "http://unused", proxy.Options{BodyTimeout: 50 * time.Millisecond})
+	gw, _ := newGateway(t, unusedUpstream, proxy.Options{BodyTimeout: 50 * time.Millisecond})
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
@@ -479,7 +579,7 @@ func TestHandler_BodyTooLarge(t *testing.T) {
 }
 
 func TestHandler_DeclaredLengthTooLarge(t *testing.T) {
-	gw, logs := newGateway(t, "http://unused", proxy.Options{MaxBodyBytes: 100})
+	gw, logs := newGateway(t, unusedUpstream, proxy.Options{MaxBodyBytes: 100})
 	srv := httptest.NewServer(gw)
 	defer srv.Close()
 
@@ -622,7 +722,7 @@ func TestHandler_ConcurrencyCap(t *testing.T) {
 }
 
 func TestHandler_MethodNotAllowed(t *testing.T) {
-	gw, _ := newGateway(t, "http://unused", proxy.Options{})
+	gw, _ := newGateway(t, unusedUpstream, proxy.Options{})
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/messages", nil))
 	if rec.Code != http.StatusMethodNotAllowed {

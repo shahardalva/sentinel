@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,10 +41,13 @@ func run(logger *slog.Logger) error {
 	}
 	addr := envOr("SENTINEL_ADDR", defaultAddr)
 
-	upstream := anthropic.New(anthropic.Config{
+	upstream, err := anthropic.New(anthropic.Config{
 		APIKey:  apiKey,
 		BaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
 	})
+	if err != nil {
+		return fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
+	}
 
 	mux := http.NewServeMux()
 	messages := proxy.NewHandler(upstream, logger, proxy.Options{})

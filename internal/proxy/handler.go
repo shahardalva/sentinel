@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -80,11 +81,19 @@ const (
 )
 
 var (
-	errHeaderTimeout = errors.New("upstream response headers timed out")
-	errIdleTimeout   = errors.New("upstream stream idle timeout")
-	errOverloaded    = errors.New("gateway at capacity")
-	errUpstreamAuth  = errors.New("upstream rejected the gateway's credentials")
+	errHeaderTimeout   = errors.New("upstream response headers timed out")
+	errIdleTimeout     = errors.New("upstream stream idle timeout")
+	errOverloaded      = errors.New("gateway at capacity")
+	errUpstreamAuth    = errors.New("upstream rejected the gateway's credentials")
+	errContentEncoding = errors.New("unsupported content-encoding")
 )
+
+// clientWriteError marks a stream failure on the client's side of the proxy:
+// a failed write or flush to the client, including the write timeout.
+type clientWriteError struct{ err error }
+
+func (e *clientWriteError) Error() string { return "write to client: " + e.err.Error() }
+func (e *clientWriteError) Unwrap() error { return e.err }
 
 // Options configures a Handler. Zero values select the defaults.
 type Options struct {
@@ -173,8 +182,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if failure != nil {
 			attrs = append(attrs, slog.String("error", failure.Error()), slog.String("phase", phase))
 		}
-		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, r.Context().Err() != nil), "request", attrs...)
+		_, clientFailed := errors.AsType[*clientWriteError](failure)
+		clientGone := clientFailed || r.Context().Err() != nil
+		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, clientGone), "request", attrs...)
 	}()
+
+	// The body is forwarded and inspected as-is, so an encoded one would be
+	// unreadable upstream and opaque to any check on its contents.
+	if ce := r.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+		failure = errContentEncoding
+		status = http.StatusUnsupportedMediaType
+		rejectEarly(w, status, "invalid_request_error", "content-encoding is not supported; send an uncompressed body")
+		return
+	}
 
 	// A declared length over the limit is rejected before reading anything.
 	if r.ContentLength > h.maxBody {
@@ -334,7 +354,8 @@ func (ir *idleReader) Read(p []byte) (int, error) {
 // copyFlush copies src to w, flushing after every write so streamed (SSE)
 // events reach the client as they arrive instead of waiting in a buffer.
 // Each write must complete within writeTimeout, so a client that stops
-// reading can't hold the stream open.
+// reading can't hold the stream open. Failures on the client's side are
+// returned as *clientWriteError; a read error from src is returned as is.
 func copyFlush(w http.ResponseWriter, src io.Reader, writeTimeout time.Duration) error {
 	rc := http.NewResponseController(w)
 	// Clear the deadline so it can't affect the next request on this connection.
@@ -344,13 +365,13 @@ func copyFlush(w http.ResponseWriter, src io.Reader, writeTimeout time.Duration)
 		n, err := src.Read(buf)
 		if n > 0 {
 			if derr := rc.SetWriteDeadline(time.Now().Add(writeTimeout)); derr != nil && !errors.Is(derr, http.ErrNotSupported) {
-				return derr
+				return &clientWriteError{derr}
 			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return werr
+				return &clientWriteError{werr}
 			}
 			if ferr := rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
-				return ferr
+				return &clientWriteError{ferr}
 			}
 		}
 		if err == io.EOF {

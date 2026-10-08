@@ -14,6 +14,47 @@ import (
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
+func mustNew(t *testing.T, cfg Config) *Provider {
+	t.Helper()
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p
+}
+
+func TestNew_ValidatesBaseURL(t *testing.T) {
+	valid := []string{
+		"", // DefaultBaseURL
+		"https://api.anthropic.com",
+		"https://proxy.internal:8443/anthropic/",
+		"http://127.0.0.1:9000",
+		"http://[::1]:9000",
+		"http://localhost:9000",
+	}
+	for _, u := range valid {
+		if _, err := New(Config{BaseURL: u}); err != nil {
+			t.Errorf("New(%q) = %v, want ok", u, err)
+		}
+	}
+	invalid := []string{
+		"http://api.anthropic.com", // key in plaintext over the network
+		"http://10.0.0.5:8080",
+		"api.anthropic.com", // no scheme
+		"https://",
+		"ftp://api.anthropic.com",
+		"https://user:pass@api.anthropic.com",
+		"https://api.anthropic.com?x=1",
+		"https://api.anthropic.com/#frag",
+		"https://api.anthropic.com/\x7f",
+	}
+	for _, u := range invalid {
+		if _, err := New(Config{BaseURL: u}); err == nil {
+			t.Errorf("New(%q) = ok, want error", u)
+		}
+	}
+}
+
 func TestForward(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -43,7 +84,7 @@ func TestForward(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			p := New(Config{APIKey: "server-key", BaseURL: upstream.URL + "/"})
+			p := mustNew(t, Config{APIKey: "server-key", BaseURL: upstream.URL + "/"})
 			h := http.Header{}
 			h.Set("X-Api-Key", "client-key")
 			h.Set("Authorization", "Bearer client-token")
@@ -92,7 +133,7 @@ func TestForward_WrapsErrors(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err := New(Config{BaseURL: url}).Forward(ctx, &proxy.Request{Header: http.Header{}})
+	_, err := mustNew(t, Config{BaseURL: url}).Forward(ctx, &proxy.Request{Header: http.Header{}})
 	if err == nil || !strings.HasPrefix(err.Error(), "anthropic: forward: ") {
 		t.Fatalf("err = %v, want wrapped with provider context", err)
 	}
@@ -102,7 +143,7 @@ func TestForward_WrapsErrors(t *testing.T) {
 }
 
 func TestNew_ConnectionPool(t *testing.T) {
-	tr, ok := New(Config{}).client.Transport.(*http.Transport)
+	tr, ok := mustNew(t, Config{}).client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatal("default client has no *http.Transport")
 	}
@@ -147,7 +188,7 @@ func TestForward_Response(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	resp, err := New(Config{BaseURL: upstream.URL}).Forward(t.Context(), &proxy.Request{Header: http.Header{}})
+	resp, err := mustNew(t, Config{BaseURL: upstream.URL}).Forward(t.Context(), &proxy.Request{Header: http.Header{}})
 	if err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
@@ -178,7 +219,7 @@ func TestForward_RejectsInvalidVersion(t *testing.T) {
 		called.Store(true)
 	}))
 	defer upstream.Close()
-	p := New(Config{BaseURL: upstream.URL})
+	p := mustNew(t, Config{BaseURL: upstream.URL})
 
 	for _, v := range []string{"latest", "2023-6-1", "2023-13-01", "2023-06-01x", "2023-06-01\x00"} {
 		h := http.Header{}
@@ -191,4 +232,34 @@ func TestForward_RejectsInvalidVersion(t *testing.T) {
 	if called.Load() {
 		t.Error("upstream called for an invalid version")
 	}
+}
+
+func TestForward_RejectsInvalidBeta(t *testing.T) {
+	var called atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+	}))
+	defer upstream.Close()
+	p := mustNew(t, Config{BaseURL: upstream.URL})
+
+	for _, v := range []string{"a\r\nX-Injected: 1", "a\nb", "a\rb", "a\x00b", "a\x7fb"} {
+		h := http.Header{}
+		h["Anthropic-Beta"] = []string{"ok-beta", v}
+		_, err := p.Forward(t.Context(), &proxy.Request{Header: h})
+		if _, ok := errors.AsType[*proxy.RequestError](err); !ok {
+			t.Errorf("beta %q: err = %v, want *proxy.RequestError", v, err)
+		}
+	}
+	if called.Load() {
+		t.Error("upstream called for an invalid beta")
+	}
+
+	// A tab is a legal header character and must still pass.
+	h := http.Header{}
+	h.Set("Anthropic-Beta", "a,\tb")
+	resp, err := p.Forward(t.Context(), &proxy.Request{Header: h})
+	if err != nil {
+		t.Fatalf("beta with tab: %v", err)
+	}
+	resp.Body.Close()
 }

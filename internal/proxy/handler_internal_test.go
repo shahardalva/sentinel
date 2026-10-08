@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -63,6 +64,32 @@ func TestReadBody_DeclaredLengthNotTrusted(t *testing.T) {
 	}
 	if c := cap(got); c > initialBodyBuf+bytes.MinRead {
 		t.Errorf("buffer cap = %d, want at most %d", c, initialBodyBuf+bytes.MinRead)
+	}
+}
+
+// brokenClient is a ResponseWriter whose connection has gone away.
+type brokenClient struct{ http.ResponseWriter }
+
+func (brokenClient) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+func TestCopyFlush_AttributesFailures(t *testing.T) {
+	err := copyFlush(brokenClient{httptest.NewRecorder()}, strings.NewReader("data"), time.Second)
+	if _, ok := errors.AsType[*clientWriteError](err); !ok {
+		t.Errorf("client write failure: err = %v, want *clientWriteError", err)
+	}
+	err = copyFlush(httptest.NewRecorder(), iotest.ErrReader(errors.New("upstream reset")), time.Second)
+	if _, ok := errors.AsType[*clientWriteError](err); ok || err == nil {
+		t.Errorf("upstream read failure: err = %v, want a non-client error", err)
+	}
+}
+
+func TestLogLevel_Stream(t *testing.T) {
+	failure := errors.New("boom")
+	if got := logLevel(http.StatusOK, phaseStream, failure, false); got != slog.LevelError {
+		t.Errorf("upstream-side stream failure: level = %v, want ERROR", got)
+	}
+	if got := logLevel(http.StatusOK, phaseStream, failure, true); got != slog.LevelWarn {
+		t.Errorf("client-side stream failure: level = %v, want WARN", got)
 	}
 }
 
