@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,16 +59,31 @@ const (
 	DefaultIdleTimeout   = 60 * time.Second
 	DefaultBodyTimeout   = 2 * time.Minute
 	DefaultMaxBodyBytes  = 32 << 20 // Anthropic's request size limit
-	// Bounds buffered request bodies to MaxConcurrent × MaxBodyBytes (4 GiB
-	// with the defaults). Lower either for a smaller deployment.
+	// Bounds requests in flight upstream, and so their buffered bodies to
+	// MaxConcurrent × MaxBodyBytes (4 GiB with the defaults). Bodies still
+	// being uploaded don't hold a slot; their buffers grow only as bytes
+	// arrive. Lower either for a smaller deployment.
 	DefaultMaxConcurrent = 128
 
+	// RejectDrainTimeout bounds how long a connection is kept, after an early
+	// rejection, for the rest of a body the gateway won't use. Long enough
+	// for a client already sending it to finish, so closing doesn't reset
+	// the connection before the client reads the response.
+	RejectDrainTimeout = time.Second
+
 	maxLoggedModel = 128 // bytes; the model field is client-controlled
+
+	// initialBodyBuf caps the up-front allocation for a request body. The
+	// declared Content-Length is client-controlled, so beyond this the buffer
+	// grows only as bytes actually arrive.
+	initialBodyBuf = 64 << 10
 )
 
 var (
 	errHeaderTimeout = errors.New("upstream response headers timed out")
 	errIdleTimeout   = errors.New("upstream stream idle timeout")
+	errOverloaded    = errors.New("gateway at capacity")
+	errUpstreamAuth  = errors.New("upstream rejected the gateway's credentials")
 )
 
 // Options configures a Handler. Zero values select the defaults.
@@ -81,7 +97,8 @@ type Options struct {
 	// BodyTimeout bounds reading the client's request body.
 	BodyTimeout  time.Duration
 	MaxBodyBytes int64
-	// MaxConcurrent caps requests in flight; requests beyond it get a 503.
+	// MaxConcurrent caps requests in flight upstream; requests beyond it get
+	// a 503. A request takes its slot only once its body is fully read.
 	MaxConcurrent int
 }
 
@@ -128,21 +145,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqID := rand.Text()
 	w.Header().Set("X-Request-Id", reqID)
 
-	// Shed load rather than queue: a queued request still holds its
-	// connection, and waiting only moves the memory pressure elsewhere.
-	select {
-	case h.slots <- struct{}{}:
-		defer func() { <-h.slots }()
-	default:
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "overloaded",
-			slog.String("request_id", reqID),
-			slog.Int("max_concurrent", cap(h.slots)),
-		)
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "overloaded_error", "gateway is at capacity")
-		return
-	}
-
 	var (
 		model, upstreamID           string
 		status                      int
@@ -159,7 +161,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
 			slog.Int64("read_body_ms", readDur.Milliseconds()),
 		}
-		if phase != phaseReadBody {
+		if phase == phaseUpstream || phase == phaseStream {
 			attrs = append(attrs, slog.Int64("upstream_ttfb_ms", ttfbDur.Milliseconds()))
 		}
 		if phase == phaseStream {
@@ -174,31 +176,54 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, r.Context().Err() != nil), "request", attrs...)
 	}()
 
+	// A declared length over the limit is rejected before reading anything.
+	if r.ContentLength > h.maxBody {
+		failure = &http.MaxBytesError{Limit: h.maxBody}
+		status = http.StatusRequestEntityTooLarge
+		rejectEarly(w, status, "request_too_large", "request body too large")
+		return
+	}
+
 	// The read deadline is per request, not server-wide, and is cleared once
 	// the body is in: a read deadline expiring later, during a long stream,
 	// would be treated as the client going away.
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(h.bodyTimeout))
-	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength, h.maxBody)
+	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength)
 	_ = rc.SetReadDeadline(time.Time{})
 	readDur = time.Since(start)
 	if err != nil {
 		failure = err
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			status = http.StatusRequestEntityTooLarge
-			writeError(w, status, "request_too_large", "request body too large")
+			rejectEarly(w, status, "request_too_large", "request body too large")
 			return
 		}
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			status = http.StatusRequestTimeout
-			writeError(w, status, "timeout_error", "request body not received in time")
+			rejectEarly(w, status, "timeout_error", "request body not received in time")
 			return
 		}
 		status = http.StatusBadRequest
-		writeError(w, status, "invalid_request_error", "could not read request body")
+		rejectEarly(w, status, "invalid_request_error", "could not read request body")
 		return
 	}
 	model = truncate(extractModel(body), maxLoggedModel)
+
+	// The slot is taken only once the body is in, so a slow upload can't hold
+	// one. Shed load rather than queue: a queued request still holds its
+	// connection, and waiting only moves the memory pressure elsewhere.
+	phase = phaseAdmit
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	default:
+		failure = errOverloaded
+		status = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "1")
+		rejectEarly(w, status, "overloaded_error", "gateway is at capacity")
+		return
+	}
 
 	// One context for the whole upstream exchange. Timers cancel it with a
 	// cause, so a timeout is distinguishable from the client going away.
@@ -233,6 +258,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	upstreamID = resp.RequestID
+	// Clients never authenticate to the upstream; the gateway does. An
+	// upstream 401/403 means the gateway's own credentials were rejected, so
+	// passing it on would look like a problem with the client's key.
+	if resp.Status == http.StatusUnauthorized || resp.Status == http.StatusForbidden {
+		failure = fmt.Errorf("%w (status %d)", errUpstreamAuth, resp.Status)
+		status = http.StatusBadGateway
+		writeError(w, status, "api_error", "upstream authentication failed")
+		return
+	}
 	for k, vv := range resp.Header {
 		w.Header()[k] = append(w.Header()[k], vv...)
 	}
@@ -258,15 +292,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Request phases, as logged. A failure's phase says where it happened.
 const (
 	phaseReadBody = "read_body"
+	phaseAdmit    = "admit" // waiting for a concurrency slot
 	phaseUpstream = "upstream"
 	phaseStream   = "stream"
 )
 
 // logLevel picks the level for a request's log line. Server-side and upstream
 // failures are errors, including a stream that breaks after a 2xx was sent.
-// Failures caused by the client (bad body, disconnect) are warnings.
+// Failures caused by the client (bad body, disconnect) and load shedding are
+// warnings.
 func logLevel(status int, phase string, failure error, clientGone bool) slog.Level {
 	switch {
+	case errors.Is(failure, errOverloaded):
+		return slog.LevelWarn
 	case status >= 500:
 		return slog.LevelError
 	case failure == nil:
@@ -324,15 +362,16 @@ func copyFlush(w http.ResponseWriter, src io.Reader, writeTimeout time.Duration)
 	}
 }
 
-// readBody reads r to the end. When the declared length is known and within
-// limit, the buffer is allocated once at that size instead of grown by
-// repeated doubling.
-func readBody(r io.Reader, contentLength, limit int64) ([]byte, error) {
-	if contentLength <= 0 || contentLength > limit {
+// readBody reads r to the end. When the length is declared, the buffer is
+// allocated up front at that size, capped at initialBodyBuf, so most bodies
+// are read without repeated doubling and a large declared length reserves no
+// more than that until the bytes arrive.
+func readBody(r io.Reader, contentLength int64) ([]byte, error) {
+	if contentLength <= 0 {
 		return io.ReadAll(r)
 	}
 	// MinRead of headroom lets ReadFrom see EOF without growing the buffer.
-	buf := bytes.NewBuffer(make([]byte, 0, contentLength+bytes.MinRead))
+	buf := bytes.NewBuffer(make([]byte, 0, min(contentLength, initialBodyBuf)+bytes.MinRead))
 	_, err := buf.ReadFrom(r)
 	return buf.Bytes(), err
 }
@@ -355,6 +394,17 @@ func truncate(s string, n int) string {
 		n--
 	}
 	return s[:n]
+}
+
+// rejectEarly answers a request whose body may still be unread. net/http
+// drains up to 256 KiB of an unread body, with no deadline, before sending
+// the response and again when the handler returns, so a client that stalls
+// mid-body would hold the connection open indefinitely. Connection: close
+// skips the first drain; the read deadline bounds the second.
+func rejectEarly(w http.ResponseWriter, status int, typ, msg string) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(RejectDrainTimeout))
+	w.Header().Set("Connection", "close")
+	writeError(w, status, typ, msg)
 }
 
 // writeError writes an error in Anthropic's error response shape.

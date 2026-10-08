@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,6 +48,34 @@ func post(h http.Handler, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// sendPartial opens a raw connection to srv, sends a request whose headers
+// declare contentLength bytes but only part of the body, and then sends
+// nothing more. It fails unless a response arrives and the server then
+// closes the connection, rather than waiting for the rest of the body.
+func sendPartial(t *testing.T, srv *httptest.Server, key string, contentLength int) *http.Response {
+	t.Helper()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(proxy.RejectDrainTimeout + 2*time.Second))
+	fmt.Fprintf(conn, "POST /v1/messages HTTP/1.1\r\nHost: gw\r\nX-Api-Key: %s\r\nContent-Length: %d\r\n\r\n{\"model\":", key, contentLength)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("no response while the body was incomplete: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	// EOF or a reset both mean the server let go; only a timeout means it's
+	// still holding the connection.
+	if _, err := br.ReadByte(); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection not closed by the server after the response: %v", err)
+	}
+	return resp
 }
 
 func logLine(t *testing.T, logs *bytes.Buffer) map[string]any {
@@ -116,6 +147,9 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 			reqID := rec.Header().Get("X-Request-Id")
 			if reqID == "" {
 				t.Fatal("missing X-Request-Id")
+			}
+			if c := rec.Header().Get("Connection"); c != "" {
+				t.Errorf("Connection = %q, want keep-alive left to net/http", c)
 			}
 
 			line := logLine(t, logs)
@@ -444,6 +478,93 @@ func TestHandler_BodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestHandler_DeclaredLengthTooLarge(t *testing.T) {
+	gw, logs := newGateway(t, "http://unused", proxy.Options{MaxBodyBytes: 100})
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	// Rejected from the headers alone, without waiting for the body.
+	resp := sendPartial(t, srv, gatewayKey, 1000)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	srv.Close() // waits for the handler, so its log line is complete
+	if line := logLine(t, logs); line["level"] != "WARN" || line["phase"] != "read_body" {
+		t.Errorf("log = %v, want WARN in phase read_body", line)
+	}
+}
+
+func TestHandler_SlowBodyDoesNotHoldSlot(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{MaxConcurrent: 1})
+	entered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		gw.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	// An authenticated client starts its body and stalls.
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "POST /v1/messages HTTP/1.1\r\nHost: gw\r\nX-Api-Key: %s\r\nContent-Length: 1000\r\n\r\n{", gatewayKey)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled request never reached the handler")
+	}
+
+	// The only slot must still be free.
+	if rec := post(gw, reqBody); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 while another body is still uploading", rec.Code)
+	}
+}
+
+func TestHandler_UpstreamRejectsGatewayKey(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Request-Id", "req_up_1")
+				w.WriteHeader(code)
+				io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+			}))
+			defer upstream.Close()
+
+			gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+			rec := post(gw, reqBody)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rec.Code)
+			}
+			if typ := errorType(t, rec); typ != "api_error" {
+				t.Errorf("error type = %q", typ)
+			}
+			if b := rec.Body.String(); !strings.Contains(b, "upstream authentication failed") || strings.Contains(b, "x-api-key") {
+				t.Errorf("body = %q, want the gateway's message, not the upstream's", b)
+			}
+			line := logLine(t, logs)
+			if line["level"] != "ERROR" || line["phase"] != "upstream" || line["status"] != float64(http.StatusBadGateway) {
+				t.Errorf("log = %v, want ERROR 502 in phase upstream", line)
+			}
+			if msg, _ := line["error"].(string); !strings.Contains(msg, "credentials") || !strings.Contains(msg, strconv.Itoa(code)) {
+				t.Errorf("log error = %q, want upstream credential rejection with status", msg)
+			}
+			if line["upstream_request_id"] != "req_up_1" {
+				t.Errorf("log upstream_request_id = %v, want req_up_1", line["upstream_request_id"])
+			}
+		})
+	}
+}
+
 func TestHandler_ConcurrencyCap(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -478,8 +599,14 @@ func TestHandler_ConcurrencyCap(t *testing.T) {
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("missing Retry-After")
 	}
-	if !strings.Contains(logs.String(), `"msg":"overloaded"`) {
-		t.Errorf("no overloaded log line:\n%s", logs)
+	if c := rec.Header().Get("Connection"); c != "close" {
+		t.Errorf("Connection = %q, want close", c)
+	}
+	// The first request is still in flight, so this is the shed one's line.
+	line := logLine(t, logs)
+	if line["status"] != float64(http.StatusServiceUnavailable) || line["level"] != "WARN" ||
+		line["phase"] != "admit" || line["error"] != "gateway at capacity" {
+		t.Errorf("log = %v, want WARN 503 in phase admit, gateway at capacity", line)
 	}
 
 	release <- struct{}{}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -24,6 +26,30 @@ func TestRun_RequiresEnv(t *testing.T) {
 				t.Fatalf("run() = %v, want error mentioning %s", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestCloseUnmatched(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {})
+	h := closeUnmatched(mux)
+
+	tests := []struct {
+		method, path string
+		wantStatus   int
+		wantConn     string
+	}{
+		{http.MethodPost, "/v1/messages", http.StatusOK, ""},
+		{http.MethodGet, "/v1/messages", http.StatusMethodNotAllowed, "close"},
+		{http.MethodPost, "/nope", http.StatusNotFound, "close"},
+	}
+	for _, tt := range tests {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, strings.NewReader("{}")))
+		if rec.Code != tt.wantStatus || rec.Header().Get("Connection") != tt.wantConn {
+			t.Errorf("%s %s: status %d, Connection %q; want %d, %q",
+				tt.method, tt.path, rec.Code, rec.Header().Get("Connection"), tt.wantStatus, tt.wantConn)
+		}
 	}
 }
 

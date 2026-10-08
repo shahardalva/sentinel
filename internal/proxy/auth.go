@@ -6,7 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// authReadTimeout bounds reads on a connection while its request is being
+// authenticated, so a client without a key can't hold it open by sending a
+// partial body. A var so tests can shorten it.
+var authReadTimeout = 5 * time.Second
 
 // RequireKey rejects requests that don't present one of keys, either as
 // x-api-key (what the Anthropic SDKs send) or as an Authorization bearer
@@ -22,6 +28,9 @@ func RequireKey(keys []string, logger *slog.Logger, next http.Handler) http.Hand
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(authReadTimeout))
+
 		presented := clientKey(r.Header)
 		got := sha256.Sum256([]byte(presented))
 		match := 0
@@ -33,10 +42,13 @@ func RequireKey(keys []string, logger *slog.Logger, next http.Handler) http.Hand
 				slog.String("path", r.URL.Path),
 				slog.String("remote_addr", r.RemoteAddr),
 			)
-			writeError(w, http.StatusUnauthorized, "authentication_error", "invalid x-api-key")
+			rejectEarly(w, http.StatusUnauthorized, "authentication_error", "invalid x-api-key")
 			return
 		}
 
+		// Cleared so it can't cut off next later, e.g. during a long stream;
+		// next sets its own deadlines.
+		_ = rc.SetReadDeadline(time.Time{})
 		r = r.Clone(r.Context())
 		r.Header.Del("X-Api-Key")
 		r.Header.Del("Authorization")

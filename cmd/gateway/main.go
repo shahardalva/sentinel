@@ -54,7 +54,7 @@ func run(logger *slog.Logger) error {
 	// body-read and per-chunk write deadlines instead.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           closeUnmatched(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
@@ -85,6 +85,19 @@ func run(logger *slog.Logger) error {
 		_ = srv.Close()
 	}
 	return nil
+}
+
+// closeUnmatched closes the connection after a 404 or 405 from mux. Those
+// responses leave the body unread, and net/http would otherwise drain it
+// with no deadline (see proxy.RejectDrainTimeout).
+func closeUnmatched(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern == "" {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(proxy.RejectDrainTimeout))
+			w.Header().Set("Connection", "close")
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // parseKeys splits a comma-separated key list, dropping blank entries.

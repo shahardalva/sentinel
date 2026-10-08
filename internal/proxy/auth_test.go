@@ -47,6 +47,9 @@ func TestRequireKey(t *testing.T) {
 				if typ := errorType(t, rec); typ != "authentication_error" {
 					t.Errorf("error type = %q", typ)
 				}
+				if c := rec.Header().Get("Connection"); c != "close" {
+					t.Errorf("Connection = %q, want close", c)
+				}
 				if seen != nil {
 					t.Error("next called for rejected request")
 				}
@@ -69,6 +72,18 @@ func TestRequireKey_NoKeysRejectsAll(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Errorf("key %q: status = %d, want 401", key, rec.Code)
 		}
+	}
+}
+
+func TestGateway_UnauthenticatedPartialBody(t *testing.T) {
+	gw, _ := newGateway(t, "http://unused", proxy.Options{})
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	// Headers declare 1000 bytes; the client sends 9 and then nothing.
+	resp := sendPartial(t, srv, "wrong-key", 1000)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
 }
 
