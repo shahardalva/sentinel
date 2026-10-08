@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -215,7 +216,7 @@ func TestHandler_UpstreamTimeout(t *testing.T) {
 	defer upstream.Close()
 	defer close(release) // runs first, so Close doesn't wait on the stuck handler
 
-	gw, _ := newGateway(t, upstream.URL, proxy.Options{Timeout: 50 * time.Millisecond})
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{HeaderTimeout: 50 * time.Millisecond})
 	rec := post(gw, reqBody)
 
 	if rec.Code != http.StatusGatewayTimeout {
@@ -223,6 +224,90 @@ func TestHandler_UpstreamTimeout(t *testing.T) {
 	}
 	if typ := errorType(t, rec); typ != "timeout_error" {
 		t.Errorf("error type = %q", typ)
+	}
+}
+
+func TestHandler_LongActiveStreamCompletes(t *testing.T) {
+	// Runs ~4x longer than either timeout; must not be cut while data flows.
+	const events = 20
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := range events {
+			fmt.Fprintf(w, "event: e%d\n\n", i)
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{
+		HeaderTimeout: 50 * time.Millisecond,
+		IdleTimeout:   50 * time.Millisecond,
+	})
+	rec := post(gw, reqBody)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if want := fmt.Sprintf("event: e%d\n", events-1); !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("stream cut short: %q", rec.Body.String())
+	}
+	if line := logLine(t, logs); line["error"] != nil {
+		t.Errorf("log error = %v, want none", line["error"])
+	}
+}
+
+func TestHandler_StalledStreamAborted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: one\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // stall until the gateway gives up
+	}))
+	defer upstream.Close()
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{IdleTimeout: 50 * time.Millisecond})
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- post(gw, reqBody) }()
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled stream was not aborted")
+	}
+
+	if rec.Body.String() != "event: one\n\n" {
+		t.Errorf("body = %q, want only the first event", rec.Body.String())
+	}
+	if line := logLine(t, logs); !strings.Contains(fmt.Sprint(line["error"]), "idle") {
+		t.Errorf("log error = %v, want idle timeout", line["error"])
+	}
+}
+
+func TestHandler_SlowRequestBody(t *testing.T) {
+	gw, _ := newGateway(t, "http://unused", proxy.Options{BodyTimeout: 50 * time.Millisecond})
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	// The client sends part of the body, then nothing.
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go io.WriteString(pw, `{"model":`)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/v1/messages", pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Api-Key", gatewayKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", resp.StatusCode)
 	}
 }
 

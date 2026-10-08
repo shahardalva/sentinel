@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,7 +18,6 @@ import (
 
 const (
 	defaultAddr     = "127.0.0.1:8081" // loopback only; set SENTINEL_ADDR to expose
-	upstreamTimeout = 120 * time.Second
 	shutdownTimeout = 30 * time.Second
 )
 
@@ -48,15 +46,16 @@ func run(logger *slog.Logger) error {
 	})
 
 	mux := http.NewServeMux()
-	messages := proxy.NewHandler(upstream, logger, proxy.Options{Timeout: upstreamTimeout})
+	messages := proxy.NewHandler(upstream, logger, proxy.Options{})
 	mux.Handle("POST /v1/messages", proxy.RequireKey(clientKeys, logger, messages))
 
+	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
+	// can legitimately run for minutes. The handler sets its own per-request
+	// body-read and per-chunk write deadlines instead.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      upstreamTimeout + 10*time.Second, // must outlive the upstream call
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
@@ -76,11 +75,14 @@ func run(logger *slog.Logger) error {
 	case <-ctx.Done():
 	}
 
-	logger.Info("shutting down")
+	// Give in-flight requests, including streams, a grace period to finish,
+	// then cut whatever is still open.
+	logger.Info("shutting down", "grace_period", shutdownTimeout.String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+		logger.Warn("grace period expired; closing open connections", "error", err)
+		_ = srv.Close()
 	}
 	return nil
 }
