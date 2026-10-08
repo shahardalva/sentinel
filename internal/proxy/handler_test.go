@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -81,9 +82,11 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var gotBody []byte
+			// Captured on the server's goroutine; the channel orders the read.
+			gotBody := make(chan []byte, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotBody, _ = io.ReadAll(r.Body)
+				b, _ := io.ReadAll(r.Body)
+				gotBody <- b
 				for k, v := range tt.header {
 					w.Header().Set(k, v)
 				}
@@ -96,8 +99,8 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 			gw, logs := newGateway(t, upstream.URL, proxy.Options{})
 			rec := post(gw, reqBody)
 
-			if string(gotBody) != reqBody {
-				t.Errorf("upstream body = %q, want %q", gotBody, reqBody)
+			if b := <-gotBody; string(b) != reqBody {
+				t.Errorf("upstream body = %q, want %q", b, reqBody)
 			}
 			if rec.Code != tt.status {
 				t.Errorf("status = %d, want %d", rec.Code, tt.status)
@@ -421,9 +424,9 @@ func TestHandler_SlowRequestBody(t *testing.T) {
 }
 
 func TestHandler_BodyTooLarge(t *testing.T) {
-	called := false
+	var called atomic.Bool // written on the server's goroutine
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+		called.Store(true)
 	}))
 	defer upstream.Close()
 
@@ -436,7 +439,7 @@ func TestHandler_BodyTooLarge(t *testing.T) {
 	if typ := errorType(t, rec); typ != "request_too_large" {
 		t.Errorf("error type = %q", typ)
 	}
-	if called {
+	if called.Load() {
 		t.Error("upstream was called")
 	}
 }

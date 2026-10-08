@@ -26,11 +26,18 @@ func TestForward(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var got *http.Request
-			var gotBody []byte
+			// The handler runs on the server's goroutine, and *http.Request
+			// must not be used after it returns, so copy what we need and
+			// hand it over on a channel (which also orders the accesses).
+			type captured struct {
+				method, path string
+				header       http.Header
+				body         []byte
+			}
+			seen := make(chan captured, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				got = r
-				gotBody, _ = io.ReadAll(r.Body)
+				body, _ := io.ReadAll(r.Body)
+				seen <- captured{r.Method, r.URL.Path, r.Header.Clone(), body}
 				w.WriteHeader(http.StatusOK)
 			}))
 			defer upstream.Close()
@@ -50,27 +57,28 @@ func TestForward(t *testing.T) {
 				t.Fatalf("Forward: %v", err)
 			}
 			resp.Body.Close()
+			got := <-seen
 
-			if got.Method != http.MethodPost || got.URL.Path != "/v1/messages" {
-				t.Errorf("request = %s %s, want POST /v1/messages", got.Method, got.URL.Path)
+			if got.method != http.MethodPost || got.path != "/v1/messages" {
+				t.Errorf("request = %s %s, want POST /v1/messages", got.method, got.path)
 			}
-			if v := got.Header.Values("X-Api-Key"); len(v) != 1 || v[0] != "server-key" {
+			if v := got.header.Values("X-Api-Key"); len(v) != 1 || v[0] != "server-key" {
 				t.Errorf("x-api-key = %v, want [server-key]", v)
 			}
-			if v := got.Header.Get("Authorization"); v != "" {
+			if v := got.header.Get("Authorization"); v != "" {
 				t.Errorf("authorization leaked upstream: %q", v)
 			}
-			if v := got.Header.Get("Anthropic-Version"); v != tt.wantVersion {
+			if v := got.header.Get("Anthropic-Version"); v != tt.wantVersion {
 				t.Errorf("anthropic-version = %q, want %q", v, tt.wantVersion)
 			}
-			if v := got.Header.Values("Anthropic-Beta"); !slices.Equal(v, tt.beta) {
+			if v := got.header.Values("Anthropic-Beta"); !slices.Equal(v, tt.beta) {
 				t.Errorf("anthropic-beta = %q, want %q", v, tt.beta)
 			}
-			if v := got.Header.Get("Content-Type"); v != "application/json" {
+			if v := got.header.Get("Content-Type"); v != "application/json" {
 				t.Errorf("content-type = %q", v)
 			}
-			if string(gotBody) != `{"model":"m"}` {
-				t.Errorf("body = %q", gotBody)
+			if string(got.body) != `{"model":"m"}` {
+				t.Errorf("body = %q", got.body)
 			}
 		})
 	}
