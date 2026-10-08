@@ -4,6 +4,7 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -50,7 +51,7 @@ func (p *Provider) Name() string { return "anthropic" }
 func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*http.Response, error) {
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(req.Body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: build request: %w", err)
 	}
 	version := req.Header.Get("Anthropic-Version")
 	if version == "" {
@@ -62,7 +63,11 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*http.Respo
 	if beta := req.Header.Values("Anthropic-Beta"); len(beta) > 0 {
 		up.Header["Anthropic-Beta"] = slices.Clone(beta)
 	}
-	return p.client.Do(up)
+	resp, err := p.client.Do(up)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: forward: %w", err)
+	}
+	return resp, nil
 }
 
 // AllowResponseHeader reports whether an upstream response header may reach

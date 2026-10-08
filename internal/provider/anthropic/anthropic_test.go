@@ -1,10 +1,13 @@
 package anthropic
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
@@ -70,6 +73,22 @@ func TestForward(t *testing.T) {
 				t.Errorf("body = %q", gotBody)
 			}
 		})
+	}
+}
+
+func TestForward_WrapsErrors(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	url := upstream.URL
+	upstream.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := New(Config{BaseURL: url}).Forward(ctx, &proxy.Request{Header: http.Header{}})
+	if err == nil || !strings.HasPrefix(err.Error(), "anthropic: forward: ") {
+		t.Fatalf("err = %v, want wrapped with provider context", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false; wrapping must keep the cause: %v", err)
 	}
 }
 

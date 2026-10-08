@@ -100,31 +100,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", reqID)
 
 	var (
-		model, upstreamID string
-		status            int
-		upstreamDur       time.Duration
-		failure           error
+		model, upstreamID           string
+		status                      int
+		phase                       = phaseReadBody // the stage reached, or where it failed
+		readDur, ttfbDur, streamDur time.Duration
+		failure                     error
 	)
 	defer func() {
-		level := slog.LevelInfo
-		if status >= 500 {
-			level = slog.LevelError
-		}
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
 			slog.String("provider", h.provider.Name()),
 			slog.String("model", model),
 			slog.Int("status", status),
 			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
-			slog.Int64("upstream_ms", upstreamDur.Milliseconds()),
+			slog.Int64("read_body_ms", readDur.Milliseconds()),
+		}
+		if phase != phaseReadBody {
+			attrs = append(attrs, slog.Int64("upstream_ttfb_ms", ttfbDur.Milliseconds()))
+		}
+		if phase == phaseStream {
+			attrs = append(attrs, slog.Int64("stream_ms", streamDur.Milliseconds()))
 		}
 		if upstreamID != "" {
 			attrs = append(attrs, slog.String("upstream_request_id", upstreamID))
 		}
 		if failure != nil {
-			attrs = append(attrs, slog.String("error", failure.Error()))
+			attrs = append(attrs, slog.String("error", failure.Error()), slog.String("phase", phase))
 		}
-		h.logger.LogAttrs(r.Context(), level, "request", attrs...)
+		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, r.Context().Err() != nil), "request", attrs...)
 	}()
 
 	// The read deadline is per request, not server-wide, and is cleared once
@@ -134,6 +137,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = rc.SetReadDeadline(time.Now().Add(h.bodyTimeout))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBody))
 	_ = rc.SetReadDeadline(time.Time{})
+	readDur = time.Since(start)
 	if err != nil {
 		failure = err
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -157,11 +161,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
 
+	phase = phaseUpstream
 	upStart := time.Now()
 	headerTimer := time.AfterFunc(h.headerTimeout, func() { cancel(errHeaderTimeout) })
 	resp, err := h.provider.Forward(ctx, &Request{Body: body, Header: r.Header})
 	headerTimer.Stop()
-	upstreamDur = time.Since(upStart)
+	ttfbDur = time.Since(upStart)
 	if err != nil {
 		failure = err
 		switch {
@@ -188,6 +193,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", reqID)
 	status = resp.StatusCode
 	w.WriteHeader(status)
+
+	phase = phaseStream
+	streamStart := time.Now()
 	idleTimer := time.AfterFunc(h.idleTimeout, func() { cancel(errIdleTimeout) })
 	idleTimer.Stop()
 	src := &idleReader{r: resp.Body, timer: idleTimer, d: h.idleTimeout}
@@ -198,7 +206,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			failure = errIdleTimeout
 		}
 	}
-	upstreamDur = time.Since(upStart)
+	streamDur = time.Since(streamStart)
+}
+
+// Request phases, as logged. A failure's phase says where it happened.
+const (
+	phaseReadBody = "read_body"
+	phaseUpstream = "upstream"
+	phaseStream   = "stream"
+)
+
+// logLevel picks the level for a request's log line. Server-side and upstream
+// failures are errors, including a stream that breaks after a 2xx was sent.
+// Failures caused by the client (bad body, disconnect) are warnings.
+func logLevel(status int, phase string, failure error, clientGone bool) slog.Level {
+	switch {
+	case status >= 500:
+		return slog.LevelError
+	case failure == nil:
+		return slog.LevelInfo
+	case phase == phaseStream && !clientGone:
+		return slog.LevelError
+	default:
+		return slog.LevelWarn
+	}
 }
 
 // idleReader arms timer for the duration of each Read, so it fires only when

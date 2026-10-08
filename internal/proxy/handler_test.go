@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
@@ -123,8 +125,13 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 			if line["status"] != float64(tt.status) {
 				t.Errorf("log status = %v", line["status"])
 			}
-			if _, ok := line["latency_ms"].(float64); !ok {
-				t.Errorf("log latency_ms missing: %v", line)
+			for _, k := range []string{"latency_ms", "read_body_ms", "upstream_ttfb_ms", "stream_ms"} {
+				if _, ok := line[k].(float64); !ok {
+					t.Errorf("log %s missing: %v", k, line)
+				}
+			}
+			if line["level"] != "INFO" || line["error"] != nil || line["phase"] != nil {
+				t.Errorf("log = %v, want INFO without error or phase", line)
 			}
 		})
 	}
@@ -203,8 +210,110 @@ func TestHandler_UpstreamUnreachable(t *testing.T) {
 	if typ := errorType(t, rec); typ != "api_error" {
 		t.Errorf("error type = %q", typ)
 	}
-	if line := logLine(t, logs); line["level"] != "ERROR" || line["error"] == nil {
-		t.Errorf("log = %v, want ERROR with error field", line)
+	line := logLine(t, logs)
+	if line["level"] != "ERROR" || line["phase"] != "upstream" {
+		t.Errorf("log = %v, want ERROR in phase upstream", line)
+	}
+	if msg, _ := line["error"].(string); !strings.HasPrefix(msg, "anthropic: forward: ") {
+		t.Errorf("log error = %q, want provider-wrapped error", msg)
+	}
+	if _, ok := line["stream_ms"]; ok {
+		t.Errorf("stream_ms logged for a request that never streamed: %v", line)
+	}
+}
+
+func TestHandler_MidStreamFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: one\n\n")
+		w.(http.Flusher).Flush()
+		// Drop the connection without ending the chunked body.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer upstream.Close()
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+	rec := post(gw, reqBody)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (sent before the failure)", rec.Code)
+	}
+	line := logLine(t, logs)
+	if line["level"] != "ERROR" || line["phase"] != "stream" || line["error"] == nil {
+		t.Errorf("log = %v, want ERROR in phase stream with error", line)
+	}
+	if line["status"] != float64(http.StatusOK) {
+		t.Errorf("log status = %v, want 200", line["status"])
+	}
+}
+
+func TestHandler_ClientDisconnect(t *testing.T) {
+	started := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	stop := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// net/http only watches for the peer closing once the body is consumed.
+		io.Copy(io.Discard, r.Body)
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(upstreamCanceled)
+		case <-stop: // test failed; let upstream.Close return
+		}
+	}))
+	defer upstream.Close()
+	defer close(stop)
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("X-Api-Key", gatewayKey)
+
+	done := make(chan struct{})
+	go func() {
+		gw.ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+	<-started
+	cancel() // the client goes away while waiting on upstream
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream request was not cancelled")
+	}
+	<-done
+
+	line := logLine(t, logs)
+	if line["status"] != float64(499) || line["level"] != "WARN" || line["phase"] != "upstream" {
+		t.Errorf("log = %v, want status 499, WARN, phase upstream", line)
+	}
+}
+
+func TestHandler_BodyReadError(t *testing.T) {
+	gw, logs := newGateway(t, "http://unused", proxy.Options{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", iotest.ErrReader(errors.New("connection reset")))
+	req.Header.Set("X-Api-Key", gatewayKey)
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "invalid_request_error" {
+		t.Errorf("error type = %q", typ)
+	}
+	line := logLine(t, logs)
+	if line["level"] != "WARN" || line["phase"] != "read_body" {
+		t.Errorf("log = %v, want WARN in phase read_body", line)
+	}
+	if _, ok := line["upstream_ttfb_ms"]; ok {
+		t.Errorf("upstream_ttfb_ms logged for a request never sent upstream: %v", line)
 	}
 }
 
