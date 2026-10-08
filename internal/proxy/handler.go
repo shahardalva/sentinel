@@ -140,11 +140,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", reqID)
 	status = resp.StatusCode
 	w.WriteHeader(status)
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if err := copyFlush(w, resp.Body); err != nil {
 		// Status is already sent; all we can do is record it.
 		failure = err
 	}
 	upstreamDur = time.Since(upStart)
+}
+
+// copyFlush copies src to w, flushing after every write so streamed (SSE)
+// events reach the client as they arrive instead of waiting in a buffer.
+func copyFlush(w http.ResponseWriter, src io.Reader) error {
+	rc := http.NewResponseController(w)
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if ferr := rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+				return ferr
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // extractModel returns the "model" field of a JSON body, or "" if absent.

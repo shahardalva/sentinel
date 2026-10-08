@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -125,6 +126,65 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 				t.Errorf("log latency_ms missing: %v", line)
 			}
 		})
+	}
+}
+
+func TestHandler_StreamsEventsAsTheyArrive(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: one\ndata: {}\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, "event: two\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{})
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	// Cancelling the client request on exit unblocks both servers if the test
+	// fails while the stream is still open.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/messages", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Api-Key", gatewayKey)
+
+	first := make(chan string, 1)
+	rest := make(chan string, 1)
+	go func() {
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			first <- "error: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		br := bufio.NewReader(resp.Body)
+		line, _ := br.ReadString('\n')
+		first <- line
+		b, _ := io.ReadAll(br)
+		rest <- string(b)
+	}()
+
+	select {
+	case line := <-first:
+		if line != "event: one\n" {
+			t.Fatalf("first line = %q, want %q", line, "event: one\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first event not delivered while the upstream stream was still open")
+	}
+	close(release)
+	if got := <-rest; !strings.Contains(got, "event: two\n") {
+		t.Errorf("rest of stream = %q, want event two", got)
 	}
 }
 
