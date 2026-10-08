@@ -10,15 +10,19 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Provider forwards a request to an upstream LLM API. Implementations own
-// authentication and decide which client headers are passed upstream.
+// authentication and decide which client headers are passed upstream and
+// which upstream response headers are passed back.
 type Provider interface {
 	Name() string
 	Forward(ctx context.Context, req *Request) (*http.Response, error)
+	// AllowResponseHeader reports whether an upstream response header may be
+	// sent to the client. It must reject hop-by-hop headers.
+	AllowResponseHeader(name string) bool
 }
 
 // Request is a client request as handed to a Provider.
@@ -30,6 +34,8 @@ type Request struct {
 const (
 	DefaultTimeout      = 120 * time.Second
 	DefaultMaxBodyBytes = 32 << 20 // Anthropic's request size limit
+
+	maxLoggedModel = 128 // bytes; the model field is client-controlled
 )
 
 // Options configures a Handler. Zero values select the defaults.
@@ -101,7 +107,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, "invalid_request_error", "could not read request body")
 		return
 	}
-	model = extractModel(body)
+	model = truncate(extractModel(body), maxLoggedModel)
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
@@ -126,7 +132,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	upstreamID = resp.Header.Get("Request-Id")
-	copyHeaders(w.Header(), resp.Header)
+	for k, vv := range resp.Header {
+		if h.provider.AllowResponseHeader(k) {
+			w.Header()[k] = append(w.Header()[k], vv...)
+		}
+	}
 	w.Header().Set("X-Request-Id", reqID)
 	status = resp.StatusCode
 	w.WriteHeader(status)
@@ -146,29 +156,15 @@ func extractModel(body []byte) string {
 	return v.Model
 }
 
-// hopByHop headers apply to a single connection and must not be forwarded
-// (RFC 9110 section 7.6.1).
-var hopByHop = []string{
-	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
-	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
-}
-
-func copyHeaders(dst, src http.Header) {
-	skip := make(map[string]bool, len(hopByHop))
-	for _, k := range hopByHop {
-		skip[k] = true
+// truncate shortens s to at most n bytes without splitting a UTF-8 sequence.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	for _, v := range src.Values("Connection") {
-		for f := range strings.SplitSeq(v, ",") {
-			skip[http.CanonicalHeaderKey(strings.TrimSpace(f))] = true
-		}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
-	for k, vv := range src {
-		if skip[k] {
-			continue
-		}
-		dst[k] = append(dst[k], vv...)
-	}
+	return s[:n]
 }
 
 // writeError writes an error in Anthropic's error response shape.

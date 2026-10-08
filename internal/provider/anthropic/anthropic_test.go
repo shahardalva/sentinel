@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
@@ -14,9 +15,11 @@ func TestForward(t *testing.T) {
 		name          string
 		clientVersion string
 		wantVersion   string
+		beta          []string
 	}{
-		{"default version", "", DefaultVersion},
-		{"client version passed through", "2024-01-01", "2024-01-01"},
+		{"default version", "", DefaultVersion, nil},
+		{"client version passed through", "2024-01-01", "2024-01-01", nil},
+		{"beta passed through", "", DefaultVersion, []string{"feature-a", "feature-b,feature-c"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -36,6 +39,9 @@ func TestForward(t *testing.T) {
 			if tt.clientVersion != "" {
 				h.Set("Anthropic-Version", tt.clientVersion)
 			}
+			for _, b := range tt.beta {
+				h.Add("Anthropic-Beta", b)
+			}
 			resp, err := p.Forward(t.Context(), &proxy.Request{Body: []byte(`{"model":"m"}`), Header: h})
 			if err != nil {
 				t.Fatalf("Forward: %v", err)
@@ -54,6 +60,9 @@ func TestForward(t *testing.T) {
 			if v := got.Header.Get("Anthropic-Version"); v != tt.wantVersion {
 				t.Errorf("anthropic-version = %q, want %q", v, tt.wantVersion)
 			}
+			if v := got.Header.Values("Anthropic-Beta"); !slices.Equal(v, tt.beta) {
+				t.Errorf("anthropic-beta = %q, want %q", v, tt.beta)
+			}
 			if v := got.Header.Get("Content-Type"); v != "application/json" {
 				t.Errorf("content-type = %q", v)
 			}
@@ -61,5 +70,27 @@ func TestForward(t *testing.T) {
 				t.Errorf("body = %q", gotBody)
 			}
 		})
+	}
+}
+
+func TestAllowResponseHeader(t *testing.T) {
+	p := New(Config{})
+	allowed := []string{
+		"Content-Type", "content-type", "Retry-After", "Request-Id", "X-Should-Retry",
+		"anthropic-ratelimit-requests-limit", "Anthropic-Ratelimit-Tokens-Reset",
+	}
+	for _, h := range allowed {
+		if !p.AllowResponseHeader(h) {
+			t.Errorf("%s dropped, want allowed", h)
+		}
+	}
+	denied := []string{
+		"Anthropic-Organization-Id", "Set-Cookie", "Server", "Cf-Ray", "Via",
+		"Connection", "Transfer-Encoding", "Content-Length", "X-Request-Id",
+	}
+	for _, h := range denied {
+		if p.AllowResponseHeader(h) {
+			t.Errorf("%s allowed, want dropped", h)
+		}
 	}
 }

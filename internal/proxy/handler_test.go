@@ -196,40 +196,92 @@ func TestHandler_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandler_FiltersResponseHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Type", "application/json")
+		h.Set("Request-Id", "req_up_1")
+		h.Set("Anthropic-Ratelimit-Requests-Remaining", "49")
+		h.Set("Anthropic-Organization-Id", "org-secret")
+		h.Set("Set-Cookie", "__cf_bm=abc")
+		h.Set("Cf-Ray", "8f00-TLV")
+		h.Set("Server", "cloudflare")
+		h.Set("X-Request-Id", "spoofed")
+		io.WriteString(w, "{}")
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{})
+	rec := post(gw, reqBody)
+
+	for _, k := range []string{"Content-Type", "Request-Id", "Anthropic-Ratelimit-Requests-Remaining"} {
+		if rec.Header().Get(k) == "" {
+			t.Errorf("allowed header %s dropped", k)
+		}
+	}
+	for _, k := range []string{"Anthropic-Organization-Id", "Set-Cookie", "Cf-Ray", "Server"} {
+		if v := rec.Header().Get(k); v != "" {
+			t.Errorf("header %s forwarded: %q", k, v)
+		}
+	}
+	if v := rec.Header().Values("X-Request-Id"); len(v) != 1 || v[0] == "spoofed" {
+		t.Errorf("X-Request-Id = %v, want gateway-generated id", v)
+	}
+}
+
 // stubProvider shows the handler depends only on the Provider interface.
-type stubProvider struct{ resp *http.Response }
+type stubProvider struct {
+	resp  *http.Response
+	allow func(string) bool
+}
 
 func (s stubProvider) Name() string { return "stub" }
 func (s stubProvider) Forward(context.Context, *proxy.Request) (*http.Response, error) {
 	return s.resp, nil
 }
+func (s stubProvider) AllowResponseHeader(name string) bool { return s.allow(name) }
 
-func TestHandler_StripsHopByHopHeaders(t *testing.T) {
+func TestHandler_UsesProviderHeaderAllowlist(t *testing.T) {
 	h := http.Header{}
-	h.Set("Connection", "X-Internal")
-	h.Set("X-Internal", "secret")
-	h.Set("Keep-Alive", "timeout=5")
-	h.Set("X-Request-Id", "spoofed")
 	h.Set("X-Kept", "yes")
-	p := stubProvider{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     h,
-		Body:       io.NopCloser(strings.NewReader("ok")),
-	}}
+	h.Set("X-Dropped", "no")
+	h.Set("X-Request-Id", "spoofed")
+	p := stubProvider{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     h,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		},
+		// Even a provider that allows X-Request-Id can't override the gateway's.
+		allow: func(name string) bool { return name == "X-Kept" || name == "X-Request-Id" },
+	}
 	handler := proxy.NewHandler(p, slog.New(slog.DiscardHandler), proxy.Options{})
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}")))
 
-	for _, k := range []string{"Connection", "X-Internal", "Keep-Alive"} {
-		if v := rec.Header().Get(k); v != "" {
-			t.Errorf("hop-by-hop header %s forwarded: %q", k, v)
-		}
-	}
 	if rec.Header().Get("X-Kept") != "yes" {
-		t.Error("end-to-end header dropped")
+		t.Error("allowed header dropped")
+	}
+	if v := rec.Header().Get("X-Dropped"); v != "" {
+		t.Errorf("disallowed header forwarded: %q", v)
 	}
 	if v := rec.Header().Values("X-Request-Id"); len(v) != 1 || v[0] == "spoofed" {
 		t.Errorf("X-Request-Id = %v, want gateway-generated id", v)
+	}
+}
+
+func TestHandler_TruncatesLoggedModel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	// 127 ASCII bytes then a 3-byte rune that straddles the 128-byte cap.
+	long := strings.Repeat("a", 127) + "€" + strings.Repeat("b", 1<<20)
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+	post(gw, `{"model":"`+long+`"}`)
+
+	model, _ := logLine(t, logs)["model"].(string)
+	if want := strings.Repeat("a", 127); model != want {
+		t.Errorf("logged model = %d bytes %q..., want the 127-byte prefix", len(model), model[:min(len(model), 10)])
 	}
 }
