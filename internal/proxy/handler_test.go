@@ -1,0 +1,230 @@
+package proxy_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/shahardalva/sentinel/internal/provider/anthropic"
+	"github.com/shahardalva/sentinel/internal/proxy"
+)
+
+const reqBody = `{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+
+// newGateway wires the handler to an Anthropic provider pointed at upstreamURL
+// and captures log output.
+func newGateway(t *testing.T, upstreamURL string, opts proxy.Options) (http.Handler, *bytes.Buffer) {
+	t.Helper()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	p := anthropic.New(anthropic.Config{APIKey: "test-key", BaseURL: upstreamURL})
+	mux := http.NewServeMux()
+	mux.Handle("POST /v1/messages", proxy.NewHandler(p, logger, opts))
+	return mux, &logs
+}
+
+func post(h http.Handler, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func logLine(t *testing.T, logs *bytes.Buffer) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &m); err != nil {
+		t.Fatalf("parse log %q: %v", logs.String(), err)
+	}
+	return m
+}
+
+func errorType(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var e struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil || e.Type != "error" {
+		t.Fatalf("not an error body: %q", rec.Body.String())
+	}
+	return e.Error.Type
+}
+
+func TestHandler_PassesResponseThrough(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		header map[string]string
+	}{
+		{"success", http.StatusOK, `{"id":"msg_1","type":"message"}`, map[string]string{"Request-Id": "req_up_1"}},
+		{"upstream error", http.StatusTooManyRequests, `{"type":"error","error":{"type":"rate_limit_error"}}`, map[string]string{"Retry-After": "7"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				for k, v := range tt.header {
+					w.Header().Set(k, v)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				io.WriteString(w, tt.body)
+			}))
+			defer upstream.Close()
+
+			gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+			rec := post(gw, reqBody)
+
+			if string(gotBody) != reqBody {
+				t.Errorf("upstream body = %q, want %q", gotBody, reqBody)
+			}
+			if rec.Code != tt.status {
+				t.Errorf("status = %d, want %d", rec.Code, tt.status)
+			}
+			if rec.Body.String() != tt.body {
+				t.Errorf("body = %q, want %q", rec.Body.String(), tt.body)
+			}
+			for k, v := range tt.header {
+				if got := rec.Header().Get(k); got != v {
+					t.Errorf("header %s = %q, want %q", k, got, v)
+				}
+			}
+			reqID := rec.Header().Get("X-Request-Id")
+			if reqID == "" {
+				t.Fatal("missing X-Request-Id")
+			}
+
+			line := logLine(t, logs)
+			if line["request_id"] != reqID {
+				t.Errorf("log request_id = %v, want %q", line["request_id"], reqID)
+			}
+			if line["model"] != "claude-sonnet-5-5" {
+				t.Errorf("log model = %v", line["model"])
+			}
+			if line["status"] != float64(tt.status) {
+				t.Errorf("log status = %v", line["status"])
+			}
+			if _, ok := line["latency_ms"].(float64); !ok {
+				t.Errorf("log latency_ms missing: %v", line)
+			}
+		})
+	}
+}
+
+func TestHandler_UpstreamUnreachable(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	url := upstream.URL
+	upstream.Close()
+
+	gw, logs := newGateway(t, url, proxy.Options{})
+	rec := post(gw, reqBody)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "api_error" {
+		t.Errorf("error type = %q", typ)
+	}
+	if line := logLine(t, logs); line["level"] != "ERROR" || line["error"] == nil {
+		t.Errorf("log = %v, want ERROR with error field", line)
+	}
+}
+
+func TestHandler_UpstreamTimeout(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer upstream.Close()
+	defer close(release) // runs first, so Close doesn't wait on the stuck handler
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{Timeout: 50 * time.Millisecond})
+	rec := post(gw, reqBody)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "timeout_error" {
+		t.Errorf("error type = %q", typ)
+	}
+}
+
+func TestHandler_BodyTooLarge(t *testing.T) {
+	called := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{MaxBodyBytes: 10})
+	rec := post(gw, reqBody)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "request_too_large" {
+		t.Errorf("error type = %q", typ)
+	}
+	if called {
+		t.Error("upstream was called")
+	}
+}
+
+func TestHandler_MethodNotAllowed(t *testing.T) {
+	gw, _ := newGateway(t, "http://unused", proxy.Options{})
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/messages", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+// stubProvider shows the handler depends only on the Provider interface.
+type stubProvider struct{ resp *http.Response }
+
+func (s stubProvider) Name() string { return "stub" }
+func (s stubProvider) Forward(context.Context, *proxy.Request) (*http.Response, error) {
+	return s.resp, nil
+}
+
+func TestHandler_StripsHopByHopHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("Connection", "X-Internal")
+	h.Set("X-Internal", "secret")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("X-Request-Id", "spoofed")
+	h.Set("X-Kept", "yes")
+	p := stubProvider{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}}
+	handler := proxy.NewHandler(p, slog.New(slog.DiscardHandler), proxy.Options{})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}")))
+
+	for _, k := range []string{"Connection", "X-Internal", "Keep-Alive"} {
+		if v := rec.Header().Get(k); v != "" {
+			t.Errorf("hop-by-hop header %s forwarded: %q", k, v)
+		}
+	}
+	if rec.Header().Get("X-Kept") != "yes" {
+		t.Error("end-to-end header dropped")
+	}
+	if v := rec.Header().Values("X-Request-Id"); len(v) != 1 || v[0] == "spoofed" {
+		t.Errorf("X-Request-Id = %v, want gateway-generated id", v)
+	}
+}
