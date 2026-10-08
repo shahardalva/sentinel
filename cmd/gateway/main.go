@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	defaultAddr     = ":8081"
+	defaultAddr     = "127.0.0.1:8081" // loopback only; set SENTINEL_ADDR to expose
 	upstreamTimeout = 120 * time.Second
 	shutdownTimeout = 30 * time.Second
 )
@@ -35,6 +36,10 @@ func run(logger *slog.Logger) error {
 	if apiKey == "" {
 		return errors.New("ANTHROPIC_API_KEY is not set")
 	}
+	clientKeys := parseKeys(os.Getenv("SENTINEL_API_KEYS"))
+	if len(clientKeys) == 0 {
+		return errors.New("SENTINEL_API_KEYS is not set")
+	}
 	addr := envOr("SENTINEL_ADDR", defaultAddr)
 
 	upstream := anthropic.New(anthropic.Config{
@@ -43,7 +48,8 @@ func run(logger *slog.Logger) error {
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/messages", proxy.NewHandler(upstream, logger, proxy.Options{Timeout: upstreamTimeout}))
+	messages := proxy.NewHandler(upstream, logger, proxy.Options{Timeout: upstreamTimeout})
+	mux.Handle("POST /v1/messages", proxy.RequireKey(clientKeys, logger, messages))
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -77,6 +83,17 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// parseKeys splits a comma-separated key list, dropping blank entries.
+func parseKeys(s string) []string {
+	var keys []string
+	for k := range strings.SplitSeq(s, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 func envOr(key, def string) string {

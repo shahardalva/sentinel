@@ -16,22 +16,27 @@ import (
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
-const reqBody = `{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+const (
+	reqBody     = `{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	upstreamKey = "upstream-secret"
+	gatewayKey  = "gateway-client-secret"
+)
 
-// newGateway wires the handler to an Anthropic provider pointed at upstreamURL
-// and captures log output.
+// newGateway wires the authenticated handler to an Anthropic provider pointed
+// at upstreamURL and captures log output.
 func newGateway(t *testing.T, upstreamURL string, opts proxy.Options) (http.Handler, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	p := anthropic.New(anthropic.Config{APIKey: "test-key", BaseURL: upstreamURL})
+	p := anthropic.New(anthropic.Config{APIKey: upstreamKey, BaseURL: upstreamURL})
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/messages", proxy.NewHandler(p, logger, opts))
+	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey}, logger, proxy.NewHandler(p, logger, opts)))
 	return mux, &logs
 }
 
 func post(h http.Handler, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("X-Api-Key", gatewayKey)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
