@@ -19,12 +19,16 @@ tool policies, and writes an audit log.
 ## Commands
 - go run ./cmd/gateway (needs the env vars below), or make run
 - go test ./... (make test adds -race; make vet, make fmt)
+- make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis (unused yet). Writes ./certs via make certs on first run. Gateway
-  on 127.0.0.1:8081 only. make up-real: gateway against the real API.
-  make down, make logs.
-- make bench / make bench-gateway: k6 in a container against the mock,
-  directly or through the gateway (after make up). DURATION_S and STREAM
+  redis (unused yet). Runs make certs first, which rewrites ./certs when a
+  file is missing or server.pem expires within 7 days, and recreates the
+  containers. Gateway on 127.0.0.1:8081 only. make up-real: gateway
+  against the real API. make down, make logs.
+- make bench: k6 in a container against the mock directly (after make up).
+  make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
+  the mock with a dummy upstream key; it refuses to run if that container's
+  ANTHROPIC_BASE_URL is not the mock. DURATION_S and STREAM
   pass through.
 - Compose without make: docker compose up (real), or add
   -f docker-compose.yml -f docker-compose.mock.yml --profile mock (mock).
@@ -52,14 +56,16 @@ tool policies, and writes an audit log.
   (gitignored) for running cmd/mockupstream with -tls-cert/-tls-key.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY and
-SENTINEL_API_KEYS from .env (copy .env.example, placeholders only; .env is
-gitignored). Compose sets SENTINEL_ADDR=0.0.0.0:8081 in the container and
+SENTINEL_API_KEYS from .env (copy .env.example, which leaves them empty;
+.env is gitignored). Compose sets SENTINEL_ADDR=0.0.0.0:8081 in the container and
 publishes it on 127.0.0.1 only. The mock override sets ANTHROPIC_BASE_URL=
 https://mockupstream:9090, SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and a
-dummy ANTHROPIC_API_KEY. certs/ is bind-mounted read-only; the certs-init
-service copies the server key into a volume owned by the nonroot user
-(65532), since devcerts writes it 0600 for the host user. BENCH_API_KEY in
-.env is the client key for make bench-gateway.
+dummy ANTHROPIC_API_KEY. The gateway, gateway-bench and k6 mount only
+certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
+copies the server key into a volume as a file owned by the nonroot user
+(65532) with mode 0400, since devcerts writes it 0600 for the host user; the
+volume itself stays root-owned. BENCH_API_KEY in .env (optional, default
+"bench") is the only client key gateway-bench accepts.
 
 ## Git workflow
 - Branch from dev. Open pull requests against dev, never main.

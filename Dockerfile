@@ -5,7 +5,8 @@ ARG GO_VERSION=1.27.0
 
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+# go.sum* so the build works before and after the first dependency.
+COPY go.mod go.sum* ./
 COPY cmd ./cmd
 COPY internal ./internal
 ENV CGO_ENABLED=0

@@ -1,7 +1,13 @@
-COMPOSE      := docker compose
-COMPOSE_MOCK := $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml --profile mock
+COMPOSE       := docker compose
+COMPOSE_MOCK  := $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml --profile mock
+COMPOSE_BENCH := $(COMPOSE_MOCK) --profile bench
+MOCK_URL      := https://mockupstream:9090
 
-.PHONY: fmt vet test certs run up up-real down logs bench bench-gateway
+.DEFAULT_GOAL := help
+.PHONY: help fmt vet test certs run up up-real down logs bench bench-gateway
+
+help: ## List the targets
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 fmt: ## Format Go code with gofmt
 	gofmt -w .
@@ -12,17 +18,15 @@ vet: ## Run go vet
 test: ## Run tests with the race detector (needs cgo and a C compiler)
 	go test -race ./...
 
-certs: ## Write a dev CA and a server cert for mockupstream to ./certs
-	go run ./cmd/devcerts -hosts localhost,127.0.0.1,mockupstream
+certs: ## Write a dev CA and server cert to ./certs if missing or expiring within 7 days
+	go run ./cmd/devcerts -hosts localhost,127.0.0.1,mockupstream -renew-within 168h
 
 run: ## Run the gateway on the host (needs the env vars from CLAUDE.md)
 	go run ./cmd/gateway
 
-certs/server.pem:
-	$(MAKE) certs
-
-up: certs/server.pem ## Start gateway, mockupstream and redis; the gateway uses the mock over HTTPS
-	$(COMPOSE_MOCK) up -d --build
+# --force-recreate so mockupstream and the gateway pick up renewed certs.
+up: certs ## Start gateway, mockupstream and redis; the gateway uses the mock over HTTPS
+	$(COMPOSE_MOCK) up -d --build --force-recreate
 
 up-real: ## Start gateway and redis; the gateway uses the real Anthropic API
 	$(COMPOSE) up -d --build
@@ -34,7 +38,17 @@ logs: ## Follow logs from all running services
 	$(COMPOSE_MOCK) logs -f
 
 bench: ## Load test mockupstream directly with k6 (after make up); DURATION_S and STREAM pass through
-	$(COMPOSE_MOCK) run --rm --no-deps k6
+	$(COMPOSE_MOCK) run --rm --no-deps -e TARGET_URL=$(MOCK_URL) k6
 
-bench-gateway: ## Load test through the gateway with k6 (after make up), sending BENCH_API_KEY from .env
-	TARGET_URL=http://gateway:8081 $(COMPOSE_MOCK) run --rm --no-deps k6
+# Runs against gateway-bench, which always points at the mock and has no
+# real upstream key, never the gateway from make up-real. The check refuses
+# to start k6 unless the running gateway-bench container's upstream is the
+# mock, in case an override file changed it.
+bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; DURATION_S and STREAM pass through
+	$(COMPOSE_BENCH) up -d --build --force-recreate --always-recreate-deps gateway-bench
+	@id="$$($(COMPOSE_BENCH) ps -q gateway-bench)"; \
+	if [ -z "$$id" ]; then echo "bench-gateway: gateway-bench is not running" >&2; exit 1; fi; \
+	if ! docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$$id" | tr -d '\r' | grep -qx 'ANTHROPIC_BASE_URL=$(MOCK_URL)'; then \
+		echo "bench-gateway: gateway-bench's upstream is not $(MOCK_URL); refusing to run" >&2; exit 1; \
+	fi
+	$(COMPOSE_BENCH) run --rm --no-deps -e TARGET_URL=http://gateway-bench:8081 k6

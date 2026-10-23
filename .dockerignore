@@ -1,7 +1,8 @@
-# The build only needs go.mod, cmd/ and internal/. Keep secrets and dev
+# The build only needs go.mod, go.sum, cmd/ and internal/. Keep secrets and dev
 # keys out of the build context.
 *
 !go.mod
+!go.sum
 !cmd/
 !internal/
 **/*_test.go

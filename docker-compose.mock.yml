@@ -11,10 +11,11 @@ services:
       # The mock ignores the upstream key, so keep the real one from .env
       # away from it.
       ANTHROPIC_API_KEY: mock-not-a-real-key
+    # Only the CA certificate; the server key stays with mockupstream.
     volumes:
       - type: bind
-        source: ./certs
-        target: /certs
+        source: ./certs/ca.pem
+        target: /certs/ca.pem
         read_only: true
         bind:
           create_host_path: false

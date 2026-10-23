@@ -10,6 +10,8 @@ x-hardening: &hardening
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
 
+# The whole ./certs directory, server key included. Only certs-init and
+# mockupstream mount it.
 x-certs: &certs
   type: bind
   source: ./certs
@@ -17,6 +19,15 @@ x-certs: &certs
   read_only: true
   bind:
     # Fail instead of creating an empty, root-owned ./certs on the host.
+    create_host_path: false
+
+# Just the dev CA certificate, for clients of mockupstream.
+x-ca: &ca
+  type: bind
+  source: ./certs/ca.pem
+  target: /certs/ca.pem
+  read_only: true
+  bind:
     create_host_path: false
 
 services:
@@ -69,6 +80,9 @@ services:
     <<: *hardening
     command:
       - -addr=0.0.0.0:9090
+      # 100ms, not the 200ms default, as in bench/RESULTS.md: about 100
+      # requests in flight at 1000 req/s, under the gateway's cap of 128.
+      - -delay=100ms
       - -tls-cert=/certs/server.pem
       - -tls-key=/key/server-key.pem
     volumes:
@@ -78,6 +92,29 @@ services:
       certs-init:
         condition: service_completed_successfully
     restart: unless-stopped
+
+  # The gateway for make bench-gateway. It always points at mockupstream,
+  # holds only a dummy upstream key and reads nothing from .env except
+  # BENCH_API_KEY, so a load test can never reach the real API. Not
+  # published on the host.
+  gateway-bench:
+    build:
+      context: .
+      target: gateway
+    image: sentinel-gateway:dev
+    profiles: [bench]
+    <<: *hardening
+    environment:
+      SENTINEL_ADDR: 0.0.0.0:8081
+      ANTHROPIC_BASE_URL: https://mockupstream:9090
+      ANTHROPIC_API_KEY: mock-not-a-real-key
+      SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
+      SENTINEL_API_KEYS: ${BENCH_API_KEY:-bench}
+    volumes:
+      - *ca
+    depends_on:
+      mockupstream:
+        condition: service_started
 
   # Not used by the gateway yet.
   redis:
@@ -101,7 +138,7 @@ services:
       STREAM: ${STREAM:-}
       DURATION_S: ${DURATION_S:-30}
     volumes:
-      - *certs
+      - *ca
       - type: bind
         source: ./bench/k6
         target: /scripts

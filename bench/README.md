@@ -104,6 +104,28 @@ encryption. For a like-for-like comparison with the plain-http run, add
 `-dir` and `-validity`. It never writes the CA's private key; rerun it for a
 fresh set.
 
+### With Docker Compose
+
+`make bench` and `make bench-gateway` run the same k6 script in a container
+against the compose stack (see the top-level README), over HTTPS with the dev
+CA:
+
+```bash
+make up              # for make bench: the mock it hits directly
+make bench           # k6 straight at mockupstream
+make bench-gateway   # k6 through gateway-bench, a gateway fixed to the mock
+```
+
+`make bench-gateway` starts its own `gateway-bench` service, which always
+points at the mock and holds no real upstream key, and refuses to run if that
+gateway's upstream is anything else. `DURATION_S` and `STREAM` pass through,
+for example `make bench-gateway DURATION_S=5`.
+
+In compose, mockupstream runs with `-delay 100ms`, the method used in
+[RESULTS.md](RESULTS.md): about 100 requests in flight at 1000 req/s, under
+the gateway's concurrency cap of 128 (see below). Compare compose runs with
+host runs only at the same delay.
+
 ## Reading the results
 
 The end-of-test summary has a threshold block per rate, for example:
