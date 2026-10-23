@@ -155,13 +155,14 @@ All configuration comes from environment variables. Secrets are never read from 
 | `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys. The gateway refuses to start without at least one. |
 | `SENTINEL_ADDR` | No | `127.0.0.1:8081` | Listen address. Loopback only by default. |
 | `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Upstream override. Must be `https`, except for a loopback host. |
+| `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
 
 Built-in limits:
 
 | Limit | Value | Purpose |
 | --- | --- | --- |
 | Max request body | 32 MiB | Matches the provider's request size limit |
-| Concurrent upstream requests | 128 | Bounds memory and upstream connections |
+| Concurrent upstream requests | 128 (`SENTINEL_MAX_CONCURRENT`) | Bounds memory and upstream connections |
 | Body read timeout | 2 min | Bounds slow uploads |
 | Time to first byte | 10 min | Non-streaming requests send nothing until generation finishes |
 | Stream idle timeout | 60 s | Aborts a stream that stops producing data |

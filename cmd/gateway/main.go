@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,17 +41,22 @@ func run(logger *slog.Logger) error {
 		return errors.New("SENTINEL_API_KEYS is not set")
 	}
 	addr := envOr("SENTINEL_ADDR", defaultAddr)
+	maxConcurrent, err := parseMaxConcurrent(os.Getenv("SENTINEL_MAX_CONCURRENT"))
+	if err != nil {
+		return fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
+	}
 
 	upstream, err := anthropic.New(anthropic.Config{
-		APIKey:  apiKey,
-		BaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
+		APIKey:       apiKey,
+		BaseURL:      os.Getenv("ANTHROPIC_BASE_URL"),
+		MaxIdleConns: maxConcurrent,
 	})
 	if err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
 	}
 
 	mux := http.NewServeMux()
-	messages := proxy.NewHandler(upstream, logger, proxy.Options{})
+	messages := proxy.NewHandler(upstream, logger, proxy.Options{MaxConcurrent: maxConcurrent})
 	mux.Handle("POST /v1/messages", proxy.RequireKey(clientKeys, logger, messages))
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
@@ -113,6 +119,19 @@ func parseKeys(s string) []string {
 		}
 	}
 	return keys
+}
+
+// parseMaxConcurrent reads the concurrency cap. Empty means
+// proxy.DefaultMaxConcurrent; anything else must be a positive integer.
+func parseMaxConcurrent(s string) (int, error) {
+	if s == "" {
+		return proxy.DefaultMaxConcurrent, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%q is not a positive integer", s)
+	}
+	return n, nil
 }
 
 func envOr(key, def string) string {

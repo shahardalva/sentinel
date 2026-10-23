@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
 func TestRun_RequiresEnv(t *testing.T) {
@@ -62,5 +64,29 @@ func TestParseKeys(t *testing.T) {
 	}
 	if got := parseKeys(""); len(got) != 0 {
 		t.Errorf("parseKeys(\"\") = %q, want empty", got)
+	}
+}
+
+func TestRun_RejectsInvalidMaxConcurrent(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk")
+	t.Setenv("SENTINEL_API_KEYS", "k1")
+	t.Setenv("SENTINEL_MAX_CONCURRENT", "0")
+	err := run(slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "SENTINEL_MAX_CONCURRENT") {
+		t.Fatalf("run() = %v, want error mentioning SENTINEL_MAX_CONCURRENT", err)
+	}
+}
+
+func TestParseMaxConcurrent(t *testing.T) {
+	if got, err := parseMaxConcurrent(""); err != nil || got != proxy.DefaultMaxConcurrent {
+		t.Errorf("parseMaxConcurrent(\"\") = %d, %v; want %d", got, err, proxy.DefaultMaxConcurrent)
+	}
+	if got, err := parseMaxConcurrent("256"); err != nil || got != 256 {
+		t.Errorf("parseMaxConcurrent(\"256\") = %d, %v; want 256", got, err)
+	}
+	for _, s := range []string{"0", "-1", "abc", "1.5", "12x", " "} {
+		if got, err := parseMaxConcurrent(s); err == nil {
+			t.Errorf("parseMaxConcurrent(%q) = %d, want error", s, got)
+		}
 	}
 }
