@@ -21,6 +21,11 @@ const DefaultTimeout = 50 * time.Millisecond
 
 const keyPrefix = "sentinel:ratelimit:"
 
+// ErrBusy is returned by Allow when every Redis connection stayed busy for
+// the whole timeout. That is load on the gateway, not a Redis failure, so it
+// doesn't count toward the breaker; callers still apply their fail mode.
+var ErrBusy = errors.New("ratelimit: all Redis connections busy")
+
 // bucketScript takes one token from the bucket at KEYS[1], refilling it first
 // for the time since it was last touched. It runs atomically in Redis and
 // uses Redis's clock, so gateways with skewed clocks still share one bucket
@@ -43,8 +48,10 @@ if tokens == nil or ts == nil then
 end
 if now > ts then
   tokens = math.min(capacity, tokens + (now - ts) / period)
-  ts = now
 end
+-- Also when Redis's clock went back (failover, NTP step): that counts as no
+-- time passing, instead of no refill until the clock catches up with ts.
+ts = now
 
 local allowed = 0
 local wait = 0
@@ -83,6 +90,9 @@ type Limiter struct {
 	period   float64 // microseconds per token
 	timeout  time.Duration
 	breaker  *breaker
+	// One per connection in the client's pool, so a call holding a slot
+	// never waits for a connection and its timeout is spent on Redis alone.
+	slots chan struct{}
 }
 
 func New(cfg Config) (*Limiter, error) {
@@ -107,13 +117,16 @@ func New(cfg Config) (*Limiter, error) {
 		period:   float64(time.Minute/time.Microsecond) / float64(cfg.PerMinute),
 		timeout:  cfg.Timeout,
 		breaker:  &breaker{logger: cfg.Logger, cooldown: cfg.BreakerCooldown},
+		slots:    make(chan struct{}, cfg.Client.Options().PoolSize),
 	}, nil
 }
 
 // NewClient returns a Redis client for url (redis:// or rediss://) whose
 // calls honor context deadlines, so Limiter's timeout bounds every call,
-// including dialing.
-func NewClient(url string, timeout time.Duration) (*redis.Client, error) {
+// including dialing. poolSize caps its connections; zero keeps go-redis's
+// default of 10 per CPU. Pass at least the number of requests expected to
+// check their limit at once, or the extra ones get ErrBusy.
+func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, err
@@ -126,6 +139,9 @@ func NewClient(url string, timeout time.Duration) (*redis.Client, error) {
 	opts.ReadTimeout = timeout
 	opts.WriteTimeout = timeout
 	opts.PoolTimeout = timeout
+	if poolSize > 0 {
+		opts.PoolSize = poolSize
+	}
 	opts.DisableIdentity = true // skip CLIENT SETINFO on connect
 	return redis.NewClient(opts), nil
 }
@@ -140,19 +156,42 @@ func (l *Limiter) Allow(ctx context.Context, client string) (proxy.RateLimit, er
 	if !call {
 		return proxy.RateLimit{}, ErrCircuitOpen
 	}
-	res, err := l.run(ctx, client)
+	callCtx, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
+
+	// The wait for a slot counts against the timeout, so Allow still returns
+	// within it, but says nothing about Redis.
+	select {
+	case l.slots <- struct{}{}:
+		defer func() { <-l.slots }()
+	case <-callCtx.Done():
+		if probe {
+			l.breaker.release()
+		}
+		if ctx.Err() != nil {
+			return proxy.RateLimit{}, ctx.Err()
+		}
+		return proxy.RateLimit{}, ErrBusy
+	}
+	// A call left with less than half the timeout after waiting didn't get a
+	// fair chance; if it times out, that's the wait's fault, not Redis's.
+	d, _ := callCtx.Deadline()
+	fair := time.Until(d) >= l.timeout/2
+
+	res, err := l.run(callCtx, client)
+	switch {
+	case err == nil:
+		l.breaker.record(time.Now(), probe, nil)
 	// A caller that gave up says nothing about Redis's health.
-	if ctx.Err() == nil || err == nil {
+	case ctx.Err() == nil && fair:
 		l.breaker.record(time.Now(), probe, err)
-	} else if probe {
+	case probe:
 		l.breaker.release()
 	}
 	return res, err
 }
 
 func (l *Limiter) run(ctx context.Context, client string) (proxy.RateLimit, error) {
-	ctx, cancel := context.WithTimeout(ctx, l.timeout)
-	defer cancel()
 	res, err := bucketScript.Run(ctx, l.client, []string{keyPrefix + client}, l.capacity, l.period).Int64Slice()
 	if err != nil {
 		return proxy.RateLimit{}, err

@@ -66,6 +66,13 @@ func (b *breaker) record(now time.Time, probe bool, err error) {
 	if probe {
 		b.probing = false
 	}
+	// While open only the probe decides. Calls already in flight when it
+	// opened report on Redis as it was then: a late success must not close
+	// it, or a Redis that answers some calls in time and not others would
+	// flip it open and closed many times a second.
+	if b.failures >= BreakerThreshold && !probe {
+		return
+	}
 	if err == nil {
 		if b.failures >= BreakerThreshold {
 			b.logger.Info("redis circuit closed; calling redis again")
@@ -75,7 +82,7 @@ func (b *breaker) record(now time.Time, probe bool, err error) {
 	}
 	b.failures++
 	// Open on the failure that reaches the threshold, and reopen when a
-	// probe fails. Calls already in flight when it opened don't extend it.
+	// probe fails.
 	if b.failures == BreakerThreshold || probe {
 		b.openUntil = now.Add(b.cooldown)
 		b.logger.Warn("redis circuit open; skipping redis and applying the fail mode",

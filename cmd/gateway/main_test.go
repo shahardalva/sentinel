@@ -328,6 +328,7 @@ func TestLoadConfig_RateLimit(t *testing.T) {
 		"SENTINEL_REDIS_URL":            "redis://:hunter2@redis:6379/0",
 		"SENTINEL_RATE_LIMIT_RPM":       "600",
 		"SENTINEL_RATE_LIMIT_FAIL_MODE": "closed",
+		"SENTINEL_MAX_CONCURRENT":       "32",
 	})))
 	if err != nil {
 		t.Fatal(err)
@@ -335,6 +336,11 @@ func TestLoadConfig_RateLimit(t *testing.T) {
 	defer cfg.redis.Close()
 	if cfg.redis == nil || cfg.redis.Options().Addr != "redis:6379" || cfg.rateRPM != 600 || !cfg.rateFailClosed {
 		t.Errorf("set: rpm %d, failClosed %v, redis %v", cfg.rateRPM, cfg.rateFailClosed, cfg.redis)
+	}
+	// Every request in flight can check its limit without waiting for a
+	// Redis connection.
+	if n := cfg.redis.Options().PoolSize; n != 32 {
+		t.Errorf("Redis pool size = %d, want SENTINEL_MAX_CONCURRENT (32)", n)
 	}
 
 	for _, rpm := range []string{"0", "-5", "fast"} {

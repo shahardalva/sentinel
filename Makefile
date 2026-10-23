@@ -4,7 +4,7 @@ COMPOSE_BENCH := $(COMPOSE_MOCK) --profile bench
 MOCK_URL      := https://mockupstream:9090
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt vet test certs run up up-real down logs bench bench-gateway
+.PHONY: help fmt vet test test-redis certs run up up-real down logs bench bench-gateway
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -17,6 +17,11 @@ vet: ## Run go vet
 
 test: ## Run tests with the race detector (needs cgo and a C compiler)
 	go test -race ./...
+
+# A throwaway redis:7-alpine on 127.0.0.1:6390, removed afterwards.
+test-redis: ## Run the tests with the race detector, the rate-limit ones also on a real Redis (needs Docker)
+	docker run -d --rm --name sentinel-test-redis -p 127.0.0.1:6390:6379 redis:7-alpine
+	SENTINEL_TEST_REDIS_URL=redis://127.0.0.1:6390/0 go test -race ./...; status=$$?; 	docker stop sentinel-test-redis >/dev/null; exit $$status
 
 certs: ## Write a dev CA and server cert to ./certs if missing or expiring within 7 days
 	go run ./cmd/devcerts -hosts localhost,127.0.0.1,mockupstream -renew-within 168h

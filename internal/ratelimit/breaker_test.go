@@ -42,7 +42,7 @@ const (
 // logging to the returned buffer.
 func breakerLimiter(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer) {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, breakerTimeout)
+	client, err := ratelimit.NewClient(url, breakerTimeout, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,5 +172,67 @@ func TestBreaker_CallerCancelDoesNotCount(t *testing.T) {
 	// Those were the caller's doing; this one still reaches Redis.
 	if _, err := l.Allow(context.Background(), "client"); errors.Is(err, ratelimit.ErrCircuitOpen) {
 		t.Error("breaker opened on calls the caller cancelled")
+	}
+}
+
+// A probe whose caller hangs up tells nothing about Redis; the next request
+// after it must probe again rather than find the breaker stuck waiting.
+func TestBreaker_AbandonedProbeReleases(t *testing.T) {
+	l, _ := breakerLimiter(t, "redis://"+blackHole(t))
+	failN(t, l, ratelimit.BreakerThreshold)
+	time.Sleep(breakerCooldown)
+
+	ctx, cancel := context.WithTimeout(context.Background(), breakerTimeout/10)
+	defer cancel()
+	if _, err := l.Allow(ctx, "client"); errors.Is(err, ratelimit.ErrCircuitOpen) {
+		t.Fatalf("probe: err = %v, want it to reach Redis", err)
+	}
+
+	start := time.Now()
+	_, err := l.Allow(context.Background(), "client")
+	if errors.Is(err, ratelimit.ErrCircuitOpen) {
+		t.Fatal("after an abandoned probe: ErrCircuitOpen; the next request should probe")
+	}
+	if d := time.Since(start); d < breakerTimeout {
+		t.Errorf("second probe took %v; it should have waited on Redis for the %v timeout", d, breakerTimeout)
+	}
+}
+
+// Requests hammering the limiter while Redis goes down and comes back: the
+// breaker opens, probes and closes again, and -race sees it all.
+func TestBreaker_ConcurrentOutage(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	l, logs := breakerLimiter(t, "redis://"+addr)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					l.Allow(context.Background(), "client")
+				}
+			}
+		})
+	}
+	time.Sleep(50 * time.Millisecond)
+	mr.Close()
+	time.Sleep(2 * breakerCooldown) // trips, then at least one failed probe
+	if err := mr.StartAddr(addr); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * breakerCooldown) // a probe after the cooldown closes it
+	close(stop)
+	wg.Wait()
+
+	if _, err := l.Allow(context.Background(), "client"); err != nil {
+		t.Errorf("after recovery: err = %v, want the breaker closed", err)
+	}
+	if out := logs.String(); !strings.Contains(out, "redis circuit open") || !strings.Contains(out, "redis circuit closed") {
+		t.Errorf("want the breaker to open and close:\n%s", out)
 	}
 }

@@ -102,7 +102,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	var rdb *redis.Client
 	if u := getenv("SENTINEL_REDIS_URL"); u != "" {
 		// The URL may hold a password, so errors don't repeat it.
-		if rdb, err = ratelimit.NewClient(u, ratelimit.DefaultTimeout); err != nil {
+		if rdb, err = ratelimit.NewClient(u, ratelimit.DefaultTimeout, maxConcurrent); err != nil {
 			return config{}, errors.New("SENTINEL_REDIS_URL: not a valid redis:// or rediss:// URL")
 		}
 	}

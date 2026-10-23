@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,7 +56,7 @@ func newRateLimited(t *testing.T, perMinute int, failClosed bool, redisURL strin
 	if redisURL == "" {
 		redisURL = "redis://" + mr.Addr()
 	}
-	client, err := ratelimit.NewClient(redisURL, timeout)
+	client, err := ratelimit.NewClient(redisURL, timeout, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +298,8 @@ func TestRateLimit_SlowRedisTimesOut(t *testing.T) {
 		if rec.Code != want {
 			t.Errorf("failClosed=%v: status = %d, want %d", failClosed, rec.Code, want)
 		}
-		if elapsed > 10*timeout {
+		// The slack covers the rest of the request, not a second Redis wait.
+		if elapsed > timeout+50*time.Millisecond {
 			t.Errorf("failClosed=%v: request took %v with a %v Redis timeout", failClosed, elapsed, timeout)
 		}
 		line := lastLog(t, rl.logs)
@@ -328,5 +330,35 @@ func TestRateLimit_OpenBreakerSkipsRedis(t *testing.T) {
 	line := lastLog(t, rl.logs)
 	if !strings.Contains(line["error"].(string), "circuit open") {
 		t.Errorf("log error = %v, want it to mention the open circuit", line["error"])
+	}
+}
+
+// A client that hangs up while its limit is being checked is not a Redis
+// outage: no 503, no fail-open warning, and nothing sent upstream.
+func TestRateLimit_ClientGoneDuringCheck(t *testing.T) {
+	for _, failClosed := range []bool{false, true} {
+		rl := newRateLimited(t, 60, failClosed, stalledRedis(t), time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+		req.Header.Set("X-Api-Key", gatewayKey)
+		rec := httptest.NewRecorder()
+		rl.gw.ServeHTTP(rec, req)
+		cancel()
+
+		if rec.Body.Len() != 0 {
+			t.Errorf("failClosed=%v: wrote %q to a client that is gone", failClosed, rec.Body)
+		}
+		if n := rl.calls.Load(); n != 0 {
+			t.Errorf("failClosed=%v: %d requests reached upstream", failClosed, n)
+		}
+		lines := logLines(t, rl.logs)
+		if len(lines) != 1 {
+			t.Fatalf("failClosed=%v: %d log lines, want only the request line: %v", failClosed, len(lines), lines)
+		}
+		line := lines[0]
+		if line["status"] != 499.0 || line["level"] != "WARN" || line["phase"] != "rate_limit" {
+			t.Errorf("failClosed=%v: status %v, level %v, phase %v; want 499, WARN, rate_limit",
+				failClosed, line["status"], line["level"], line["phase"])
+		}
 	}
 }

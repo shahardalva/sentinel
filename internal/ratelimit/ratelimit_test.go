@@ -2,10 +2,12 @@ package ratelimit_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +30,7 @@ func newLimiter(t *testing.T, perMinute int) (*ratelimit.Limiter, *miniredis.Min
 
 func limiterFor(t *testing.T, url string, perMinute int, timeout time.Duration) *ratelimit.Limiter {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, timeout)
+	client, err := ratelimit.NewClient(url, timeout, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +103,24 @@ func TestAllow_Refills(t *testing.T) {
 	}
 }
 
+// A Redis clock that steps back, as after a failover to a replica whose
+// clock is behind, must not stall refills until it catches up.
+func TestAllow_ClockGoesBack(t *testing.T) {
+	l, mr := newLimiter(t, 60)
+	for range 60 {
+		allow(t, l, "client")
+	}
+	back := t0.Add(-10 * time.Minute)
+	mr.SetTime(back)
+	if ok, _, retry := allow(t, l, "client"); ok || retry != time.Second {
+		t.Errorf("clock stepped back: allowed %v, RetryAfter %v; want denied, 1s (no time passed)", ok, retry)
+	}
+	mr.SetTime(back.Add(time.Second))
+	if ok, _, _ := allow(t, l, "client"); !ok {
+		t.Error("1s after the step back: denied; the bucket should refill from the new clock")
+	}
+}
+
 func TestAllow_SeparateClients(t *testing.T) {
 	l, _ := newLimiter(t, 3)
 	for range 3 {
@@ -158,7 +178,7 @@ func blackHole(t *testing.T) string {
 }
 
 func TestAllow_SlowRedisTimesOut(t *testing.T) {
-	const timeout = 100 * time.Millisecond
+	const timeout = ratelimit.DefaultTimeout
 	l := limiterFor(t, "redis://"+blackHole(t), 60, timeout)
 	start := time.Now()
 	_, err := l.Allow(context.Background(), "client")
@@ -166,8 +186,99 @@ func TestAllow_SlowRedisTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("Allow against a stalled Redis: no error")
 	}
-	if elapsed > 10*timeout {
+	if elapsed < timeout || elapsed > 2*timeout {
 		t.Errorf("Allow took %v with a %v timeout", elapsed, timeout)
+	}
+}
+
+// slowRedis forwards to target, holding back each reply chunk while
+// *delay is set. Connection setup is delayed too, so callers warm up a
+// connection before setting it.
+func slowRedis(t *testing.T, target string, delay *atomic.Int64) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			t.Cleanup(func() { c.Close(); up.Close() })
+			go io.Copy(up, c)
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					n, err := up.Read(buf)
+					if n > 0 {
+						time.Sleep(time.Duration(delay.Load()))
+						if _, werr := c.Write(buf[:n]); werr != nil {
+							return
+						}
+					}
+					if err != nil {
+						c.Close()
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// More calls at once than the pool has connections: the extra ones give up
+// with ErrBusy, and since Redis itself answered, the breaker stays closed.
+func TestAllow_PoolBusyDoesNotTripBreaker(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	mr := miniredis.RunT(t)
+	delay := new(atomic.Int64)
+	client, err := ratelimit.NewClient("redis://"+slowRedis(t, mr.Addr(), delay), timeout, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	if n := client.Options().PoolSize; n != 1 {
+		t.Fatalf("PoolSize = %d, want 1", n)
+	}
+	l, err := ratelimit.New(ratelimit.Config{Client: client, PerMinute: 1000, Timeout: timeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Allow(context.Background(), "client"); err != nil {
+		t.Fatalf("warm-up: %v", err)
+	}
+
+	delay.Store(int64(70 * time.Millisecond)) // each call holds the one connection this long
+	const n = 4 * ratelimit.BreakerThreshold
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			_, err := l.Allow(context.Background(), "client")
+			errs <- err
+		}()
+	}
+	var busy int
+	for range n {
+		if err := <-errs; errors.Is(err, ratelimit.ErrBusy) {
+			busy++
+		}
+	}
+	if busy == 0 {
+		t.Error("no call got ErrBusy; the test did not exhaust the pool")
+	}
+
+	delay.Store(0)
+	if _, err := l.Allow(context.Background(), "client"); err != nil {
+		t.Errorf("after the burst: err = %v, want the breaker still closed", err)
 	}
 }
 
@@ -183,7 +294,7 @@ func TestRouteClientLogs(t *testing.T) {
 }
 
 func TestNew_Validates(t *testing.T) {
-	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0)
+	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +305,7 @@ func TestNew_Validates(t *testing.T) {
 	if _, err := ratelimit.New(ratelimit.Config{PerMinute: 60}); err == nil {
 		t.Error("New with no client: no error")
 	}
-	if _, err := ratelimit.NewClient("http://example.com", 0); err == nil {
+	if _, err := ratelimit.NewClient("http://example.com", 0, 0); err == nil {
 		t.Error("NewClient with an http URL: no error")
 	}
 }

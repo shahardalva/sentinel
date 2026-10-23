@@ -261,6 +261,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lim, err := h.limiter.Allow(r.Context(), id)
 		limitDur = time.Since(limitStart)
 		switch {
+		case err != nil && r.Context().Err() != nil:
+			// The client went away; Redis may be fine, and nobody is left
+			// to answer.
+			failure = err
+			status = 499 // client closed request
+			return
 		case err != nil && h.failClosed:
 			failure = fmt.Errorf("rate limiter unavailable: %w", err)
 			status = http.StatusServiceUnavailable
