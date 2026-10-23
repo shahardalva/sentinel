@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"log/slog"
@@ -125,12 +126,12 @@ func generate(t *testing.T) *devcert.Bundle {
 // caFile, to an upstream presenting a certificate from served.
 func forward(t *testing.T, caFile string, served *devcert.Bundle) error {
 	t.Helper()
-	pool, err := loadCAFile(caFile)
+	cas, err := loadCAFile(caFile)
 	if err != nil {
 		t.Fatalf("loadCAFile: %v", err)
 	}
 	ts := tlsUpstream(t, served)
-	p, err := anthropic.New(anthropic.Config{APIKey: "sk", BaseURL: ts.URL, RootCAs: pool})
+	p, err := anthropic.New(anthropic.Config{APIKey: "sk", BaseURL: ts.URL, ExtraRootCAs: cas})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,13 +163,15 @@ func TestUpstreamCA_RejectsUnknownCA(t *testing.T) {
 }
 
 func TestRun_RejectsBadCAFile(t *testing.T) {
-	notPEM := writeFile(t, []byte("not a certificate"))
+	b := generate(t)
 	// A PEM block of the right type whose contents don't parse.
-	badCert := writeFile(t, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")}))
+	junk := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")})
 	tests := []struct{ name, path string }{
 		{"missing", filepath.Join(t.TempDir(), "nope.pem")},
-		{"not PEM", notPEM},
-		{"invalid certificate", badCert},
+		{"not PEM", writeFile(t, []byte("not a certificate"))},
+		{"invalid certificate", writeFile(t, junk)},
+		{"valid then invalid certificate", writeFile(t, append(slices.Clone(b.CACert), junk...))},
+		{"private key", writeFile(t, append(slices.Clone(b.CACert), b.ServerKey...))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -178,6 +181,72 @@ func TestRun_RejectsBadCAFile(t *testing.T) {
 			err := run(slog.New(slog.DiscardHandler))
 			if err == nil || !strings.Contains(err.Error(), "SENTINEL_UPSTREAM_CA_FILE") {
 				t.Fatalf("run() = %v, want error mentioning SENTINEL_UPSTREAM_CA_FILE", err)
+			}
+		})
+	}
+}
+
+func TestRun_CAFileKeepsHTTPSRule(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk")
+	t.Setenv("SENTINEL_API_KEYS", "k1")
+	t.Setenv("SENTINEL_UPSTREAM_CA_FILE", writeFile(t, generate(t).CACert))
+	t.Setenv("ANTHROPIC_BASE_URL", "http://example.com")
+	err := run(slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_BASE_URL") {
+		t.Fatalf("run() = %v, want error mentioning ANTHROPIC_BASE_URL", err)
+	}
+}
+
+func TestLoadCAFile(t *testing.T) {
+	a, b := generate(t), generate(t)
+	path := writeFile(t, append(slices.Clone(a.CACert), b.CACert...))
+	certs, err := loadCAFile(path)
+	if err != nil || len(certs) != 2 {
+		t.Fatalf("loadCAFile = %d certs, %v; want 2, nil", len(certs), err)
+	}
+}
+
+func TestLogCAs(t *testing.T) {
+	b := generate(t)
+	ca, err := loadCAFile(writeFile(t, b.CACert))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := loadCAFile(writeFile(t, b.ServerCert))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		certs     []*x509.Certificate
+		baseURL   string
+		wantWarns []string
+	}{
+		{"CA, custom upstream", ca, "https://localhost:9090", nil},
+		{"CA, default upstream", ca, "", []string{"default Anthropic API"}},
+		{"CA, explicit default upstream", ca, "https://api.anthropic.com/", []string{"default Anthropic API"}},
+		{"non-CA, custom upstream", leaf, "https://localhost:9090", []string{"non-CA certificate"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf strings.Builder
+			logCAs(slog.New(slog.NewTextHandler(&buf, nil)), "ca.pem", tt.certs, tt.baseURL)
+			var warns []string
+			for line := range strings.Lines(buf.String()) {
+				if strings.Contains(line, "level=WARN") {
+					warns = append(warns, line)
+				}
+			}
+			if len(warns) != len(tt.wantWarns) {
+				t.Fatalf("warnings = %q, want %d", warns, len(tt.wantWarns))
+			}
+			for i, want := range tt.wantWarns {
+				if !strings.Contains(warns[i], want) {
+					t.Errorf("warning %d = %q, want it to mention %q", i, warns[i], want)
+				}
+			}
+			if !strings.Contains(buf.String(), "certs=1") {
+				t.Errorf("log %q missing cert count", buf.String())
 			}
 		})
 	}

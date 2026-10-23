@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -47,22 +48,26 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
 	}
 
-	var rootCAs *x509.CertPool
-	if caFile := os.Getenv("SENTINEL_UPSTREAM_CA_FILE"); caFile != "" {
-		if rootCAs, err = loadCAFile(caFile); err != nil {
+	caFile := os.Getenv("SENTINEL_UPSTREAM_CA_FILE")
+	var extraCAs []*x509.Certificate
+	if caFile != "" {
+		if extraCAs, err = loadCAFile(caFile); err != nil {
 			return fmt.Errorf("SENTINEL_UPSTREAM_CA_FILE: %w", err)
 		}
-		logger.Info("trusting extra upstream CAs", "file", caFile)
 	}
 
+	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
 	upstream, err := anthropic.New(anthropic.Config{
 		APIKey:       apiKey,
-		BaseURL:      os.Getenv("ANTHROPIC_BASE_URL"),
+		BaseURL:      baseURL,
 		MaxIdleConns: maxConcurrent,
-		RootCAs:      rootCAs,
+		ExtraRootCAs: extraCAs,
 	})
 	if err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
+	}
+	if caFile != "" {
+		logCAs(logger, caFile, extraCAs, baseURL)
 	}
 
 	mux := http.NewServeMux()
@@ -144,21 +149,51 @@ func parseMaxConcurrent(s string) (int, error) {
 	return n, nil
 }
 
-// loadCAFile returns the system trust store plus the PEM certificates in
-// path. It fails if the file can't be read or holds no valid certificate.
-func loadCAFile(path string) (*x509.CertPool, error) {
+// loadCAFile returns the certificates in the PEM file at path. Every PEM
+// block must be a CERTIFICATE that parses, and there must be at least one;
+// a stray private key or a corrupt block fails rather than being skipped.
+func loadCAFile(path string) ([]*x509.Certificate, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	pool, err := x509.SystemCertPool()
-	if err != nil {
-		return nil, fmt.Errorf("load system trust store: %w", err)
+	var certs []*x509.Certificate
+	for n := 1; ; n++ {
+		var block *pem.Block
+		if block, data = pem.Decode(data); block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("%s: PEM block %d is %q, want CERTIFICATE", path, n, block.Type)
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%s: PEM block %d: %w", path, n, err)
+		}
+		certs = append(certs, cert)
 	}
-	if !pool.AppendCertsFromPEM(data) {
-		return nil, fmt.Errorf("%s contains no valid PEM certificates", path)
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("%s contains no PEM certificates", path)
 	}
-	return pool, nil
+	return certs, nil
+}
+
+// logCAs records the extra upstream CAs and warns about setups that widen
+// trust more than intended.
+func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, baseURL string) {
+	logger.Info("trusting extra upstream CAs", "file", file, "certs", len(cas))
+	for _, c := range cas {
+		if !c.IsCA {
+			// Go trusts any certificate in the root pool, CA or not.
+			logger.Warn("upstream CA file holds a non-CA certificate; it is trusted as a root anyway",
+				"file", file, "subject", c.Subject.String())
+		}
+	}
+	if baseURL == "" || strings.TrimRight(baseURL, "/") == anthropic.DefaultBaseURL {
+		logger.Warn("extra upstream CAs are trusted for the default Anthropic API; "+
+			"anyone holding one of their keys could impersonate it and read ANTHROPIC_API_KEY",
+			"file", file, "upstream", anthropic.DefaultBaseURL)
+	}
 }
 
 func envOr(key, def string) string {

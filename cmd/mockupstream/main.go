@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +24,7 @@ func main() {
 	eventDelay := flag.Duration("event-delay", 10*time.Millisecond, "delay between stream events")
 	tlsCert := flag.String("tls-cert", "", "PEM certificate file; serve HTTPS (requires -tls-key)")
 	tlsKey := flag.String("tls-key", "", "PEM private key file; serve HTTPS (requires -tls-cert)")
+	http1 := flag.Bool("http1", false, "over HTTPS, offer only HTTP/1.1, matching the plain-http connection model")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -32,7 +34,12 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	logger.Info("listening", "addr", *addr, "tls", *tlsCert != "", "delay", delay.String(), "event_delay", eventDelay.String())
+	if *http1 {
+		// A non-nil, empty map stops ListenAndServeTLS from enabling HTTP/2.
+		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	}
+	logger.Info("listening", "addr", *addr, "tls", *tlsCert != "", "http1_only", *http1,
+		"delay", delay.String(), "event_delay", eventDelay.String())
 	if err := serve(srv, *tlsCert, *tlsKey); err != nil {
 		logger.Error("mockupstream exited", "error", err)
 		os.Exit(1)

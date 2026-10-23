@@ -29,9 +29,10 @@ type Config struct {
 	// MaxIdleConns sizes the default client's idle pool; set it to the
 	// gateway's concurrency cap. Defaults to proxy.DefaultMaxConcurrent.
 	MaxIdleConns int
-	// RootCAs, if set, replaces the default client's trust store for the
-	// upstream TLS connection. Ignored when Client is set.
-	RootCAs *x509.CertPool
+	// ExtraRootCAs are trusted for the upstream TLS connection in addition
+	// to the system trust store, never instead of it. Ignored when Client
+	// is set.
+	ExtraRootCAs []*x509.Certificate
 }
 
 type Provider struct {
@@ -60,9 +61,11 @@ func New(cfg Config) (*Provider, error) {
 		}
 		t.MaxIdleConns = cfg.MaxIdleConns
 		t.MaxIdleConnsPerHost = cfg.MaxIdleConns
-		if cfg.RootCAs != nil {
-			t.TLSClientConfig = &tls.Config{RootCAs: cfg.RootCAs, MinVersion: tls.VersionTLS12}
+		tlsCfg, err := tlsConfig(t.TLSClientConfig, cfg.ExtraRootCAs)
+		if err != nil {
+			return nil, err
 		}
+		t.TLSClientConfig = tlsCfg
 		cfg.Client = &http.Client{Transport: t}
 	}
 	return &Provider{
@@ -70,6 +73,30 @@ func New(cfg Config) (*Provider, error) {
 		endpoint: strings.TrimRight(cfg.BaseURL, "/") + "/v1/messages",
 		client:   cfg.Client,
 	}, nil
+}
+
+// tlsConfig builds on base (which may be nil) rather than replacing it, so
+// any defaults the transport carries are kept. It sets a TLS 1.2 floor and,
+// when extra CAs are given, a pool of the system roots plus those CAs.
+func tlsConfig(base *tls.Config, extraCAs []*x509.Certificate) (*tls.Config, error) {
+	c := &tls.Config{}
+	if base != nil {
+		c = base.Clone()
+	}
+	if c.MinVersion < tls.VersionTLS12 {
+		c.MinVersion = tls.VersionTLS12
+	}
+	if len(extraCAs) > 0 {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: load system trust store: %w", err)
+		}
+		for _, ca := range extraCAs {
+			pool.AddCert(ca)
+		}
+		c.RootCAs = pool
+	}
+	return c, nil
 }
 
 func validateBaseURL(raw string) error {
