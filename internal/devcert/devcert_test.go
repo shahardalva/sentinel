@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"math/big"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,6 +48,32 @@ func TestGenerate(t *testing.T) {
 	}
 	if _, err := srv.Verify(x509.VerifyOptions{DNSName: "example.com", Roots: roots}); err == nil {
 		t.Error("verify for example.com succeeded, want hostname error")
+	}
+}
+
+func TestGenerate_DistinctCANames(t *testing.T) {
+	a, err := Generate([]string{"localhost"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Generate([]string{"localhost"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	na, nb := parse(t, a.CACert).Subject.CommonName, parse(t, b.CACert).Subject.CommonName
+	if na == nb {
+		t.Errorf("two CAs share the name %q", na)
+	}
+	if !strings.HasPrefix(na, "Sentinel dev CA ") {
+		t.Errorf("CA name = %q, want prefix %q", na, "Sentinel dev CA ")
+	}
+}
+
+func TestCAName(t *testing.T) {
+	serial := new(big.Int).SetBytes([]byte{0x1a, 0x2b, 0x3c, 0x4d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01})
+	got := caName(serial, time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	if want := "Sentinel dev CA 2026-10-23 1a2b3c4d"; got != want {
+		t.Errorf("caName = %q, want %q", got, want)
 	}
 }
 

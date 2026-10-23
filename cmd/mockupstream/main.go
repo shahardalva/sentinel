@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -28,34 +29,56 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	fail := func(err error) {
+		logger.Error("mockupstream exited", "error", err)
+		os.Exit(1)
+	}
 	srv := &http.Server{
-		Addr:              *addr,
 		Handler:           newHandler(*delay, *eventDelay),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	// Check everything that can fail before logging that we're listening.
+	useTLS, err := tlsEnabled(*tlsCert, *tlsKey)
+	if err != nil {
+		fail(err)
+	}
+	if useTLS {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			fail(err)
+		}
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
 	if *http1 {
-		// A non-nil, empty map stops ListenAndServeTLS from enabling HTTP/2.
+		// A non-nil, empty map stops ServeTLS from enabling HTTP/2.
 		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
 	}
-	logger.Info("listening", "addr", *addr, "tls", *tlsCert != "", "http1_only", *http1,
-		"delay", delay.String(), "event_delay", eventDelay.String())
-	if err := serve(srv, *tlsCert, *tlsKey); err != nil {
-		logger.Error("mockupstream exited", "error", err)
-		os.Exit(1)
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fail(err)
 	}
+	logger.Info("listening", "addr", ln.Addr().String(), "tls", useTLS, "http1_only", *http1,
+		"delay", delay.String(), "event_delay", eventDelay.String())
+	fail(serve(srv, ln, useTLS))
 }
 
-// serve runs srv over HTTPS when certFile and keyFile are both set, and over
-// plain HTTP when neither is.
-func serve(srv *http.Server, certFile, keyFile string) error {
-	switch {
-	case certFile == "" && keyFile == "":
-		return srv.ListenAndServe()
-	case certFile == "" || keyFile == "":
-		return errors.New("-tls-cert and -tls-key must be set together")
+// tlsEnabled reports whether to serve HTTPS: true when certFile and keyFile
+// are both set, false when neither is, and an error when only one is.
+func tlsEnabled(certFile, keyFile string) (bool, error) {
+	if (certFile == "") != (keyFile == "") {
+		return false, errors.New("-tls-cert and -tls-key must be set together")
 	}
-	return srv.ListenAndServeTLS(certFile, keyFile)
+	return certFile != "", nil
+}
+
+// serve runs srv on ln, over HTTPS with srv.TLSConfig's certificate when
+// useTLS is set.
+func serve(srv *http.Server, ln net.Listener, useTLS bool) error {
+	if useTLS {
+		return srv.ServeTLS(ln, "", "")
+	}
+	return srv.Serve(ln)
 }
 
 func newHandler(delay, eventDelay time.Duration) http.Handler {
