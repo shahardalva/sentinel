@@ -121,6 +121,15 @@ points at the mock and holds no real upstream key, and refuses to run if that
 gateway's upstream is anything else. `DURATION_S` and `STREAM` pass through,
 for example `make bench-gateway DURATION_S=5`.
 
+`gateway-bench` rate limits through the compose Redis, like a production
+gateway, so every request includes the Redis call and the overhead you
+measure includes it. Its limit is `SENTINEL_RATE_LIMIT_RPM=1000000`, far above
+anything the script sends (1000 req/s is 60,000 a minute), so the bench never
+gets a `429`. It uses Redis database 1, apart from the `make up` gateway's
+buckets in database 0. The request log's `rate_limit_us` shows the Redis time
+on its own. Results from before this change, such as those in
+[RESULTS.md](RESULTS.md), have no Redis call, so compare them with care.
+
 In compose, mockupstream runs with `-delay 100ms`, the method used in
 [RESULTS.md](RESULTS.md): about 100 requests in flight at 1000 req/s, under
 the gateway's concurrency cap of 128 (see below). Compare compose runs with

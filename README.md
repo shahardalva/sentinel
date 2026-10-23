@@ -8,7 +8,7 @@ The goal is a single control point for LLM traffic: who is calling, what is bein
 
 [![CI](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-success)
+![Dependencies](https://img.shields.io/badge/dependencies-go--redis%20only-success)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 
@@ -54,7 +54,8 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 - Per-client gateway keys, accepted as `x-api-key` or `Authorization: Bearer`. Keys are compared as SHA-256 digests in constant time.
 - The upstream provider key never leaves the gateway. Client credential headers are stripped before the request is forwarded.
 - Upstream response headers pass through an allowlist. Organization IDs, cookies and CDN headers are dropped.
-- Early rejections (401, 413, 415, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
+- Per-key rate limiting in Redis: a token bucket per client key, answered with `429` and `Retry-After` before the body is read. Redis stores only a SHA-256 digest of each key.
+- Early rejections (401, 413, 415, 429, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
 - `anthropic-version` must be a real `YYYY-MM-DD` date. `anthropic-beta` values with control characters are rejected.
 - The upstream base URL must be `https` (plain `http` is allowed only for loopback test servers). The gateway refuses to start otherwise.
 - Binds to `127.0.0.1` by default. Exposing it on a network is an explicit choice.
@@ -76,9 +77,9 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 - Every response carries an `X-Request-Id` header that matches the log line.
 
 **Engineering**
-- Standard library only. No third-party dependencies.
+- One third-party dependency, `go-redis`, for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)). Everything else is the standard library.
 - Provider-agnostic core. The handler knows nothing about Anthropic; provider-specific behavior lives behind a `Provider` interface.
-- 44 test functions covering the behavior above, passing under the race detector.
+- 98 test functions covering the behavior above, passing under the race detector. Rate-limit tests run against an in-process Redis (`miniredis`), so CI needs no Redis server.
 
 ## Quick start
 
@@ -90,7 +91,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 ### Run with Docker Compose
 
-The compose stack runs the gateway, a mock upstream over HTTPS and Redis (not used by the gateway yet). The gateway is published on `127.0.0.1:8081` only.
+The compose stack runs the gateway, a mock upstream over HTTPS and Redis, which the gateway uses for rate limiting. The gateway is published on `127.0.0.1:8081` only.
 
 ```bash
 cp .env.example .env   # then fill it in; .env is gitignored
@@ -183,8 +184,11 @@ All configuration comes from environment variables. Secrets are never read from 
 | `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Upstream override. Must be `https`, except for a loopback host. |
 | `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
 | `SENTINEL_UPSTREAM_CA_FILE` | No | | PEM file of extra CA certificates to trust for the upstream connection, added to the system trust store. For a private or dev CA (see `cmd/devcerts`). Every PEM block must be a valid certificate; the gateway refuses to start if the file is missing, holds none, or holds anything else. The CAs are trusted for whatever host `ANTHROPIC_BASE_URL` names, including the default; the gateway logs a warning in that case, since anyone holding the CA's key could then impersonate the Anthropic API. Does not relax the `https` rule. |
+| `SENTINEL_REDIS_URL` | No | | Redis for per-key rate limiting, as `redis://[:password@]host:port/db` or `rediss://` for TLS. Unset turns rate limiting off, and the gateway logs that at startup. A malformed URL stops startup. An unreachable Redis at startup is only a warning. |
+| `SENTINEL_RATE_LIMIT_RPM` | No | `60` | Requests per minute per client key. Also the burst: a full bucket holds a minute's worth. Must be a positive integer. |
+| `SENTINEL_RATE_LIMIT_FAIL_MODE` | No | `open` | What happens when Redis can't answer within 50 ms. `open` lets the request through and logs a `WARN`, at most once per 10 seconds. `closed` answers `503`. After 5 failures in a row, a circuit breaker skips Redis for 5 seconds and applies the fail mode at once, then lets one request try Redis again. See [ADR 0002](docs/adr/0002-rate-limiting.md). |
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and a dummy `ANTHROPIC_API_KEY`. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends.
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and a dummy `ANTHROPIC_API_KEY`. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -192,6 +196,8 @@ Built-in limits:
 | --- | --- | --- |
 | Max request body | 32 MiB | Matches the provider's request size limit |
 | Concurrent upstream requests | 128 (`SENTINEL_MAX_CONCURRENT`) | Bounds memory and upstream connections |
+| Rate limit | 60 requests/min per key (`SENTINEL_RATE_LIMIT_RPM`) | Stops one key from using the whole budget. Off without `SENTINEL_REDIS_URL` |
+| Redis call timeout | 50 ms | A slow Redis adds at most this much to a request |
 | Body read timeout | 2 min | Bounds slow uploads |
 | Time to first byte | 10 min | Non-streaming requests send nothing until generation finishes |
 | Stream idle timeout | 60 s | Aborts a stream that stops producing data |
@@ -201,15 +207,16 @@ Built-in limits:
 
 ## Request lifecycle
 
-Each request moves through five stages. Every stage can end the request, and each one is timed.
+Each request moves through six stages. Every stage can end the request, and each one is timed.
 
 1. **Auth.** Match the client key in constant time. Strip credential headers.
-2. **Intake.** Reject compressed bodies and oversized declared lengths, then read the body under a deadline.
-3. **Admission.** Take a concurrency slot, or shed load with `503`.
-4. **Provider.** Validate provider headers, attach the gateway's credentials, forward, and filter the response headers.
-5. **Stream relay.** Copy the response to the client, flushing every chunk, with idle and write deadlines.
+2. **Rate limit.** Take a token from the key's bucket in Redis, or answer `429`. Runs before the body is read, so a rejected request costs one Redis call and no upload.
+3. **Intake.** Reject compressed bodies and oversized declared lengths, then read the body under a deadline.
+4. **Admission.** Take a concurrency slot, or shed load with `503`.
+5. **Provider.** Validate provider headers, attach the gateway's credentials, forward, and filter the response headers.
+6. **Stream relay.** Copy the response to the client, flushing every chunk, with idle and write deadlines.
 
-The logged timings map to these stages: `read_body_ms` for intake, `upstream_ttfb_ms` until the provider's response headers arrive, and `stream_ms` for the relay.
+The logged timings map to these stages: `rate_limit_us` for the Redis call, `read_body_ms` for intake, `upstream_ttfb_ms` until the provider's response headers arrive, and `stream_ms` for the relay.
 
 ## Error responses
 
@@ -226,8 +233,10 @@ Errors use the same JSON shape as the Anthropic API, so existing SDKs parse them
 | 408 | `timeout_error` | Request body not received in time |
 | 413 | `request_too_large` | Body larger than the limit, declared or actual |
 | 415 | `invalid_request_error` | Request has a `Content-Encoding` |
+| 429 | `rate_limit_error` | The client key is over its rate limit. `Retry-After` says when a token is back |
 | 502 | `api_error` | Provider unreachable, or it rejected the gateway's own credentials |
 | 503 | `overloaded_error` | Gateway at capacity. Includes `Retry-After` |
+| 503 | `api_error` | Redis unavailable with `SENTINEL_RATE_LIMIT_FAIL_MODE=closed`. Includes `Retry-After` |
 | 504 | `timeout_error` | Provider didn't respond in time |
 
 A provider `401` or `403` is reported as `502 upstream authentication failed`, not passed through. Clients never authenticate to the provider, so passing it on would make a revoked gateway key look like a problem with the client's key.
@@ -248,6 +257,8 @@ Logs are JSON on stdout, one line per request:
   "model": "claude-haiku-5-5",
   "status": 200,
   "latency_ms": 974,
+  "rate_limit_us": 412,
+  "rate_limit_remaining": 59,
   "read_body_ms": 0,
   "upstream_ttfb_ms": 973,
   "stream_ms": 0,
@@ -258,7 +269,8 @@ Logs are JSON on stdout, one line per request:
 - `request_id` matches the `X-Request-Id` response header, so a client report can be traced to its log line.
 - `upstream_request_id` is the provider's ID for the same request, for support cases with the provider.
 - `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; see [Performance](#performance) for load-test numbers.
-- Failed requests add `error` and `phase` (`read_body`, `admit`, `upstream` or `stream`).
+- With rate limiting on, `rate_limit_us` is how long the Redis call took, and `rate_limit_remaining` how many requests the key has left right now. `rate_limit_remaining` is missing when Redis couldn't answer.
+- Failed requests add `error` and `phase` (`rate_limit`, `read_body`, `admit`, `upstream` or `stream`).
 
 ## Performance
 
@@ -272,7 +284,9 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 
 ## Design decisions
 
-**Standard library only.** `net/http` covers routing, streaming and per-request deadlines. Fewer dependencies mean a smaller attack surface for a security component.
+**Standard library first.** `net/http` covers routing, streaming and per-request deadlines. Fewer dependencies mean a smaller attack surface for a security component. The one exception is `go-redis` for rate limiting, since a Redis client is not something to hand-roll; see [ADR 0002](docs/adr/0002-rate-limiting.md).
+
+**Fail open on a Redis outage, by default.** If Redis can't answer within 50 ms, the request goes through and the gateway logs a warning. An outage then loses rate limiting rather than all traffic. `SENTINEL_RATE_LIMIT_FAIL_MODE=closed` reverses that choice.
 
 **A provider-agnostic core.** The handler talks to a `Provider` interface that returns a small `Response` struct. Header filtering, request IDs and version validation live in the Anthropic provider. Adding OpenAI means implementing one `Forward` method; the handler doesn't change.
 
@@ -294,6 +308,7 @@ sentinel/
 ├── cmd/mockupstream/         # fake Messages API for load tests, http or https
 ├── cmd/devcerts/             # writes a dev CA and server certificate to ./certs
 ├── internal/devcert/         # certificate generation used by devcerts and tests
+├── internal/ratelimit/       # per-key token bucket in Redis
 ├── internal/proxy/           # provider-agnostic core
 │   ├── auth.go               #   gateway key authentication
 │   └── handler.go            #   intake, admission, forwarding, stream relay, logging
@@ -326,6 +341,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - a mid-stream upstream failure and a client disconnect mid-stream
 - oversized bodies, declared and actual, and a slow body that must not hold a slot
 - the concurrency cap returning `503`
+- rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, and the circuit breaker opening, probing and closing
 - the upstream rejecting the gateway's key
 - response header filtering and `anthropic-version` validation
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
@@ -333,7 +349,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 ## Known limitations
 
 - Only `POST /v1/messages` is proxied. Other Anthropic endpoints return `404`.
-- No per-key quotas yet. One valid key can use the whole concurrency budget.
+- Rate limits are per request, not per token, and every key gets the same limit. Without `SENTINEL_REDIS_URL` there is no limit, and one valid key can use the whole concurrency budget.
 - `anthropic-beta` values are forwarded without an allowlist. Restricting beta features belongs to the planned policy stage.
 - The logged `model` field is best effort: it comes from a separate JSON parse and is not authoritative.
 - Query strings are not forwarded upstream.

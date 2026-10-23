@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -43,6 +45,24 @@ type Response struct {
 	Body   io.ReadCloser
 	// RequestID is the upstream's ID for this request, for the log. May be empty.
 	RequestID string
+}
+
+// RateLimiter decides whether a client may make another request. client is
+// the identity RequireKey derived from the client's key.
+type RateLimiter interface {
+	// Allow takes one request from client's allowance. An error means the
+	// limiter could not decide; the Handler then applies its fail mode.
+	Allow(ctx context.Context, client string) (RateLimit, error)
+}
+
+// RateLimit is a RateLimiter's decision.
+type RateLimit struct {
+	Allowed bool
+	// Remaining is how many more requests the client may make right away.
+	Remaining int64
+	// RetryAfter is how long until the next request would be allowed, when
+	// this one is not.
+	RetryAfter time.Duration
 }
 
 // RequestError rejects a client request as invalid. The handler answers it
@@ -86,7 +106,12 @@ var (
 	errOverloaded      = errors.New("gateway at capacity")
 	errUpstreamAuth    = errors.New("upstream rejected the gateway's credentials")
 	errContentEncoding = errors.New("unsupported content-encoding")
+	errRateLimited     = errors.New("client over its rate limit")
 )
+
+// limiterWarnInterval spaces out the warnings logged while the rate limiter
+// is unavailable in fail-open mode, so an outage doesn't flood the log.
+const limiterWarnInterval = 10 * time.Second
 
 // clientWriteError marks a stream failure on the client's side of the proxy:
 // a failed write or flush to the client, including the write timeout.
@@ -109,6 +134,13 @@ type Options struct {
 	// MaxConcurrent caps requests in flight upstream; requests beyond it get
 	// a 503. A request takes its slot only once its body is fully read.
 	MaxConcurrent int
+	// RateLimiter, if set, is asked before the body is read whether the
+	// authenticated client may make this request. Requests that did not pass
+	// through RequireKey have no client identity and are not limited.
+	RateLimiter RateLimiter
+	// RateLimitFailClosed answers 503 when RateLimiter returns an error. By
+	// default (fail open) the request is allowed and a warning logged.
+	RateLimitFailClosed bool
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
@@ -120,6 +152,12 @@ type Handler struct {
 	bodyTimeout   time.Duration
 	maxBody       int64
 	slots         chan struct{} // counting semaphore of MaxConcurrent
+	limiter       RateLimiter
+	failClosed    bool
+	// Fail-open warnings: when the last one was logged (UnixNano), and how
+	// many were skipped since.
+	lastLimiterWarn    atomic.Int64
+	skippedLimiterWarn atomic.Int64
 }
 
 func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
@@ -146,6 +184,8 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 		bodyTimeout:   opts.BodyTimeout,
 		maxBody:       opts.MaxBodyBytes,
 		slots:         make(chan struct{}, opts.MaxConcurrent),
+		limiter:       opts.RateLimiter,
+		failClosed:    opts.RateLimitFailClosed,
 	}
 }
 
@@ -158,6 +198,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		model, upstreamID           string
 		status                      int
 		phase                       = phaseReadBody // the stage reached, or where it failed
+		limitDur                    time.Duration
+		limit                       *RateLimit // nil unless the limiter decided
 		readDur, ttfbDur, streamDur time.Duration
 		failure                     error
 	)
@@ -168,8 +210,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.String("model", model),
 			slog.Int("status", status),
 			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
-			slog.Int64("read_body_ms", readDur.Milliseconds()),
 		}
+		if h.limiter != nil {
+			// Microseconds: a healthy Redis answers well under a millisecond.
+			attrs = append(attrs, slog.Int64("rate_limit_us", limitDur.Microseconds()))
+		}
+		if limit != nil {
+			attrs = append(attrs, slog.Int64("rate_limit_remaining", limit.Remaining))
+		}
+		attrs = append(attrs, slog.Int64("read_body_ms", readDur.Milliseconds()))
 		if phase == phaseUpstream || phase == phaseStream {
 			attrs = append(attrs, slog.Int64("upstream_ttfb_ms", ttfbDur.Milliseconds()))
 		}
@@ -204,14 +253,44 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before the body is read, so a client over its limit costs one Redis
+	// call and no upload.
+	if id := clientID(r.Context()); h.limiter != nil && id != "" {
+		phase = phaseRateLimit
+		limitStart := time.Now()
+		lim, err := h.limiter.Allow(r.Context(), id)
+		limitDur = time.Since(limitStart)
+		switch {
+		case err != nil && h.failClosed:
+			failure = fmt.Errorf("rate limiter unavailable: %w", err)
+			status = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", "1")
+			rejectEarly(w, status, "api_error", "rate limiter unavailable")
+			return
+		case err != nil:
+			h.warnLimiterDown(r.Context(), err)
+		case !lim.Allowed:
+			limit = &lim
+			failure = errRateLimited
+			status = http.StatusTooManyRequests
+			w.Header().Set("Retry-After", retryAfterSeconds(lim.RetryAfter))
+			rejectEarly(w, status, "rate_limit_error", "rate limit exceeded")
+			return
+		default:
+			limit = &lim
+		}
+		phase = phaseReadBody
+	}
+
 	// The read deadline is per request, not server-wide, and is cleared once
 	// the body is in: a read deadline expiring later, during a long stream,
 	// would be treated as the client going away.
 	rc := http.NewResponseController(w)
-	_ = rc.SetReadDeadline(time.Now().Add(h.bodyTimeout))
+	readStart := time.Now()
+	_ = rc.SetReadDeadline(readStart.Add(h.bodyTimeout))
 	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength)
 	_ = rc.SetReadDeadline(time.Time{})
-	readDur = time.Since(start)
+	readDur = time.Since(readStart)
 	if err != nil {
 		failure = err
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
@@ -309,12 +388,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	streamDur = time.Since(streamStart)
 }
 
+// warnLimiterDown logs that the rate limiter failed and the request was let
+// through, at most once per limiterWarnInterval, with a count of the
+// failures not logged since the last warning.
+func (h *Handler) warnLimiterDown(ctx context.Context, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastLimiterWarn.Load()
+	if now-last < int64(limiterWarnInterval) || !h.lastLimiterWarn.CompareAndSwap(last, now) {
+		h.skippedLimiterWarn.Add(1)
+		return
+	}
+	h.logger.LogAttrs(ctx, slog.LevelWarn, "rate limiter unavailable; allowing requests (fail open)",
+		slog.String("error", err.Error()),
+		slog.Int64("suppressed", h.skippedLimiterWarn.Swap(0)),
+	)
+}
+
+// retryAfterSeconds formats d for a Retry-After header: whole seconds,
+// rounded up, at least 1.
+func retryAfterSeconds(d time.Duration) string {
+	s := int64((d + time.Second - 1) / time.Second)
+	return strconv.FormatInt(max(s, 1), 10)
+}
+
 // Request phases, as logged. A failure's phase says where it happened.
 const (
-	phaseReadBody = "read_body"
-	phaseAdmit    = "admit" // waiting for a concurrency slot
-	phaseUpstream = "upstream"
-	phaseStream   = "stream"
+	phaseRateLimit = "rate_limit"
+	phaseReadBody  = "read_body"
+	phaseAdmit     = "admit" // waiting for a concurrency slot
+	phaseUpstream  = "upstream"
+	phaseStream    = "stream"
 )
 
 // logLevel picks the level for a request's log line. Server-side and upstream

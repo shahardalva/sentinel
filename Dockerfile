@@ -7,10 +7,13 @@ FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 # go.sum* so the build works before and after the first dependency.
 COPY go.mod go.sum* ./
+# A layer of its own, so a source change doesn't download modules again.
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 ENV CGO_ENABLED=0
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway && \
     go build -trimpath -ldflags="-s -w" -o /out/mockupstream ./cmd/mockupstream
 

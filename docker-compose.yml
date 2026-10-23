@@ -44,8 +44,14 @@ services:
       # Listen on all interfaces inside the container; the host port below
       # is bound to loopback only.
       SENTINEL_ADDR: 0.0.0.0:8081
+      # Per-key rate limiting. SENTINEL_RATE_LIMIT_RPM and
+      # SENTINEL_RATE_LIMIT_FAIL_MODE can be set in .env.
+      SENTINEL_REDIS_URL: redis://redis:6379/0
     ports:
       - "127.0.0.1:8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   # Copies the server key from the bind-mounted ./certs into a volume, owned
@@ -96,7 +102,9 @@ services:
   # The gateway for make bench-gateway. It always points at mockupstream,
   # holds only a dummy upstream key and reads nothing from .env except
   # BENCH_API_KEY, so a load test can never reach the real API. Not
-  # published on the host.
+  # published on the host. It rate limits through Redis like the real
+  # gateway, so the bench measures the Redis call, but with a limit no
+  # bench reaches, so it never sees a 429.
   gateway-bench:
     build:
       context: .
@@ -110,13 +118,18 @@ services:
       ANTHROPIC_API_KEY: mock-not-a-real-key
       SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
       SENTINEL_API_KEYS: ${BENCH_API_KEY:-bench}
+      # Database 1, apart from the gateway's buckets in database 0.
+      SENTINEL_REDIS_URL: redis://redis:6379/1
+      SENTINEL_RATE_LIMIT_RPM: "1000000"
     volumes:
       - *ca
     depends_on:
       mockupstream:
         condition: service_started
+      redis:
+        condition: service_healthy
 
-  # Not used by the gateway yet.
+  # Rate-limit buckets for the gateway. Not published on the host.
   redis:
     image: redis:7-alpine
     healthcheck:
