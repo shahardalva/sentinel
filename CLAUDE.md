@@ -12,16 +12,20 @@ tool policies, and writes an audit log.
 
 ## Principles
 - The hot path must be fast and measurable. Every stage records its latency.
-- Keep it simple: stdlib first, add a dependency only with a reason.
+- Keep it simple: stdlib first, add a dependency only with a reason. The
+  only one so far is go-redis (docs/adr/0002-rate-limiting.md); miniredis
+  is test-only.
 - Every change comes with tests.
 - Never commit secrets. API keys come only from environment variables.
 
 ## Commands
 - go run ./cmd/gateway (needs the env vars below), or make run
-- go test ./... (make test adds -race; make vet, make fmt)
+- go test ./... (make test adds -race; make vet, make fmt). make test-redis
+  also runs the rate-limit tests on a throwaway redis:7-alpine container;
+  SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis (unused yet). Runs make certs first, which rewrites ./certs when a
+  redis for rate limiting. Runs make certs first, which rewrites ./certs when a
   file is missing or server.pem expires within 7 days, and recreates the
   containers. Gateway on 127.0.0.1:8081 only. make up-real: gateway
   against the real API. make down, make logs.
@@ -44,7 +48,8 @@ tool policies, and writes an audit log.
   Must be https (plain http only for a loopback host); the gateway refuses
   to start otherwise.
 - SENTINEL_MAX_CONCURRENT (optional): cap on requests in flight upstream,
-  default 128. Also sizes the upstream idle connection pool. Must be a
+  default 128. Also sizes the upstream idle connection pool and the Redis
+  connection pool. Must be a
   positive integer; the gateway refuses to start otherwise.
 - SENTINEL_UPSTREAM_CA_FILE (optional): PEM file of extra CA certificates
   trusted for the upstream connection, added to the system pool (not
@@ -54,11 +59,29 @@ tool policies, and writes an audit log.
   and when a cert is not a CA. It does not relax the https-only rule.
   `go run ./cmd/devcerts` writes a dev CA and server cert to ./certs
   (gitignored) for running cmd/mockupstream with -tls-cert/-tls-key.
+- SENTINEL_REDIS_URL (optional): redis:// or rediss:// URL for per-key rate
+  limiting. Unset means no rate limiting, logged at startup. A malformed URL
+  stops startup (the error never repeats the URL, which may hold a
+  password); an unreachable Redis at startup only warns.
+- SENTINEL_RATE_LIMIT_RPM (optional): requests per minute per client key,
+  default 60, also the burst. Must be a positive integer.
+- SENTINEL_RATE_LIMIT_FAIL_MODE (optional): "open" (default) or "closed",
+  for when Redis can't answer within 50 ms. Open lets the request through
+  and logs a WARN at most every 10s; closed answers 503. Anything else stops
+  startup. After 5 Redis failures in a row a circuit breaker skips Redis
+  for 5s and applies the fail mode at once, then lets one request try
+  again; opening and closing are logged. Only that probe can close it.
+  When every Redis connection stays busy for the 50 ms, the request gets
+  the fail mode but the breaker doesn't count it. A client that disconnects
+  during the check is logged as 499, not as a Redis failure.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY and
 SENTINEL_API_KEYS from .env (copy .env.example, which leaves them empty;
-.env is gitignored). Compose sets SENTINEL_ADDR=0.0.0.0:8081 in the container and
-publishes it on 127.0.0.1 only. The mock override sets ANTHROPIC_BASE_URL=
+.env is gitignored). Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
+SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
+port on 127.0.0.1 only. gateway-bench uses Redis database 1 with
+SENTINEL_RATE_LIMIT_RPM=1000000, so the bench includes the Redis call but
+never gets a 429. The mock override sets ANTHROPIC_BASE_URL=
 https://mockupstream:9090, SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and a
 dummy ANTHROPIC_API_KEY. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init

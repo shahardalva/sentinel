@@ -132,3 +132,23 @@ func TestRequireKey_ClearsReadDeadline(t *testing.T) {
 		t.Errorf("next read %q, want %q; the auth deadline leaked into next", g, "late")
 	}
 }
+
+func TestRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{-time.Second, "1"},
+		{0, "1"},
+		{time.Nanosecond, "1"},
+		{999 * time.Millisecond, "1"},
+		{time.Second, "1"},
+		{time.Second + time.Nanosecond, "2"},
+		{90 * time.Second, "90"},
+	}
+	for _, tt := range tests {
+		if got := retryAfterSeconds(tt.d); got != tt.want {
+			t.Errorf("retryAfterSeconds(%v) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
