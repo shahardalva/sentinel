@@ -45,3 +45,4 @@ tool policies, and writes an audit log.
 ## Git workflow
 - Branch from dev. Open pull requests against dev, never main.
 - main receives only milestone merges from dev.
+- Merge dev into main with a merge commit, never squash.
