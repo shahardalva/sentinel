@@ -27,6 +27,7 @@ The goal is a single control point for LLM traffic: who is calling, what is bein
 - [Request lifecycle](#request-lifecycle)
 - [Error responses](#error-responses)
 - [Logging](#logging)
+- [Performance](#performance)
 - [Design decisions](#design-decisions)
 - [Project layout](#project-layout)
 - [Testing](#testing)
@@ -226,8 +227,18 @@ Logs are JSON on stdout, one line per request:
 
 - `request_id` matches the `X-Request-Id` response header, so a client report can be traced to its log line.
 - `upstream_request_id` is the provider's ID for the same request, for support cases with the provider.
-- `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; load testing is on the roadmap.
+- `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; see [Performance](#performance) for load-test numbers.
 - Failed requests add `error` and `phase` (`read_body`, `admit`, `upstream` or `stream`).
+
+## Performance
+
+Load tests against a mock upstream measure the time the gateway itself adds to each request.
+
+- Median gateway overhead is about 1 ms or less at every tested rate up to 1000 req/s.
+- p99 spikes moved between runs, which points at the shared test machine rather than a fixed cost in the gateway.
+- In one of two runs at 1000 req/s, the concurrency cap shed 0.22% of requests with `503`.
+
+Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see [bench/README.md](bench/README.md).
 
 ## Design decisions
 
@@ -287,7 +298,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - `anthropic-beta` values are forwarded without an allowlist. Restricting beta features belongs to the planned policy stage.
 - The logged `model` field is best effort: it comes from a separate JSON parse and is not authoritative.
 - Query strings are not forwarded upstream.
-- No published load-test numbers yet.
+- Streaming has not been load-tested yet.
 
 Each of these is tracked as an issue.
 
