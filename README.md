@@ -308,17 +308,26 @@ sentinel/
 ├── cmd/mockupstream/         # fake Messages API for load tests, http or https
 ├── cmd/devcerts/             # writes a dev CA and server certificate to ./certs
 ├── internal/devcert/         # certificate generation used by devcerts and tests
-├── internal/ratelimit/       # per-key token bucket in Redis
+├── internal/ratelimit/       # per-key rate limiting
+│   ├── ratelimit.go          #   token bucket as an atomic Redis Lua script
+│   └── breaker.go            #   circuit breaker around Redis
 ├── internal/proxy/           # provider-agnostic core
 │   ├── auth.go               #   gateway key authentication
-│   └── handler.go            #   intake, admission, forwarding, stream relay, logging
+│   └── handler.go            #   rate limit, intake, admission, forwarding, stream relay, logging
 ├── internal/provider/
 │   └── anthropic/            # Anthropic Messages API provider
 ├── bench/                    # k6 load test and results
+├── docs/
+│   ├── adr/                  # architecture decision records
+│   ├── notes.md              # dev log: what was done, decided, learned, next
+│   └── *.svg, *.png          # current and target architecture diagrams
+├── .github/workflows/ci.yml  # gofmt, vet, race tests with real Redis, docker build
 ├── Dockerfile                # gateway and mockupstream images
-├── docker-compose.yml        # local stack; real upstream by default
+├── docker-compose.yml        # local stack with Redis; real upstream by default
 ├── docker-compose.mock.yml   # override: gateway -> mockupstream over HTTPS
 ├── Makefile                  # dev tasks
+├── .env.example              # required environment variables, no secrets
+├── CLAUDE.md                 # conventions and git workflow for Claude Code
 ├── go.mod
 └── LICENSE
 ```
