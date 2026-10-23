@@ -4,6 +4,8 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,6 +29,9 @@ type Config struct {
 	// MaxIdleConns sizes the default client's idle pool; set it to the
 	// gateway's concurrency cap. Defaults to proxy.DefaultMaxConcurrent.
 	MaxIdleConns int
+	// RootCAs, if set, replaces the default client's trust store for the
+	// upstream TLS connection. Ignored when Client is set.
+	RootCAs *x509.CertPool
 }
 
 type Provider struct {
@@ -55,6 +60,9 @@ func New(cfg Config) (*Provider, error) {
 		}
 		t.MaxIdleConns = cfg.MaxIdleConns
 		t.MaxIdleConnsPerHost = cfg.MaxIdleConns
+		if cfg.RootCAs != nil {
+			t.TLSClientConfig = &tls.Config{RootCAs: cfg.RootCAs, MinVersion: tls.VersionTLS12}
+		}
 		cfg.Client = &http.Client{Transport: t}
 	}
 	return &Provider{

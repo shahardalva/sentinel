@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,10 +47,19 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
 	}
 
+	var rootCAs *x509.CertPool
+	if caFile := os.Getenv("SENTINEL_UPSTREAM_CA_FILE"); caFile != "" {
+		if rootCAs, err = loadCAFile(caFile); err != nil {
+			return fmt.Errorf("SENTINEL_UPSTREAM_CA_FILE: %w", err)
+		}
+		logger.Info("trusting extra upstream CAs", "file", caFile)
+	}
+
 	upstream, err := anthropic.New(anthropic.Config{
 		APIKey:       apiKey,
 		BaseURL:      os.Getenv("ANTHROPIC_BASE_URL"),
 		MaxIdleConns: maxConcurrent,
+		RootCAs:      rootCAs,
 	})
 	if err != nil {
 		return fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
@@ -132,6 +142,23 @@ func parseMaxConcurrent(s string) (int, error) {
 		return 0, fmt.Errorf("%q is not a positive integer", s)
 	}
 	return n, nil
+}
+
+// loadCAFile returns the system trust store plus the PEM certificates in
+// path. It fails if the file can't be read or holds no valid certificate.
+func loadCAFile(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system trust store: %w", err)
+	}
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("%s contains no valid PEM certificates", path)
+	}
+	return pool, nil
 }
 
 func envOr(key, def string) string {

@@ -33,3 +33,6 @@ go.work.sum
 # .vscode/
 .env
 *.log
+
+# Dev certificates from cmd/devcerts
+certs/

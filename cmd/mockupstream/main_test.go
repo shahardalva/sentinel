@@ -155,3 +155,13 @@ func TestRejectsWrongMethodPathAndBody(t *testing.T) {
 		}
 	}
 }
+
+func TestServe_RequiresCertAndKeyTogether(t *testing.T) {
+	for _, files := range [][2]string{{"server.pem", ""}, {"", "server-key.pem"}} {
+		srv := &http.Server{Addr: "127.0.0.1:0", Handler: newHandler(0, 0)}
+		err := serve(srv, files[0], files[1])
+		if err == nil || !strings.Contains(err.Error(), "must be set together") {
+			t.Errorf("serve(%q, %q) = %v, want error about setting both", files[0], files[1], err)
+		}
+	}
+}

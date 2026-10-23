@@ -1,13 +1,21 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/pem"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/shahardalva/sentinel/internal/devcert"
+	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
@@ -74,6 +82,104 @@ func TestRun_RejectsInvalidMaxConcurrent(t *testing.T) {
 	err := run(slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "SENTINEL_MAX_CONCURRENT") {
 		t.Fatalf("run() = %v, want error mentioning SENTINEL_MAX_CONCURRENT", err)
+	}
+}
+
+// tlsUpstream starts an HTTPS server on 127.0.0.1 using b's server
+// certificate.
+func tlsUpstream(t *testing.T, b *devcert.Bundle) *httptest.Server {
+	t.Helper()
+	cert, err := tls.X509KeyPair(b.ServerCert, b.ServerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"type":"message"}`))
+	}))
+	ts.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func writeFile(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func generate(t *testing.T) *devcert.Bundle {
+	t.Helper()
+	b, err := devcert.Generate([]string{"localhost", "127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// forward sends one request through a provider that trusts the CAs in
+// caFile, to an upstream presenting a certificate from served.
+func forward(t *testing.T, caFile string, served *devcert.Bundle) error {
+	t.Helper()
+	pool, err := loadCAFile(caFile)
+	if err != nil {
+		t.Fatalf("loadCAFile: %v", err)
+	}
+	ts := tlsUpstream(t, served)
+	p, err := anthropic.New(anthropic.Config{APIKey: "sk", BaseURL: ts.URL, RootCAs: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := p.Forward(t.Context(), &proxy.Request{Body: []byte("{}"), Header: http.Header{}})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.Status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.Status)
+	}
+	return nil
+}
+
+func TestUpstreamCA_TrustsServerSignedByCA(t *testing.T) {
+	b := generate(t)
+	if err := forward(t, writeFile(t, b.CACert), b); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+}
+
+func TestUpstreamCA_RejectsUnknownCA(t *testing.T) {
+	trusted, other := generate(t), generate(t)
+	err := forward(t, writeFile(t, trusted.CACert), other)
+	var verr *tls.CertificateVerificationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("Forward = %v, want a certificate verification error", err)
+	}
+}
+
+func TestRun_RejectsBadCAFile(t *testing.T) {
+	notPEM := writeFile(t, []byte("not a certificate"))
+	// A PEM block of the right type whose contents don't parse.
+	badCert := writeFile(t, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")}))
+	tests := []struct{ name, path string }{
+		{"missing", filepath.Join(t.TempDir(), "nope.pem")},
+		{"not PEM", notPEM},
+		{"invalid certificate", badCert},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ANTHROPIC_API_KEY", "sk")
+			t.Setenv("SENTINEL_API_KEYS", "k1")
+			t.Setenv("SENTINEL_UPSTREAM_CA_FILE", tt.path)
+			err := run(slog.New(slog.DiscardHandler))
+			if err == nil || !strings.Contains(err.Error(), "SENTINEL_UPSTREAM_CA_FILE") {
+				t.Fatalf("run() = %v, want error mentioning SENTINEL_UPSTREAM_CA_FILE", err)
+			}
+		})
 	}
 }
 

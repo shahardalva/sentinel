@@ -33,6 +33,12 @@ tool policies, and writes an audit log.
 - SENTINEL_MAX_CONCURRENT (optional): cap on requests in flight upstream,
   default 128. Also sizes the upstream idle connection pool. Must be a
   positive integer; the gateway refuses to start otherwise.
+- SENTINEL_UPSTREAM_CA_FILE (optional): PEM file of extra CA certificates
+  trusted for the upstream connection, added to the system pool (not
+  replacing it). The gateway refuses to start if the file is set but missing
+  or holds no valid certificate. It does not relax the https-only rule.
+  `go run ./cmd/devcerts` writes a dev CA and server cert to ./certs
+  (gitignored) for running cmd/mockupstream with -tls-cert/-tls-key.
 
 ## Git workflow
 - Branch from dev. Open pull requests against dev, never main.

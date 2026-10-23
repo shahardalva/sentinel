@@ -63,6 +63,27 @@ Then run k6 at the gateway (default address `127.0.0.1:8081`):
 TARGET_URL=http://127.0.0.1:8081 API_KEY=bench-key k6 run bench/k6/messages.js
 ```
 
+### Mock over HTTPS
+
+To include the upstream TLS handshake and encryption in the measurement,
+generate a dev CA and server certificate (written to `./certs`, which git
+ignores; valid for 30 days):
+
+```bash
+go run ./cmd/devcerts
+go run ./cmd/mockupstream -tls-cert certs/server.pem -tls-key certs/server-key.pem
+```
+
+Then start the gateway with the https URL and the CA file:
+
+```bash
+ANTHROPIC_BASE_URL=https://localhost:9090 SENTINEL_UPSTREAM_CA_FILE=certs/ca.pem ANTHROPIC_API_KEY=dummy SENTINEL_API_KEYS=bench-key go run ./cmd/gateway
+```
+
+`cmd/devcerts` takes `-hosts` (default `localhost,127.0.0.1,mockupstream`),
+`-dir` and `-validity`. It never writes the CA's private key; rerun it for a
+fresh set.
+
 In PowerShell, set `$env:TARGET_URL` and `$env:API_KEY` first, the same way.
 The gateway logs one JSON line per request to stdout. At high rates, send it
 to a file (`> gateway.log`) so terminal output doesn't slow the gateway down.
