@@ -42,9 +42,15 @@ func Generate(hosts []string, validity time.Duration) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("devcert: CA key: %w", err)
 	}
+	caSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
 	caTmpl := &x509.Certificate{
-		SerialNumber:          serial(),
-		Subject:               pkix.Name{CommonName: "Sentinel dev CA"},
+		SerialNumber: caSerial,
+		// Date and serial prefix tell CAs apart if several end up in one
+		// trust store.
+		Subject:               pkix.Name{CommonName: caName(caSerial, time.Now())},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
@@ -65,8 +71,12 @@ func Generate(hosts []string, validity time.Duration) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("devcert: server key: %w", err)
 	}
+	srvSerial, err := serial()
+	if err != nil {
+		return nil, err
+	}
 	srvTmpl := &x509.Certificate{
-		SerialNumber: serial(),
+		SerialNumber: srvSerial,
 		Subject:      pkix.Name{CommonName: hosts[0]},
 		NotBefore:    notBefore,
 		NotAfter:     notAfter,
@@ -97,7 +107,17 @@ func Generate(hosts []string, validity time.Duration) (*Bundle, error) {
 }
 
 // serial returns a random 128-bit serial number.
-func serial() *big.Int {
-	n, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	return n
+func serial() (*big.Int, error) {
+	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("devcert: serial number: %w", err)
+	}
+	return n, nil
+}
+
+// caName is the CA's common name, for example
+// "Sentinel dev CA 2026-10-23 1a2b3c4d".
+func caName(serial *big.Int, now time.Time) string {
+	hex := fmt.Sprintf("%032x", serial)
+	return fmt.Sprintf("Sentinel dev CA %s %s", now.Format(time.DateOnly), hex[:8])
 }

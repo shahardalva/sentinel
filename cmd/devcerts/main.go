@@ -13,8 +13,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +56,11 @@ func run(dir string, hosts []string, validity time.Duration) error {
 	}
 	for _, f := range files {
 		path := filepath.Join(dir, f.name)
+		// WriteFile applies perm only when it creates the file, so remove
+		// any old copy first; otherwise a rerun keeps the old mode.
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 		if err := os.WriteFile(path, f.data, f.perm); err != nil {
 			return err
 		}
