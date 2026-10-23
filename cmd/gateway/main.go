@@ -16,13 +16,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/proxy"
+	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
 
 const (
 	defaultAddr     = "127.0.0.1:8081" // loopback only; set SENTINEL_ADDR to expose
 	shutdownTimeout = 30 * time.Second
+	defaultRateRPM  = 60
 )
 
 func main() {
@@ -42,6 +46,10 @@ type config struct {
 	extraCAs      []*x509.Certificate
 	baseURL       string // ANTHROPIC_BASE_URL as given; empty means the default
 	upstream      *anthropic.Provider
+	// Rate limiting; redis is nil when SENTINEL_REDIS_URL is unset.
+	redis          *redis.Client
+	rateRPM        int
+	rateFailClosed bool
 }
 
 // loadConfig reads and validates the gateway's environment variables via
@@ -83,14 +91,33 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
 	}
 
+	rateRPM, err := parsePositive(getenv("SENTINEL_RATE_LIMIT_RPM"), defaultRateRPM)
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_RATE_LIMIT_RPM: %w", err)
+	}
+	failClosed, err := parseFailMode(getenv("SENTINEL_RATE_LIMIT_FAIL_MODE"))
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_RATE_LIMIT_FAIL_MODE: %w", err)
+	}
+	var rdb *redis.Client
+	if u := getenv("SENTINEL_REDIS_URL"); u != "" {
+		// The URL may hold a password, so errors don't repeat it.
+		if rdb, err = ratelimit.NewClient(u, ratelimit.DefaultTimeout, maxConcurrent); err != nil {
+			return config{}, errors.New("SENTINEL_REDIS_URL: not a valid redis:// or rediss:// URL")
+		}
+	}
+
 	return config{
-		clientKeys:    clientKeys,
-		addr:          addr,
-		maxConcurrent: maxConcurrent,
-		caFile:        caFile,
-		extraCAs:      extraCAs,
-		baseURL:       baseURL,
-		upstream:      upstream,
+		clientKeys:     clientKeys,
+		addr:           addr,
+		maxConcurrent:  maxConcurrent,
+		caFile:         caFile,
+		extraCAs:       extraCAs,
+		baseURL:        baseURL,
+		upstream:       upstream,
+		redis:          rdb,
+		rateRPM:        rateRPM,
+		rateFailClosed: failClosed,
 	}, nil
 }
 
@@ -103,8 +130,23 @@ func run(logger *slog.Logger) error {
 		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.baseURL)
 	}
 
+	opts := proxy.Options{MaxConcurrent: cfg.maxConcurrent}
+	if cfg.redis == nil {
+		logger.Info("rate limiting disabled: SENTINEL_REDIS_URL is not set")
+	} else {
+		defer cfg.redis.Close()
+		ratelimit.RouteClientLogs(logger)
+		limiter, err := ratelimit.New(ratelimit.Config{Client: cfg.redis, PerMinute: cfg.rateRPM, Logger: logger})
+		if err != nil {
+			return err
+		}
+		opts.RateLimiter = limiter
+		opts.RateLimitFailClosed = cfg.rateFailClosed
+		logRateLimit(logger, cfg)
+	}
+
 	mux := http.NewServeMux()
-	messages := proxy.NewHandler(cfg.upstream, logger, proxy.Options{MaxConcurrent: cfg.maxConcurrent})
+	messages := proxy.NewHandler(cfg.upstream, logger, opts)
 	mux.Handle("POST /v1/messages", proxy.RequireKey(cfg.clientKeys, logger, messages))
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
@@ -172,14 +214,50 @@ func parseKeys(s string) []string {
 // parseMaxConcurrent reads the concurrency cap. Empty means
 // proxy.DefaultMaxConcurrent; anything else must be a positive integer.
 func parseMaxConcurrent(s string) (int, error) {
+	return parsePositive(s, proxy.DefaultMaxConcurrent)
+}
+
+// parsePositive reads a positive integer, or returns def when s is empty.
+func parsePositive(s string, def int) (int, error) {
 	if s == "" {
-		return proxy.DefaultMaxConcurrent, nil
+		return def, nil
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("%q is not a positive integer", s)
 	}
 	return n, nil
+}
+
+// parseFailMode reads SENTINEL_RATE_LIMIT_FAIL_MODE and reports whether it
+// is "closed". Empty means "open".
+func parseFailMode(s string) (closed bool, err error) {
+	switch strings.TrimSpace(s) {
+	case "", "open":
+		return false, nil
+	case "closed":
+		return true, nil
+	}
+	return false, fmt.Errorf("%q is neither \"open\" nor \"closed\"", s)
+}
+
+// logRateLimit records the rate-limit settings and checks that Redis
+// answers. An unreachable Redis is only a warning: it may still be starting,
+// and the fail mode decides what requests get until it is up.
+func logRateLimit(logger *slog.Logger, cfg config) {
+	mode := "open"
+	if cfg.rateFailClosed {
+		mode = "closed"
+	}
+	// Addr only: the URL may carry a password.
+	logger.Info("rate limiting enabled", "redis", cfg.redis.Options().Addr,
+		"rpm", cfg.rateRPM, "fail_mode", mode)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := cfg.redis.Ping(ctx).Err(); err != nil {
+		logger.Warn("redis not reachable at startup", "redis", cfg.redis.Options().Addr,
+			"fail_mode", mode, "error", err)
+	}
 }
 
 // loadCAFile returns the certificates in the PEM file at path. Every PEM
