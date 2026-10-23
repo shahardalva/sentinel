@@ -4,7 +4,9 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +22,9 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:9090", "listen address")
 	delay := flag.Duration("delay", 200*time.Millisecond, "delay before a non-streaming response and before the first stream event")
 	eventDelay := flag.Duration("event-delay", 10*time.Millisecond, "delay between stream events")
+	tlsCert := flag.String("tls-cert", "", "PEM certificate file; serve HTTPS (requires -tls-key)")
+	tlsKey := flag.String("tls-key", "", "PEM private key file; serve HTTPS (requires -tls-cert)")
+	http1 := flag.Bool("http1", false, "over HTTPS, offer only HTTP/1.1, matching the plain-http connection model")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -29,11 +34,28 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	logger.Info("listening", "addr", *addr, "delay", delay.String(), "event_delay", eventDelay.String())
-	if err := srv.ListenAndServe(); err != nil {
+	if *http1 {
+		// A non-nil, empty map stops ListenAndServeTLS from enabling HTTP/2.
+		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	}
+	logger.Info("listening", "addr", *addr, "tls", *tlsCert != "", "http1_only", *http1,
+		"delay", delay.String(), "event_delay", eventDelay.String())
+	if err := serve(srv, *tlsCert, *tlsKey); err != nil {
 		logger.Error("mockupstream exited", "error", err)
 		os.Exit(1)
 	}
+}
+
+// serve runs srv over HTTPS when certFile and keyFile are both set, and over
+// plain HTTP when neither is.
+func serve(srv *http.Server, certFile, keyFile string) error {
+	switch {
+	case certFile == "" && keyFile == "":
+		return srv.ListenAndServe()
+	case certFile == "" || keyFile == "":
+		return errors.New("-tls-cert and -tls-key must be set together")
+	}
+	return srv.ListenAndServeTLS(certFile, keyFile)
 }
 
 func newHandler(delay, eventDelay time.Duration) http.Handler {

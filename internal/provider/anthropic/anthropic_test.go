@@ -2,6 +2,8 @@ package anthropic
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net/http"
@@ -165,6 +167,60 @@ func TestNew_ConnectionPool(t *testing.T) {
 				t.Error("shares http.DefaultTransport; must be a clone")
 			}
 		})
+	}
+}
+
+func TestNew_TLSConfig(t *testing.T) {
+	tr := mustNew(t, Config{}).client.Transport.(*http.Transport)
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Errorf("TLSClientConfig = %+v, want MinVersion >= TLS 1.2", tr.TLSClientConfig)
+	}
+	if tr.TLSClientConfig.RootCAs != nil {
+		t.Error("RootCAs set without ExtraRootCAs; want the system default")
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 lost; a custom TLS config would disable HTTP/2")
+	}
+}
+
+func TestNew_ExtraRootCAs(t *testing.T) {
+	// httptest's certificate is self-signed and marked as a CA, so it can
+	// stand in for a private CA.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	forward := func(cfg Config) error {
+		cfg.BaseURL = srv.URL
+		resp, err := mustNew(t, cfg).Forward(t.Context(), &proxy.Request{Body: []byte("{}"), Header: http.Header{}})
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		return nil
+	}
+
+	var verr *tls.CertificateVerificationError
+	if err := forward(Config{}); !errors.As(err, &verr) {
+		t.Errorf("system roots only: Forward = %v, want certificate verification error", err)
+	}
+	if err := forward(Config{ExtraRootCAs: []*x509.Certificate{srv.Certificate()}}); err != nil {
+		t.Errorf("server's CA trusted: Forward = %v, want ok", err)
+	}
+}
+
+func TestNew_ExtraRootCAsKeepHTTPSRule(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	_, err := New(Config{BaseURL: "http://api.anthropic.com", ExtraRootCAs: []*x509.Certificate{srv.Certificate()}})
+	if err == nil {
+		t.Fatal("plain-http base URL accepted with ExtraRootCAs set")
+	}
+}
+
+func TestNew_ExtraRootCAsIgnoredWithClient(t *testing.T) {
+	client := &http.Client{}
+	p := mustNew(t, Config{Client: client, ExtraRootCAs: []*x509.Certificate{{}}})
+	if p.client != client || client.Transport != nil {
+		t.Error("caller's Client was replaced or modified")
 	}
 }
 

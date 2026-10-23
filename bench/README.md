@@ -69,6 +69,41 @@ to a file (`> gateway.log`) so terminal output doesn't slow the gateway down.
 
 Repeat both runs with `STREAM=1` to measure the streaming path.
 
+### Mock over HTTPS
+
+To measure the gateway with TLS on the upstream leg, as it runs against the
+real API, generate a dev CA and server certificate (written to `./certs`,
+which git ignores; valid for 30 days):
+
+```bash
+go run ./cmd/devcerts
+go run ./cmd/mockupstream -tls-cert certs/server.pem -tls-key certs/server-key.pem
+```
+
+Then start the gateway with the https URL and the CA file:
+
+```bash
+ANTHROPIC_BASE_URL=https://localhost:9090 SENTINEL_UPSTREAM_CA_FILE=certs/ca.pem ANTHROPIC_API_KEY=dummy SENTINEL_API_KEYS=bench-key go run ./cmd/gateway
+```
+
+In PowerShell:
+
+```powershell
+$env:ANTHROPIC_BASE_URL='https://localhost:9090'; $env:SENTINEL_UPSTREAM_CA_FILE='certs/ca.pem'; $env:ANTHROPIC_API_KEY='dummy'; $env:SENTINEL_API_KEYS='bench-key'; go run ./cmd/gateway
+```
+
+Over HTTPS the mock and the gateway negotiate HTTP/2, so requests share a
+few multiplexed connections instead of up to 128 HTTP/1.1 connections, and
+the TLS handshake is paid about once per connection, not per request. That
+is also how the gateway talks to the real API, but it means an HTTPS result
+differs from a plain-http one in protocol and connection model, not only in
+encryption. For a like-for-like comparison with the plain-http run, add
+`-http1` to the mockupstream command to keep the upstream on HTTP/1.1.
+
+`cmd/devcerts` takes `-hosts` (default `localhost,127.0.0.1,mockupstream`),
+`-dir` and `-validity`. It never writes the CA's private key; rerun it for a
+fresh set.
+
 ## Reading the results
 
 The end-of-test summary has a threshold block per rate, for example:
