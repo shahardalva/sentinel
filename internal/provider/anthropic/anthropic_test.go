@@ -143,16 +143,28 @@ func TestForward_WrapsErrors(t *testing.T) {
 }
 
 func TestNew_ConnectionPool(t *testing.T) {
-	tr, ok := mustNew(t, Config{}).client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatal("default client has no *http.Transport")
+	tests := []struct {
+		name string
+		cfg  Config
+		want int
+	}{
+		{"default", Config{}, proxy.DefaultMaxConcurrent},
+		{"configured", Config{MaxIdleConns: 300}, 300},
 	}
-	if tr.MaxIdleConnsPerHost != maxIdleConns || tr.MaxIdleConns != maxIdleConns {
-		t.Errorf("idle conns = %d per host, %d total; want %d",
-			tr.MaxIdleConnsPerHost, tr.MaxIdleConns, maxIdleConns)
-	}
-	if tr == http.DefaultTransport {
-		t.Error("shares http.DefaultTransport; must be a clone")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr, ok := mustNew(t, tt.cfg).client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatal("default client has no *http.Transport")
+			}
+			if tr.MaxIdleConnsPerHost != tt.want || tr.MaxIdleConns != tt.want {
+				t.Errorf("idle conns = %d per host, %d total; want %d",
+					tr.MaxIdleConnsPerHost, tr.MaxIdleConns, tt.want)
+			}
+			if tr == http.DefaultTransport {
+				t.Error("shares http.DefaultTransport; must be a clone")
+			}
+		})
 	}
 }
 
