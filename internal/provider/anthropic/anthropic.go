@@ -4,6 +4,8 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -18,14 +20,19 @@ import (
 const (
 	DefaultBaseURL = "https://api.anthropic.com"
 	DefaultVersion = "2023-06-01"
-
-	maxIdleConns = 128 // matches proxy.DefaultMaxConcurrent
 )
 
 type Config struct {
 	APIKey  string
 	BaseURL string       // defaults to DefaultBaseURL
 	Client  *http.Client // defaults to a client without its own timeout; callers bound requests via ctx
+	// MaxIdleConns sizes the default client's idle pool; set it to the
+	// gateway's concurrency cap. Defaults to proxy.DefaultMaxConcurrent.
+	MaxIdleConns int
+	// ExtraRootCAs are trusted for the upstream TLS connection in addition
+	// to the system trust store, never instead of it. Ignored when Client
+	// is set.
+	ExtraRootCAs []*x509.Certificate
 }
 
 type Provider struct {
@@ -49,8 +56,16 @@ func New(cfg Config) (*Provider, error) {
 		// All traffic goes to one host. The default keeps only 2 idle
 		// connections per host, so under load most requests would pay for a
 		// fresh TLS handshake.
-		t.MaxIdleConns = maxIdleConns
-		t.MaxIdleConnsPerHost = maxIdleConns
+		if cfg.MaxIdleConns <= 0 {
+			cfg.MaxIdleConns = proxy.DefaultMaxConcurrent
+		}
+		t.MaxIdleConns = cfg.MaxIdleConns
+		t.MaxIdleConnsPerHost = cfg.MaxIdleConns
+		tlsCfg, err := tlsConfig(t.TLSClientConfig, cfg.ExtraRootCAs)
+		if err != nil {
+			return nil, err
+		}
+		t.TLSClientConfig = tlsCfg
 		cfg.Client = &http.Client{Transport: t}
 	}
 	return &Provider{
@@ -58,6 +73,30 @@ func New(cfg Config) (*Provider, error) {
 		endpoint: strings.TrimRight(cfg.BaseURL, "/") + "/v1/messages",
 		client:   cfg.Client,
 	}, nil
+}
+
+// tlsConfig builds on base (which may be nil) rather than replacing it, so
+// any defaults the transport carries are kept. It sets a TLS 1.2 floor and,
+// when extra CAs are given, a pool of the system roots plus those CAs.
+func tlsConfig(base *tls.Config, extraCAs []*x509.Certificate) (*tls.Config, error) {
+	c := &tls.Config{}
+	if base != nil {
+		c = base.Clone()
+	}
+	if c.MinVersion < tls.VersionTLS12 {
+		c.MinVersion = tls.VersionTLS12
+	}
+	if len(extraCAs) > 0 {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: load system trust store: %w", err)
+		}
+		for _, ca := range extraCAs {
+			pool.AddCert(ca)
+		}
+		c.RootCAs = pool
+	}
+	return c, nil
 }
 
 func validateBaseURL(raw string) error {

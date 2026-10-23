@@ -2,12 +2,18 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/shahardalva/sentinel/internal/devcert"
 )
 
 func post(t *testing.T, url, body string) *http.Response {
@@ -152,6 +158,74 @@ func TestRejectsWrongMethodPathAndBody(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != tt.want {
 			t.Errorf("%s %s: status = %d, want %d", tt.method, tt.path, resp.StatusCode, tt.want)
+		}
+	}
+}
+
+func TestTLSEnabled(t *testing.T) {
+	tests := []struct {
+		cert, key string
+		want      bool
+		wantErr   bool
+	}{
+		{"", "", false, false},
+		{"server.pem", "server-key.pem", true, false},
+		{"server.pem", "", false, true},
+		{"", "server-key.pem", false, true},
+	}
+	for _, tt := range tests {
+		got, err := tlsEnabled(tt.cert, tt.key)
+		if got != tt.want || (err != nil) != tt.wantErr {
+			t.Errorf("tlsEnabled(%q, %q) = %v, %v; want %v, error %v", tt.cert, tt.key, got, err, tt.want, tt.wantErr)
+		}
+	}
+}
+
+func TestServe_TLS(t *testing.T) {
+	b, err := devcert.Generate([]string{"127.0.0.1"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(b.ServerCert, b.ServerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(b.CACert) {
+		t.Fatal("bad CA PEM")
+	}
+
+	for _, http1 := range []bool{false, true} {
+		srv := &http.Server{Handler: newHandler(0, 0), TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}}
+		if http1 {
+			srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- serve(srv, ln, true) }()
+
+		client := &http.Client{Transport: &http.Transport{
+			TLSClientConfig:   &tls.Config{RootCAs: roots},
+			ForceAttemptHTTP2: true,
+		}}
+		resp, err := client.Post("https://"+ln.Addr().String()+"/v1/messages", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("http1=%v: POST: %v", http1, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.TLS == nil {
+			t.Errorf("http1=%v: status %d, TLS %v; want 200 over TLS", http1, resp.StatusCode, resp.TLS != nil)
+		}
+		if want := map[bool]int{false: 2, true: 1}[http1]; resp.ProtoMajor != want {
+			t.Errorf("http1=%v: protocol %s, want HTTP/%d", http1, resp.Proto, want)
+		}
+
+		srv.Close()
+		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("http1=%v: serve returned %v, want ErrServerClosed", http1, err)
 		}
 	}
 }
