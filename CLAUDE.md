@@ -30,3 +30,7 @@ tool policies, and writes an audit log.
 - ANTHROPIC_BASE_URL (optional): upstream override, default https://api.anthropic.com.
   Must be https (plain http only for a loopback host); the gateway refuses
   to start otherwise.
+
+## Git workflow
+- Branch from dev. Open pull requests against dev, never main.
+- main receives only milestone merges from dev.
