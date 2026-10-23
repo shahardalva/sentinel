@@ -1,0 +1,24 @@
+# Points the gateway at the mockupstream service over HTTPS. Use with the
+# mock profile:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build
+
+services:
+  gateway:
+    environment:
+      ANTHROPIC_BASE_URL: https://mockupstream:9090
+      SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
+      # The mock ignores the upstream key, so keep the real one from .env
+      # away from it.
+      ANTHROPIC_API_KEY: mock-not-a-real-key
+    # Only the CA certificate; the server key stays with mockupstream.
+    volumes:
+      - type: bind
+        source: ./certs/ca.pem
+        target: /certs/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      mockupstream:
+        condition: service_started

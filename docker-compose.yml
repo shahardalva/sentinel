@@ -1,0 +1,149 @@
+# Local dev stack. Use the Makefile, or run compose directly:
+#
+#   real upstream:  docker compose up -d --build
+#   mock upstream:  docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build
+#
+# The mock run needs certificates first: go run ./cmd/devcerts (make certs).
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+# The whole ./certs directory, server key included. Only certs-init and
+# mockupstream mount it.
+x-certs: &certs
+  type: bind
+  source: ./certs
+  target: /certs
+  read_only: true
+  bind:
+    # Fail instead of creating an empty, root-owned ./certs on the host.
+    create_host_path: false
+
+# Just the dev CA certificate, for clients of mockupstream.
+x-ca: &ca
+  type: bind
+  source: ./certs/ca.pem
+  target: /certs/ca.pem
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    image: sentinel-gateway:dev
+    <<: *hardening
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Listen on all interfaces inside the container; the host port below
+      # is bound to loopback only.
+      SENTINEL_ADDR: 0.0.0.0:8081
+    ports:
+      - "127.0.0.1:8081:8081"
+    restart: unless-stopped
+
+  # Copies the server key from the bind-mounted ./certs into a volume, owned
+  # by the mockupstream user and readable only by it. devcerts writes the
+  # key 0600 for the host user, so on Linux the container's nonroot user
+  # can't read the bind-mounted file directly; on Docker Desktop the mount
+  # shows other owners and modes. The copy works the same on both.
+  certs-init:
+    image: alpine:3.22
+    profiles: [mock]
+    <<: *hardening
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    user: "0:0"
+    volumes:
+      - *certs
+      - mockupstream-key:/key
+    command:
+      - sh
+      - -euc
+      - |
+        rm -f /key/server-key.pem
+        cp /certs/server-key.pem /key/server-key.pem
+        chmod 0400 /key/server-key.pem
+        chown 65532:65532 /key/server-key.pem
+
+  mockupstream:
+    build:
+      context: .
+      target: mockupstream
+    image: sentinel-mockupstream:dev
+    profiles: [mock]
+    <<: *hardening
+    command:
+      - -addr=0.0.0.0:9090
+      # 100ms, not the 200ms default, as in bench/RESULTS.md: about 100
+      # requests in flight at 1000 req/s, under the gateway's cap of 128.
+      - -delay=100ms
+      - -tls-cert=/certs/server.pem
+      - -tls-key=/key/server-key.pem
+    volumes:
+      - *certs
+      - mockupstream-key:/key:ro
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # The gateway for make bench-gateway. It always points at mockupstream,
+  # holds only a dummy upstream key and reads nothing from .env except
+  # BENCH_API_KEY, so a load test can never reach the real API. Not
+  # published on the host.
+  gateway-bench:
+    build:
+      context: .
+      target: gateway
+    image: sentinel-gateway:dev
+    profiles: [bench]
+    <<: *hardening
+    environment:
+      SENTINEL_ADDR: 0.0.0.0:8081
+      ANTHROPIC_BASE_URL: https://mockupstream:9090
+      ANTHROPIC_API_KEY: mock-not-a-real-key
+      SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
+      SENTINEL_API_KEYS: ${BENCH_API_KEY:-bench}
+    volumes:
+      - *ca
+    depends_on:
+      mockupstream:
+        condition: service_started
+
+  # Not used by the gateway yet.
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Load test runner for make bench / make bench-gateway. Verifies the
+  # mock's certificate against the dev CA.
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: [bench]
+    environment:
+      SSL_CERT_FILE: /certs/ca.pem
+      TARGET_URL: ${TARGET_URL:-https://mockupstream:9090}
+      API_KEY: ${BENCH_API_KEY:-bench}
+      STREAM: ${STREAM:-}
+      DURATION_S: ${DURATION_S:-30}
+    volumes:
+      - *ca
+      - type: bind
+        source: ./bench/k6
+        target: /scripts
+        read_only: true
+    command: ["run", "/scripts/messages.js"]
+
+volumes:
+  mockupstream-key:

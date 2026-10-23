@@ -85,7 +85,33 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 ### Requirements
 
 - Go 1.27 or later
-- An Anthropic API key
+- An Anthropic API key (not needed for the mock upstream)
+- For the Docker setup: Docker with Compose v2.24 or later, and `make`
+
+### Run with Docker Compose
+
+The compose stack runs the gateway, a mock upstream over HTTPS and Redis (not used by the gateway yet). The gateway is published on `127.0.0.1:8081` only.
+
+```bash
+cp .env.example .env   # then fill it in; .env is gitignored
+openssl rand -hex 32   # a client key of your own; put it in SENTINEL_API_KEYS
+make up                # gateway -> mockupstream over HTTPS
+make logs
+make down
+```
+
+`.env.example` ships with empty keys. Choose your own client key for `SENTINEL_API_KEYS` (the gateway refuses to start without one), and set `ANTHROPIC_API_KEY` only if you will run `make up-real`. Clients then send that key as `x-api-key`.
+
+`make up` points the gateway at `https://mockupstream:9090` and trusts the dev CA from `./certs`. It first runs `make certs`, which writes the certificates (valid for 30 days) when they are missing or expire within 7 days, and recreates the containers so they load the current ones. It replaces `ANTHROPIC_API_KEY` with a dummy, so your real key never reaches the mock. `make up-real` starts the gateway against the real Anthropic API with the keys from `.env`.
+
+The images are built from the `Dockerfile` on a distroless base and run as a non-root user. Without `make`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build   # mock
+docker compose up -d --build                                                                  # real
+```
+
+Run `make` to list the targets with a line on each. `make bench-gateway` load-tests a separate `gateway-bench` service that is fixed to the mock upstream and holds no real key, and refuses to run if that gateway's upstream is anything else, so a load test never reaches the real API.
 
 ### Run the gateway
 
@@ -93,8 +119,8 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 git clone https://github.com/shahardalva/sentinel.git
 cd sentinel
 
-export ANTHROPIC_API_KEY="sk-ant-..."      # the gateway's upstream key
-export SENTINEL_API_KEYS="dev-local-key"   # keys your clients will use
+export ANTHROPIC_API_KEY="sk-ant-..."             # the gateway's upstream key
+export SENTINEL_API_KEYS="$(openssl rand -hex 32)"  # a client key you choose
 
 go run ./cmd/gateway
 ```
@@ -105,7 +131,7 @@ The gateway logs a `listening` line and serves on `127.0.0.1:8081`.
 
 ```bash
 curl http://127.0.0.1:8081/v1/messages \
-  -H "x-api-key: dev-local-key" \
+  -H "x-api-key: $SENTINEL_API_KEYS" \
   -H "content-type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
@@ -123,7 +149,7 @@ Add `"stream": true` to the body and `-N` to curl, so events print as they arriv
 
 ```bash
 curl -N http://127.0.0.1:8081/v1/messages \
-  -H "x-api-key: dev-local-key" \
+  -H "x-api-key: $SENTINEL_API_KEYS" \
   -H "content-type: application/json" \
   -d '{"model":"claude-haiku-5-5","max_tokens":64,"stream":true,
        "messages":[{"role":"user","content":"Count from 1 to 10."}]}'
@@ -136,7 +162,7 @@ Point the official SDK at the gateway and pass the gateway key:
 ```python
 from anthropic import Anthropic
 
-client = Anthropic(base_url="http://127.0.0.1:8081", api_key="dev-local-key")
+client = Anthropic(base_url="http://127.0.0.1:8081", api_key="<your client key>")
 message = client.messages.create(
     model="claude-haiku-5-5",
     max_tokens=64,
@@ -157,6 +183,8 @@ All configuration comes from environment variables. Secrets are never read from 
 | `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Upstream override. Must be `https`, except for a loopback host. |
 | `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
 | `SENTINEL_UPSTREAM_CA_FILE` | No | | PEM file of extra CA certificates to trust for the upstream connection, added to the system trust store. For a private or dev CA (see `cmd/devcerts`). Every PEM block must be a valid certificate; the gateway refuses to start if the file is missing, holds none, or holds anything else. The CAs are trusted for whatever host `ANTHROPIC_BASE_URL` names, including the default; the gateway logs a warning in that case, since anyone holding the CA's key could then impersonate the Anthropic API. Does not relax the `https` rule. |
+
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and a dummy `ANTHROPIC_API_KEY`. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends.
 
 Built-in limits:
 
@@ -271,6 +299,11 @@ sentinel/
 │   └── handler.go            #   intake, admission, forwarding, stream relay, logging
 ├── internal/provider/
 │   └── anthropic/            # Anthropic Messages API provider
+├── bench/                    # k6 load test and results
+├── Dockerfile                # gateway and mockupstream images
+├── docker-compose.yml        # local stack; real upstream by default
+├── docker-compose.mock.yml   # override: gateway -> mockupstream over HTTPS
+├── Makefile                  # dev tasks
 ├── go.mod
 └── LICENSE
 ```
