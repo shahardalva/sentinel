@@ -17,8 +17,17 @@ tool policies, and writes an audit log.
 - Never commit secrets. API keys come only from environment variables.
 
 ## Commands
-- go run ./cmd/gateway (needs the env vars below)
-- go test ./...
+- go run ./cmd/gateway (needs the env vars below), or make run
+- go test ./... (make test adds -race; make vet, make fmt)
+- make up: compose stack with gateway -> mockupstream over HTTPS, plus
+  redis (unused yet). Writes ./certs via make certs on first run. Gateway
+  on 127.0.0.1:8081 only. make up-real: gateway against the real API.
+  make down, make logs.
+- make bench / make bench-gateway: k6 in a container against the mock,
+  directly or through the gateway (after make up). DURATION_S and STREAM
+  pass through.
+- Compose without make: docker compose up (real), or add
+  -f docker-compose.yml -f docker-compose.mock.yml --profile mock (mock).
 
 ## Configuration (environment variables)
 - ANTHROPIC_API_KEY (required): the gateway's own upstream key. Clients never see it.
@@ -41,6 +50,16 @@ tool policies, and writes an audit log.
   and when a cert is not a CA. It does not relax the https-only rule.
   `go run ./cmd/devcerts` writes a dev CA and server cert to ./certs
   (gitignored) for running cmd/mockupstream with -tls-cert/-tls-key.
+
+Under Docker Compose the gateway reads ANTHROPIC_API_KEY and
+SENTINEL_API_KEYS from .env (copy .env.example, placeholders only; .env is
+gitignored). Compose sets SENTINEL_ADDR=0.0.0.0:8081 in the container and
+publishes it on 127.0.0.1 only. The mock override sets ANTHROPIC_BASE_URL=
+https://mockupstream:9090, SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and a
+dummy ANTHROPIC_API_KEY. certs/ is bind-mounted read-only; the certs-init
+service copies the server key into a volume owned by the nonroot user
+(65532), since devcerts writes it 0600 for the host user. BENCH_API_KEY in
+.env is the client key for make bench-gateway.
 
 ## Git workflow
 - Branch from dev. Open pull requests against dev, never main.

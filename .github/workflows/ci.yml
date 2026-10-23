@@ -32,3 +32,29 @@ jobs:
 
       - name: go test
         run: go test -race ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Dockerfile Go version matches go.mod
+        run: |
+          gomod="$(awk '$1 == "go" {print $2}' go.mod)"
+          dockerfile="$(sed -n 's/^ARG GO_VERSION=//p' Dockerfile)"
+          if [ "$gomod" != "$dockerfile" ]; then
+            echo "go.mod has go $gomod, Dockerfile has GO_VERSION=$dockerfile"
+            exit 1
+          fi
+
+      - name: Compose files are valid
+        run: |
+          cp .env.example .env
+          mkdir certs
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock config --quiet
+
+      - name: Build images
+        run: |
+          docker build --target gateway -t sentinel-gateway:ci .
+          docker build --target mockupstream -t sentinel-mockupstream:ci .
