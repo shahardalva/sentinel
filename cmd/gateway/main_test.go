@@ -20,7 +20,54 @@ import (
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
-func TestRun_RequiresEnv(t *testing.T) {
+// env returns a getenv that reads only from vars, so tests don't see the
+// real environment.
+func env(vars map[string]string) func(string) string {
+	return func(key string) string { return vars[key] }
+}
+
+// wantConfigErr checks that loadConfig fails with an error starting with
+// the name of the variable at fault.
+func wantConfigErr(t *testing.T, vars map[string]string, name string) {
+	t.Helper()
+	_, err := loadConfig(env(vars))
+	if err == nil || !strings.HasPrefix(err.Error(), name) {
+		t.Fatalf("loadConfig() = %v, want error starting with %s", err, name)
+	}
+}
+
+func TestLoadConfig(t *testing.T) {
+	caFile := writeFile(t, generate(t).CACert)
+	cfg, err := loadConfig(env(map[string]string{
+		"ANTHROPIC_API_KEY":         "sk",
+		"SENTINEL_API_KEYS":         "k1, k2",
+		"SENTINEL_ADDR":             "127.0.0.1:9999",
+		"SENTINEL_MAX_CONCURRENT":   "32",
+		"SENTINEL_UPSTREAM_CA_FILE": caFile,
+		"ANTHROPIC_BASE_URL":        "https://localhost:9090",
+	}))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !slices.Equal(cfg.clientKeys, []string{"k1", "k2"}) || cfg.addr != "127.0.0.1:9999" ||
+		cfg.maxConcurrent != 32 || cfg.caFile != caFile || len(cfg.extraCAs) != 1 ||
+		cfg.baseURL != "https://localhost:9090" || cfg.upstream == nil {
+		t.Errorf("loadConfig = %+v", cfg)
+	}
+}
+
+func TestLoadConfig_Defaults(t *testing.T) {
+	cfg, err := loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1"}))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.addr != defaultAddr || cfg.maxConcurrent != proxy.DefaultMaxConcurrent ||
+		cfg.caFile != "" || cfg.extraCAs != nil || cfg.baseURL != "" || cfg.upstream == nil {
+		t.Errorf("loadConfig = %+v", cfg)
+	}
+}
+
+func TestLoadConfig_RequiresEnv(t *testing.T) {
 	tests := []struct {
 		name, upstreamKey, clientKeys, wantErr string
 	}{
@@ -31,13 +78,11 @@ func TestRun_RequiresEnv(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("ANTHROPIC_API_KEY", tt.upstreamKey)
-			t.Setenv("SENTINEL_API_KEYS", tt.clientKeys)
-			t.Setenv("ANTHROPIC_BASE_URL", "http://api.anthropic.com")
-			err := run(slog.New(slog.DiscardHandler))
-			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("run() = %v, want error mentioning %s", err, tt.wantErr)
-			}
+			wantConfigErr(t, map[string]string{
+				"ANTHROPIC_API_KEY":  tt.upstreamKey,
+				"SENTINEL_API_KEYS":  tt.clientKeys,
+				"ANTHROPIC_BASE_URL": "http://api.anthropic.com",
+			}, tt.wantErr)
 		})
 	}
 }
@@ -76,14 +121,12 @@ func TestParseKeys(t *testing.T) {
 	}
 }
 
-func TestRun_RejectsInvalidMaxConcurrent(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "sk")
-	t.Setenv("SENTINEL_API_KEYS", "k1")
-	t.Setenv("SENTINEL_MAX_CONCURRENT", "0")
-	err := run(slog.New(slog.DiscardHandler))
-	if err == nil || !strings.Contains(err.Error(), "SENTINEL_MAX_CONCURRENT") {
-		t.Fatalf("run() = %v, want error mentioning SENTINEL_MAX_CONCURRENT", err)
-	}
+func TestLoadConfig_RejectsInvalidMaxConcurrent(t *testing.T) {
+	wantConfigErr(t, map[string]string{
+		"ANTHROPIC_API_KEY":       "sk",
+		"SENTINEL_API_KEYS":       "k1",
+		"SENTINEL_MAX_CONCURRENT": "0",
+	}, "SENTINEL_MAX_CONCURRENT")
 }
 
 // tlsUpstream starts an HTTPS server on 127.0.0.1 using b's server
@@ -162,7 +205,7 @@ func TestUpstreamCA_RejectsUnknownCA(t *testing.T) {
 	}
 }
 
-func TestRun_RejectsBadCAFile(t *testing.T) {
+func TestLoadConfig_RejectsBadCAFile(t *testing.T) {
 	b := generate(t)
 	// A PEM block of the right type whose contents don't parse.
 	junk := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")})
@@ -175,26 +218,22 @@ func TestRun_RejectsBadCAFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("ANTHROPIC_API_KEY", "sk")
-			t.Setenv("SENTINEL_API_KEYS", "k1")
-			t.Setenv("SENTINEL_UPSTREAM_CA_FILE", tt.path)
-			err := run(slog.New(slog.DiscardHandler))
-			if err == nil || !strings.Contains(err.Error(), "SENTINEL_UPSTREAM_CA_FILE") {
-				t.Fatalf("run() = %v, want error mentioning SENTINEL_UPSTREAM_CA_FILE", err)
-			}
+			wantConfigErr(t, map[string]string{
+				"ANTHROPIC_API_KEY":         "sk",
+				"SENTINEL_API_KEYS":         "k1",
+				"SENTINEL_UPSTREAM_CA_FILE": tt.path,
+			}, "SENTINEL_UPSTREAM_CA_FILE")
 		})
 	}
 }
 
-func TestRun_CAFileKeepsHTTPSRule(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "sk")
-	t.Setenv("SENTINEL_API_KEYS", "k1")
-	t.Setenv("SENTINEL_UPSTREAM_CA_FILE", writeFile(t, generate(t).CACert))
-	t.Setenv("ANTHROPIC_BASE_URL", "http://example.com")
-	err := run(slog.New(slog.DiscardHandler))
-	if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_BASE_URL") {
-		t.Fatalf("run() = %v, want error mentioning ANTHROPIC_BASE_URL", err)
-	}
+func TestLoadConfig_CAFileKeepsHTTPSRule(t *testing.T) {
+	wantConfigErr(t, map[string]string{
+		"ANTHROPIC_API_KEY":         "sk",
+		"SENTINEL_API_KEYS":         "k1",
+		"SENTINEL_UPSTREAM_CA_FILE": writeFile(t, generate(t).CACert),
+		"ANTHROPIC_BASE_URL":        "http://example.com",
+	}, "ANTHROPIC_BASE_URL")
 }
 
 func TestLoadCAFile(t *testing.T) {
