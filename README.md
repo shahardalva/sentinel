@@ -6,6 +6,7 @@ Sentinel is a reverse proxy that sits between your application and an LLM provid
 
 The goal is a single control point for LLM traffic: who is calling, what is being sent, and what an agent is allowed to do. Detection of prompt injection and sensitive data, policy enforcement, and an audit trail are being built on top of this core.
 
+[![CI](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-success)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
