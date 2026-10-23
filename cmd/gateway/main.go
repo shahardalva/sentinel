@@ -33,30 +33,46 @@ func main() {
 	}
 }
 
-func run(logger *slog.Logger) error {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+// config is the gateway's validated startup configuration.
+type config struct {
+	clientKeys    []string
+	addr          string
+	maxConcurrent int
+	caFile        string // SENTINEL_UPSTREAM_CA_FILE; empty if unset
+	extraCAs      []*x509.Certificate
+	baseURL       string // ANTHROPIC_BASE_URL as given; empty means the default
+	upstream      *anthropic.Provider
+}
+
+// loadConfig reads and validates the gateway's environment variables via
+// getenv. Each error starts with the name of the variable at fault.
+func loadConfig(getenv func(string) string) (config, error) {
+	apiKey := getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		return errors.New("ANTHROPIC_API_KEY is not set")
+		return config{}, errors.New("ANTHROPIC_API_KEY is not set")
 	}
-	clientKeys := parseKeys(os.Getenv("SENTINEL_API_KEYS"))
+	clientKeys := parseKeys(getenv("SENTINEL_API_KEYS"))
 	if len(clientKeys) == 0 {
-		return errors.New("SENTINEL_API_KEYS is not set")
+		return config{}, errors.New("SENTINEL_API_KEYS is not set")
 	}
-	addr := envOr("SENTINEL_ADDR", defaultAddr)
-	maxConcurrent, err := parseMaxConcurrent(os.Getenv("SENTINEL_MAX_CONCURRENT"))
+	addr := getenv("SENTINEL_ADDR")
+	if addr == "" {
+		addr = defaultAddr
+	}
+	maxConcurrent, err := parseMaxConcurrent(getenv("SENTINEL_MAX_CONCURRENT"))
 	if err != nil {
-		return fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
+		return config{}, fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
 	}
 
-	caFile := os.Getenv("SENTINEL_UPSTREAM_CA_FILE")
+	caFile := getenv("SENTINEL_UPSTREAM_CA_FILE")
 	var extraCAs []*x509.Certificate
 	if caFile != "" {
 		if extraCAs, err = loadCAFile(caFile); err != nil {
-			return fmt.Errorf("SENTINEL_UPSTREAM_CA_FILE: %w", err)
+			return config{}, fmt.Errorf("SENTINEL_UPSTREAM_CA_FILE: %w", err)
 		}
 	}
 
-	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+	baseURL := getenv("ANTHROPIC_BASE_URL")
 	upstream, err := anthropic.New(anthropic.Config{
 		APIKey:       apiKey,
 		BaseURL:      baseURL,
@@ -64,21 +80,38 @@ func run(logger *slog.Logger) error {
 		ExtraRootCAs: extraCAs,
 	})
 	if err != nil {
-		return fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
+		return config{}, fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
 	}
-	if caFile != "" {
-		logCAs(logger, caFile, extraCAs, baseURL)
+
+	return config{
+		clientKeys:    clientKeys,
+		addr:          addr,
+		maxConcurrent: maxConcurrent,
+		caFile:        caFile,
+		extraCAs:      extraCAs,
+		baseURL:       baseURL,
+		upstream:      upstream,
+	}, nil
+}
+
+func run(logger *slog.Logger) error {
+	cfg, err := loadConfig(os.Getenv)
+	if err != nil {
+		return err
+	}
+	if cfg.caFile != "" {
+		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.baseURL)
 	}
 
 	mux := http.NewServeMux()
-	messages := proxy.NewHandler(upstream, logger, proxy.Options{MaxConcurrent: maxConcurrent})
-	mux.Handle("POST /v1/messages", proxy.RequireKey(clientKeys, logger, messages))
+	messages := proxy.NewHandler(cfg.upstream, logger, proxy.Options{MaxConcurrent: cfg.maxConcurrent})
+	mux.Handle("POST /v1/messages", proxy.RequireKey(cfg.clientKeys, logger, messages))
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
 	// can legitimately run for minutes. The handler sets its own per-request
 	// body-read and per-chunk write deadlines instead.
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              cfg.addr,
 		Handler:           closeUnmatched(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -90,7 +123,7 @@ func run(logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", addr)
+		logger.Info("listening", "addr", cfg.addr)
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -194,11 +227,4 @@ func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, baseURL s
 			"anyone holding one of their keys could impersonate it and read ANTHROPIC_API_KEY",
 			"file", file, "upstream", anthropic.DefaultBaseURL)
 	}
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
