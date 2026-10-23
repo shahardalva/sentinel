@@ -359,6 +359,12 @@ Each of these is tracked as an issue.
 
 ## Roadmap
 
+### Target architecture
+
+Where the project is heading. Not yet built; the diagram at the top of this README shows what runs today.
+
+![Sentinel target architecture](docs/target-architecture.svg)
+
 | Phase | Scope |
 | --- | --- |
 | **1. Core proxy** | Anthropic provider, auth, streaming, timeouts, resource limits, structured logging. **Done.** |
