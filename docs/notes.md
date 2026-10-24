@@ -2,7 +2,57 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
-## 2026-10-24
+## 2026-10-24: OpenAI-compatible protocol
+
+### Done
+- New package internal/provider/openai: POST {base}/chat/completions with
+  the gateway's bearer key. Default base https://api.openai.com/v1, with
+  /v1 in it as in the OpenAI SDKs. Uses internal/provider/upstream for the
+  base URL rule and the client.
+- No file under internal/proxy changed. The seams from the refactor were
+  enough: Provider, ErrorFormatter, shared Admission.
+- SENTINEL_UPSTREAMS picks the upstreams (default anthropic); each one's
+  key is required only when it is listed. A route is registered only for
+  an enabled upstream. cmd/gateway builds the mux in newMux, which tests
+  call, with one Admission and one rate limiter for every route.
+- mockupstream serves /v1/chat/completions too, streaming chunks and
+  data: [DONE]. k6 takes API=openai. make up and gateway-bench enable both
+  upstreams on the mock with dummy keys; make bench-gateway checks both
+  base URLs before it runs.
+- Tests: headers sent upstream, response allowlist, OpenAI error bodies,
+  streaming and request IDs through RequireKey and the handler, from an
+  external test package; SENTINEL_UPSTREAMS parsing; routes per upstream;
+  a 503 on one route while the other holds the only slot.
+
+### Decided
+- Forward no client header on the OpenAI route. OpenAI-Organization and
+  OpenAI-Project choose who is billed and must come from the gateway, if
+  anywhere. OpenAI-Beta and X-Stainless-* have no use upstream worth the
+  risk of an allowlist we would have to maintain.
+- The upstream's X-Request-Id is dropped from the response and logged as
+  upstream_request_id. The client keeps the gateway's own X-Request-Id.
+- OpenAI error type and code strings are informative only: OpenAI SDKs
+  pick the exception from the HTTP status. Not every value is checked
+  against OpenAI's live responses.
+- An upstream key set for an unlisted upstream is ignored with a WARN, not
+  an error, so one .env can serve several setups.
+- The extra-CA warning fires per enabled upstream on its public default
+  host, compared by hostname so a trailing slash or a path doesn't hide it.
+
+### Learned
+- "OpenAI-compatible" covers most local model servers (Ollama, vLLM), so
+  one provider reaches far more than OpenAI. Only loopback gets plain http,
+  which suits a local Ollama but not one in another container.
+- Azure OpenAI, Bedrock and Vertex differ in auth, not just in base URL, so
+  they need providers of their own.
+
+### Next
+- Named upstreams, so OpenAI and a local server can be served side by side.
+- A 401 message that doesn't say x-api-key on the OpenAI route. It comes
+  from RequireKey, so it means a change in internal/proxy.
+- Per-key concurrency cap.
+
+## 2026-10-24: provider seams
 
 ### Done
 - Refactor ahead of a second protocol and named upstreams. Nothing changes

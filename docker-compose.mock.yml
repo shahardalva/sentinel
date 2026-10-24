@@ -6,11 +6,15 @@
 services:
   gateway:
     environment:
+      # Both protocols, both served by the mock.
+      SENTINEL_UPSTREAMS: anthropic,openai
       ANTHROPIC_BASE_URL: https://mockupstream:9090
+      OPENAI_BASE_URL: https://mockupstream:9090/v1
       SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
-      # The mock ignores the upstream key, so keep the real one from .env
+      # The mock ignores the upstream keys, so keep the real ones from .env
       # away from it.
       ANTHROPIC_API_KEY: mock-not-a-real-key
+      OPENAI_API_KEY: mock-not-a-real-key
     # Only the CA certificate; the server key stays with mockupstream.
     volumes:
       - type: bind

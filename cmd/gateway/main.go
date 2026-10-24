@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
+	"github.com/shahardalva/sentinel/internal/provider/openai"
 	"github.com/shahardalva/sentinel/internal/proxy"
 	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
@@ -37,6 +40,55 @@ func main() {
 	}
 }
 
+// upstreamSpec is an upstream the gateway can enable by naming it in
+// SENTINEL_UPSTREAMS.
+type upstreamSpec struct {
+	name       string // as listed in SENTINEL_UPSTREAMS
+	label      string // for log messages
+	keyVar     string // the upstream key's variable; required when enabled
+	baseURLVar string
+	defaultURL string
+	route      string // the mux pattern its handler serves
+	newFunc    func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error)
+}
+
+// upstreamSpecs are the upstreams SENTINEL_UPSTREAMS may name.
+var upstreamSpecs = []upstreamSpec{
+	{
+		name: "anthropic", label: "Anthropic",
+		keyVar: "ANTHROPIC_API_KEY", baseURLVar: "ANTHROPIC_BASE_URL", defaultURL: anthropic.DefaultBaseURL,
+		route: "POST /v1/messages",
+		newFunc: func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error) {
+			p, err := anthropic.New(anthropic.Config{APIKey: apiKey, BaseURL: baseURL, MaxIdleConns: maxIdleConns, ExtraRootCAs: extraCAs})
+			if err != nil {
+				return nil, err
+			}
+			return p, nil
+		},
+	},
+	{
+		name: "openai", label: "OpenAI",
+		keyVar: "OPENAI_API_KEY", baseURLVar: "OPENAI_BASE_URL", defaultURL: openai.DefaultBaseURL,
+		route: "POST /v1/chat/completions",
+		newFunc: func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error) {
+			p, err := openai.New(openai.Config{APIKey: apiKey, BaseURL: baseURL, MaxIdleConns: maxIdleConns, ExtraRootCAs: extraCAs})
+			if err != nil {
+				return nil, err
+			}
+			return p, nil
+		},
+	},
+}
+
+const defaultUpstreams = "anthropic"
+
+// enabledUpstream is an upstream listed in SENTINEL_UPSTREAMS, ready to serve.
+type enabledUpstream struct {
+	spec     *upstreamSpec
+	baseURL  string // in use: the variable's value, or the default when unset
+	provider proxy.Provider
+}
+
 // config is the gateway's validated startup configuration.
 type config struct {
 	clientKeys    []string
@@ -44,8 +96,10 @@ type config struct {
 	maxConcurrent int
 	caFile        string // SENTINEL_UPSTREAM_CA_FILE; empty if unset
 	extraCAs      []*x509.Certificate
-	baseURL       string // ANTHROPIC_BASE_URL as given; empty means the default
-	upstream      *anthropic.Provider
+	upstreams     []enabledUpstream // in SENTINEL_UPSTREAMS order
+	// ignored are the upstreams not in SENTINEL_UPSTREAMS whose key
+	// variable is set anyway. The key is not used.
+	ignored []*upstreamSpec
 	// Rate limiting; redis is nil when SENTINEL_REDIS_URL is unset.
 	redis          *redis.Client
 	rateRPM        int
@@ -55,9 +109,20 @@ type config struct {
 // loadConfig reads and validates the gateway's environment variables via
 // getenv. Each error starts with the name of the variable at fault.
 func loadConfig(getenv func(string) string) (config, error) {
-	apiKey := getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		return config{}, errors.New("ANTHROPIC_API_KEY is not set")
+	specs, err := parseUpstreams(getenv("SENTINEL_UPSTREAMS"))
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_UPSTREAMS: %w", err)
+	}
+	for _, s := range specs {
+		if getenv(s.keyVar) == "" {
+			return config{}, fmt.Errorf("%s is not set; it is required while SENTINEL_UPSTREAMS lists %s", s.keyVar, s.name)
+		}
+	}
+	var ignored []*upstreamSpec
+	for i := range upstreamSpecs {
+		if s := &upstreamSpecs[i]; !slices.Contains(specs, s) && getenv(s.keyVar) != "" {
+			ignored = append(ignored, s)
+		}
 	}
 	clientKeys := parseKeys(getenv("SENTINEL_API_KEYS"))
 	if len(clientKeys) == 0 {
@@ -80,15 +145,18 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 	}
 
-	baseURL := getenv("ANTHROPIC_BASE_URL")
-	upstream, err := anthropic.New(anthropic.Config{
-		APIKey:       apiKey,
-		BaseURL:      baseURL,
-		MaxIdleConns: maxConcurrent,
-		ExtraRootCAs: extraCAs,
-	})
-	if err != nil {
-		return config{}, fmt.Errorf("ANTHROPIC_BASE_URL: %w", err)
+	// The extra CAs apply to every enabled upstream.
+	var upstreams []enabledUpstream
+	for _, s := range specs {
+		baseURL := getenv(s.baseURLVar)
+		p, err := s.newFunc(getenv(s.keyVar), baseURL, maxConcurrent, extraCAs)
+		if err != nil {
+			return config{}, fmt.Errorf("%s: %w", s.baseURLVar, err)
+		}
+		if baseURL == "" {
+			baseURL = s.defaultURL
+		}
+		upstreams = append(upstreams, enabledUpstream{spec: s, baseURL: baseURL, provider: p})
 	}
 
 	rateRPM, err := parsePositive(getenv("SENTINEL_RATE_LIMIT_RPM"), defaultRateRPM)
@@ -113,8 +181,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 		maxConcurrent:  maxConcurrent,
 		caFile:         caFile,
 		extraCAs:       extraCAs,
-		baseURL:        baseURL,
-		upstream:       upstream,
+		upstreams:      upstreams,
+		ignored:        ignored,
 		redis:          rdb,
 		rateRPM:        rateRPM,
 		rateFailClosed: failClosed,
@@ -126,13 +194,12 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	logUpstreams(logger, cfg)
 	if cfg.caFile != "" {
-		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.baseURL)
+		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.upstreams)
 	}
 
-	// One cap for the whole gateway: every route and upstream draws on the
-	// same slots, so the memory bound in ADR 0001 holds however many there are.
-	opts := proxy.Options{Admission: proxy.NewAdmission(cfg.maxConcurrent)}
+	var opts proxy.Options
 	if cfg.redis == nil {
 		logger.Info("rate limiting disabled: SENTINEL_REDIS_URL is not set")
 	} else {
@@ -147,9 +214,7 @@ func run(logger *slog.Logger) error {
 		logRateLimit(logger, cfg)
 	}
 
-	mux := http.NewServeMux()
-	messages := proxy.NewHandler(cfg.upstream, logger, opts)
-	mux.Handle("POST /v1/messages", proxy.RequireKey(cfg.clientKeys, cfg.upstream, logger, messages))
+	mux := newMux(cfg, logger, opts)
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
 	// can legitimately run for minutes. The handler sets its own per-request
@@ -187,6 +252,70 @@ func run(logger *slog.Logger) error {
 		_ = srv.Close()
 	}
 	return nil
+}
+
+// newMux registers one route per enabled upstream, each behind the same
+// client keys. Every handler gets the same opts, so they share its rate
+// limiter, and one Admission: when opts has none, newMux creates it with
+// cfg.maxConcurrent slots. One cap for the whole gateway means every route
+// and upstream draws on the same slots, so the memory bound in ADR 0001
+// holds however many there are.
+func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux {
+	if opts.Admission == nil {
+		opts.Admission = proxy.NewAdmission(cfg.maxConcurrent)
+	}
+	mux := http.NewServeMux()
+	for _, u := range cfg.upstreams {
+		h := proxy.NewHandler(u.provider, logger, opts)
+		mux.Handle(u.spec.route, proxy.RequireKey(cfg.clientKeys, u.provider, logger, h))
+	}
+	return mux
+}
+
+// parseUpstreams reads SENTINEL_UPSTREAMS, a comma-separated list of
+// upstream names. Empty means defaultUpstreams. A name that is unknown or
+// listed twice is an error, as is a list with no names in it.
+func parseUpstreams(s string) ([]*upstreamSpec, error) {
+	if s == "" {
+		s = defaultUpstreams
+	}
+	var specs []*upstreamSpec
+	for name := range strings.SplitSeq(s, ",") {
+		if name = strings.TrimSpace(name); name == "" {
+			continue
+		}
+		i := slices.IndexFunc(upstreamSpecs, func(u upstreamSpec) bool { return u.name == name })
+		if i < 0 {
+			return nil, fmt.Errorf("unknown upstream %q; known upstreams are %s", name, knownUpstreams())
+		}
+		if slices.Contains(specs, &upstreamSpecs[i]) {
+			return nil, fmt.Errorf("upstream %q is listed more than once", name)
+		}
+		specs = append(specs, &upstreamSpecs[i])
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("%q lists no upstreams; known upstreams are %s", s, knownUpstreams())
+	}
+	return specs, nil
+}
+
+func knownUpstreams() string {
+	var names []string
+	for _, u := range upstreamSpecs {
+		names = append(names, u.name)
+	}
+	return strings.Join(names, ", ")
+}
+
+// logUpstreams records each enabled upstream and warns about upstream keys
+// that are set but unused. It never logs a key.
+func logUpstreams(logger *slog.Logger, cfg config) {
+	for _, u := range cfg.upstreams {
+		logger.Info("upstream enabled", "upstream", u.spec.name, "base_url", u.baseURL)
+	}
+	for _, s := range cfg.ignored {
+		logger.Warn(fmt.Sprintf("%s is set but %s is not in SENTINEL_UPSTREAMS; ignoring", s.keyVar, s.name))
+	}
 }
 
 // closeUnmatched closes the connection after a 404 or 405 from mux. Those
@@ -292,8 +421,9 @@ func loadCAFile(path string) ([]*x509.Certificate, error) {
 }
 
 // logCAs records the extra upstream CAs and warns about setups that widen
-// trust more than intended.
-func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, baseURL string) {
+// trust more than intended, including once for each enabled upstream left
+// on its public default host.
+func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, upstreams []enabledUpstream) {
 	logger.Info("trusting extra upstream CAs", "file", file, "certs", len(cas))
 	for _, c := range cas {
 		if !c.IsCA {
@@ -302,9 +432,22 @@ func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, baseURL s
 				"file", file, "subject", c.Subject.String())
 		}
 	}
-	if baseURL == "" || strings.TrimRight(baseURL, "/") == anthropic.DefaultBaseURL {
-		logger.Warn("extra upstream CAs are trusted for the default Anthropic API; "+
-			"anyone holding one of their keys could impersonate it and read ANTHROPIC_API_KEY",
-			"file", file, "upstream", anthropic.DefaultBaseURL)
+	for _, u := range upstreams {
+		if onDefaultHost(u) {
+			logger.Warn(fmt.Sprintf("extra upstream CAs are trusted for the default %s API; "+
+				"anyone holding one of their keys could impersonate it and read %s", u.spec.label, u.spec.keyVar),
+				"file", file, "upstream", u.spec.name, "base_url", u.baseURL)
+		}
 	}
+}
+
+// onDefaultHost reports whether u talks to its public default host, such
+// as api.anthropic.com, whatever the path.
+func onDefaultHost(u enabledUpstream) bool {
+	got, err := url.Parse(u.baseURL)
+	if err != nil {
+		return false
+	}
+	def, err := url.Parse(u.spec.defaultURL)
+	return err == nil && strings.EqualFold(got.Hostname(), def.Hostname())
 }

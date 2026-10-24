@@ -1,6 +1,7 @@
-// Command mockupstream imitates Anthropic's POST /v1/messages for load tests.
-// It returns a fixed response after a fixed delay, so a load test through
-// the gateway measures the gateway's own overhead rather than the model's.
+// Command mockupstream imitates Anthropic's POST /v1/messages and OpenAI's
+// POST /v1/chat/completions for load tests. It returns a fixed response
+// after a fixed delay, so a load test through the gateway measures the
+// gateway's own overhead rather than the model's.
 package main
 
 import (
@@ -107,6 +108,30 @@ func newHandler(delay, eventDelay time.Duration) http.Handler {
 		w.Header().Set("Request-Id", "req_mock")
 		json.NewEncoder(w).Encode(message(req.Model))
 	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+		if err != nil || json.Unmarshal(body, &req) != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "request body must be JSON")
+			return
+		}
+		if req.Model == "" {
+			req.Model = "mock-model"
+		}
+		if !sleep(r, delay) {
+			return
+		}
+		if req.Stream {
+			streamChat(w, r, req.Model, eventDelay)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "req_mock")
+		json.NewEncoder(w).Encode(chatCompletion(req.Model))
+	})
 	return mux
 }
 
@@ -186,6 +211,78 @@ func stream(w http.ResponseWriter, r *http.Request, model string, eventDelay tim
 			return
 		}
 	}
+}
+
+// chatCompletion is OpenAI's non-streaming Chat Completions response.
+func chatCompletion(model string) map[string]any {
+	return map[string]any{
+		"id":      "chatcmpl-mock",
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": "Hello from the mock upstream."},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17},
+	}
+}
+
+// chatChunks is the OpenAI stream for the reply: one chunk per text piece,
+// the first carrying the role, then an empty delta with finish_reason.
+func chatChunks(model string) []map[string]any {
+	created := time.Now().Unix()
+	chunk := func(delta map[string]any, finish any) map[string]any {
+		return map[string]any{
+			"id":      "chatcmpl-mock",
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}},
+		}
+	}
+	var chunks []map[string]any
+	for i, c := range replyChunks {
+		delta := map[string]any{"content": c}
+		if i == 0 {
+			delta["role"] = "assistant"
+		}
+		chunks = append(chunks, chunk(delta, nil))
+	}
+	return append(chunks, chunk(map[string]any{}, "stop"))
+}
+
+func streamChat(w http.ResponseWriter, r *http.Request, model string, eventDelay time.Duration) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Request-Id", "req_mock")
+	rc := http.NewResponseController(w)
+	send := func(i int, data []byte) bool {
+		if i > 0 && !sleep(r, eventDelay) {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
+	chunks := chatChunks(model)
+	for i, c := range chunks {
+		data, _ := json.Marshal(c)
+		if !send(i, data) {
+			return
+		}
+	}
+	send(len(chunks), []byte("[DONE]"))
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, typ, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"message": msg, "type": typ, "param": nil, "code": nil},
+	})
 }
 
 func writeError(w http.ResponseWriter, status int, typ, msg string) {

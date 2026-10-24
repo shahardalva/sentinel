@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -53,7 +55,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if !slices.Equal(cfg.clientKeys, []string{"k1", "k2"}) || cfg.addr != "127.0.0.1:9999" ||
 		cfg.maxConcurrent != 32 || cfg.caFile != caFile || len(cfg.extraCAs) != 1 ||
-		cfg.baseURL != "https://localhost:9090" || cfg.upstream == nil {
+		len(cfg.upstreams) != 1 || cfg.upstreams[0].baseURL != "https://localhost:9090" {
 		t.Errorf("loadConfig = %+v", cfg)
 	}
 }
@@ -64,8 +66,14 @@ func TestLoadConfig_Defaults(t *testing.T) {
 		t.Fatalf("loadConfig: %v", err)
 	}
 	if cfg.addr != defaultAddr || cfg.maxConcurrent != proxy.DefaultMaxConcurrent ||
-		cfg.caFile != "" || cfg.extraCAs != nil || cfg.baseURL != "" || cfg.upstream == nil {
+		cfg.caFile != "" || cfg.extraCAs != nil || cfg.ignored != nil {
 		t.Errorf("loadConfig = %+v", cfg)
+	}
+	if got := upstreamNames(cfg); !slices.Equal(got, []string{"anthropic"}) {
+		t.Errorf("upstreams = %q, want [anthropic]", got)
+	}
+	if u := cfg.upstreams[0]; u.baseURL != anthropic.DefaultBaseURL || u.provider.Name() != "anthropic" {
+		t.Errorf("anthropic upstream = %+v", u)
 	}
 }
 
@@ -260,18 +268,41 @@ func TestLogCAs(t *testing.T) {
 	tests := []struct {
 		name      string
 		certs     []*x509.Certificate
-		baseURL   string
+		env       map[string]string // upstream variables
 		wantWarns []string
 	}{
-		{"CA, custom upstream", ca, "https://localhost:9090", nil},
-		{"CA, default upstream", ca, "", []string{"default Anthropic API"}},
-		{"CA, explicit default upstream", ca, "https://api.anthropic.com/", []string{"default Anthropic API"}},
-		{"non-CA, custom upstream", leaf, "https://localhost:9090", []string{"non-CA certificate"}},
+		{"CA, custom upstream", ca, map[string]string{"ANTHROPIC_BASE_URL": "https://localhost:9090"}, nil},
+		{"CA, default upstream", ca, nil, []string{"default Anthropic API"}},
+		{"CA, explicit default upstream", ca, map[string]string{"ANTHROPIC_BASE_URL": "https://api.anthropic.com/"}, []string{"default Anthropic API"}},
+		{"non-CA, custom upstream", leaf, map[string]string{"ANTHROPIC_BASE_URL": "https://localhost:9090"}, []string{"non-CA certificate"}},
+		{
+			"CA, both upstreams on their defaults", ca,
+			map[string]string{"SENTINEL_UPSTREAMS": "anthropic,openai"},
+			[]string{
+				"default Anthropic API; anyone holding one of their keys could impersonate it and read ANTHROPIC_API_KEY",
+				"default OpenAI API; anyone holding one of their keys could impersonate it and read OPENAI_API_KEY",
+			},
+		},
+		{
+			"CA, only openai on its default", ca,
+			map[string]string{"SENTINEL_UPSTREAMS": "anthropic,openai", "ANTHROPIC_BASE_URL": "https://localhost:9090", "OPENAI_BASE_URL": "https://API.openai.com/v1/"},
+			[]string{"default OpenAI API"},
+		},
+		{
+			"CA, openai-compatible elsewhere", ca,
+			map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_BASE_URL": "https://localhost:9090/v1"}, nil,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"ANTHROPIC_API_KEY": "sk", "OPENAI_API_KEY": "sk-o", "SENTINEL_API_KEYS": "k1"}
+			maps.Copy(vars, tt.env)
+			cfg, err := loadConfig(env(vars))
+			if err != nil {
+				t.Fatal(err)
+			}
 			var buf strings.Builder
-			logCAs(slog.New(slog.NewTextHandler(&buf, nil)), "ca.pem", tt.certs, tt.baseURL)
+			logCAs(slog.New(slog.NewTextHandler(&buf, nil)), "ca.pem", tt.certs, cfg.upstreams)
 			var warns []string
 			for line := range strings.Lines(buf.String()) {
 				if strings.Contains(line, "level=WARN") {
@@ -386,5 +417,247 @@ func TestLogRateLimit(t *testing.T) {
 	}
 	if strings.Contains(out, "hunter2") {
 		t.Errorf("log contains the Redis password:\n%s", out)
+	}
+}
+
+func upstreamNames(cfg config) []string {
+	var names []string
+	for _, u := range cfg.upstreams {
+		names = append(names, u.spec.name)
+	}
+	return names
+}
+
+func TestLoadConfig_Upstreams(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    []string // enabled upstreams, in order
+		ignored []string // key variables set for an unlisted upstream
+		wantErr string   // the variable the error must start with
+	}{
+		{name: "default list", env: map[string]string{"ANTHROPIC_API_KEY": "sk"}, want: []string{"anthropic"}},
+		{
+			name: "both, in listed order",
+			env:  map[string]string{"SENTINEL_UPSTREAMS": " openai , anthropic ", "ANTHROPIC_API_KEY": "sk", "OPENAI_API_KEY": "sk-o"},
+			want: []string{"openai", "anthropic"},
+		},
+		{
+			name: "openai only, without ANTHROPIC_API_KEY",
+			env:  map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_API_KEY": "sk-o"},
+			want: []string{"openai"},
+		},
+		{name: "unknown name", env: map[string]string{"SENTINEL_UPSTREAMS": "anthropic,gemini", "ANTHROPIC_API_KEY": "sk"}, wantErr: "SENTINEL_UPSTREAMS"},
+		{name: "names are case-sensitive", env: map[string]string{"SENTINEL_UPSTREAMS": "OpenAI", "OPENAI_API_KEY": "sk-o"}, wantErr: "SENTINEL_UPSTREAMS"},
+		{name: "duplicate", env: map[string]string{"SENTINEL_UPSTREAMS": "openai,openai", "OPENAI_API_KEY": "sk-o"}, wantErr: "SENTINEL_UPSTREAMS"},
+		{name: "empty list", env: map[string]string{"SENTINEL_UPSTREAMS": " , ", "ANTHROPIC_API_KEY": "sk"}, wantErr: "SENTINEL_UPSTREAMS"},
+		{name: "anthropic listed without its key", env: map[string]string{"SENTINEL_UPSTREAMS": "anthropic,openai", "OPENAI_API_KEY": "sk-o"}, wantErr: "ANTHROPIC_API_KEY"},
+		{name: "openai listed without its key", env: map[string]string{"SENTINEL_UPSTREAMS": "anthropic,openai", "ANTHROPIC_API_KEY": "sk"}, wantErr: "OPENAI_API_KEY"},
+		{
+			name:    "unlisted key is ignored",
+			env:     map[string]string{"ANTHROPIC_API_KEY": "sk", "OPENAI_API_KEY": "sk-o", "OPENAI_BASE_URL": "not validated, not used"},
+			want:    []string{"anthropic"},
+			ignored: []string{"OPENAI_API_KEY"},
+		},
+		{
+			name:    "OPENAI_BASE_URL plain http to a non-loopback host",
+			env:     map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_API_KEY": "sk-o", "OPENAI_BASE_URL": "http://api.openai.com/v1"},
+			wantErr: "OPENAI_BASE_URL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"SENTINEL_API_KEYS": "k1"}
+			maps.Copy(vars, tt.env)
+			if tt.wantErr != "" {
+				wantConfigErr(t, vars, tt.wantErr)
+				return
+			}
+			cfg, err := loadConfig(env(vars))
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got := upstreamNames(cfg); !slices.Equal(got, tt.want) {
+				t.Errorf("upstreams = %q, want %q", got, tt.want)
+			}
+			var ignored []string
+			for _, s := range cfg.ignored {
+				ignored = append(ignored, s.keyVar)
+			}
+			if !slices.Equal(ignored, tt.ignored) {
+				t.Errorf("ignored keys = %q, want %q", ignored, tt.ignored)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_UpstreamErrorText(t *testing.T) {
+	tests := []struct {
+		upstreams, want string
+	}{
+		{"anthropic,gemini", `SENTINEL_UPSTREAMS: unknown upstream "gemini"; known upstreams are anthropic, openai`},
+		{"openai,openai", `SENTINEL_UPSTREAMS: upstream "openai" is listed more than once`},
+		{",", `SENTINEL_UPSTREAMS: "," lists no upstreams; known upstreams are anthropic, openai`},
+		{"openai", "OPENAI_API_KEY is not set; it is required while SENTINEL_UPSTREAMS lists openai"},
+	}
+	for _, tt := range tests {
+		_, err := loadConfig(env(map[string]string{"SENTINEL_UPSTREAMS": tt.upstreams, "SENTINEL_API_KEYS": "k1"}))
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("SENTINEL_UPSTREAMS=%q: err = %v, want %q", tt.upstreams, err, tt.want)
+		}
+	}
+}
+
+func TestLogUpstreams(t *testing.T) {
+	cfg, err := loadConfig(env(map[string]string{
+		"SENTINEL_UPSTREAMS": "openai",
+		"OPENAI_API_KEY":     "sk-openai-secret",
+		"OPENAI_BASE_URL":    "http://127.0.0.1:11434/v1",
+		"ANTHROPIC_API_KEY":  "sk-ant-secret",
+		"SENTINEL_API_KEYS":  "k1",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	lines := slices.Collect(strings.Lines(buf.String()))
+	if len(lines) != 2 {
+		t.Fatalf("log = %q, want 2 lines", lines)
+	}
+	for i, want := range []string{
+		`level=INFO msg="upstream enabled" upstream=openai base_url=http://127.0.0.1:11434/v1`,
+		`level=WARN msg="ANTHROPIC_API_KEY is set but anthropic is not in SENTINEL_UPSTREAMS; ignoring"`,
+	} {
+		if !strings.Contains(lines[i], want) {
+			t.Errorf("line %d = %q, want it to contain %q", i, lines[i], want)
+		}
+	}
+	if strings.Contains(buf.String(), "secret") {
+		t.Errorf("log contains an upstream key:\n%s", buf.String())
+	}
+
+	// The default base URL is logged when the variable is unset.
+	cfg, err = loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	if want := "upstream=anthropic base_url=https://api.anthropic.com\n"; !strings.HasSuffix(buf.String(), want) {
+		t.Errorf("log = %q, want it to end with %q", buf.String(), want)
+	}
+}
+
+func TestNewMux_RoutesOnlyEnabledUpstreams(t *testing.T) {
+	const (
+		messages = "/v1/messages"
+		chat     = "/v1/chat/completions"
+	)
+	tests := []struct {
+		upstreams string
+		enabled   []string
+	}{
+		{"anthropic", []string{messages}},
+		{"openai", []string{chat}},
+		{"anthropic,openai", []string{messages, chat}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.upstreams, func(t *testing.T) {
+			cfg, err := loadConfig(env(map[string]string{
+				"SENTINEL_UPSTREAMS": tt.upstreams,
+				"ANTHROPIC_API_KEY":  "sk",
+				"OPENAI_API_KEY":     "sk-o",
+				"SENTINEL_API_KEYS":  "k1",
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})
+			// Without a key an enabled route answers 401 from RequireKey and
+			// never reaches the upstream; a disabled one is not routed.
+			for _, path := range []string{messages, chat} {
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}")))
+				want := http.StatusNotFound
+				if slices.Contains(tt.enabled, path) {
+					want = http.StatusUnauthorized
+				}
+				if rec.Code != want {
+					t.Errorf("POST %s: status = %d, want %d", path, rec.Code, want)
+				}
+			}
+		})
+	}
+}
+
+// TestNewMux_SharedAdmission holds the only slot with a request on
+// /v1/messages, so /v1/chat/completions must shed its request.
+func TestNewMux_SharedAdmission(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	held := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer held.Close()
+	defer close(release) // runs first, so Close doesn't wait on the held handler
+
+	cfg, err := loadConfig(env(map[string]string{
+		"SENTINEL_UPSTREAMS":      "anthropic,openai",
+		"SENTINEL_MAX_CONCURRENT": "1",
+		"ANTHROPIC_API_KEY":       "sk",
+		"ANTHROPIC_BASE_URL":      held.URL,
+		"OPENAI_API_KEY":          "sk-o",
+		"OPENAI_BASE_URL":         "http://127.0.0.1:1/v1", // never reached
+		"SENTINEL_API_KEYS":       "k1",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}))
+	defer srv.Close()
+
+	// Cancelled before srv.Close, which would wait for it.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/messages", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Api-Key", "k1")
+	go func() {
+		if resp, err := srv.Client().Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached upstream")
+	}
+
+	chatReq, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatReq.Header.Set("Authorization", "Bearer k1")
+	resp, err := srv.Client().Do(chatReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %q", resp.StatusCode, body)
+	}
+	// In the chat route's own protocol.
+	want := `{"error":{"message":"gateway is at capacity","type":"server_error","param":null,"code":"overloaded"}}` + "\n"
+	if string(body) != want {
+		t.Errorf("body = %q, want %q", body, want)
 	}
 }
