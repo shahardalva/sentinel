@@ -507,7 +507,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 
 - Only `POST /v1/messages` is proxied on the Anthropic side. Other Anthropic endpoints return `404`.
 - Only `POST /v1/chat/completions` is proxied on the OpenAI side. The Responses API, embeddings, models and other endpoints return `404`.
-- One CA file for all upstreams: `SENTINEL_UPSTREAM_CA_FILE` is trusted for every enabled upstream, so a private CA added for a local server is trusted for the public providers too. The gateway warns for every enabled upstream, built-in or custom, on a public default host (`api.anthropic.com`, `api.openai.com`).
+- One CA file for all upstreams: `SENTINEL_UPSTREAM_CA_FILE` is trusted for every enabled upstream, so a private CA added for a local server is trusted for the public providers too. The gateway warns for every enabled upstream, built-in or custom, on a public default host (`api.anthropic.com`, `api.openai.com`). Tracked as an issue.
 - Upstreams are picked by path prefix only. There is no routing by model and no fallback between upstreams, and the rate limit is per client key, not per upstream.
 - The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
 - Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.
@@ -521,7 +521,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - Query strings are not forwarded upstream.
 - Streaming has not been load-tested yet.
 
-Each of these is tracked as an issue.
+The ones marked "Tracked as an issue" have a fix planned; the rest are deliberate scope limits for now.
 
 ## Roadmap
 
