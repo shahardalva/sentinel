@@ -130,7 +130,9 @@ func run(logger *slog.Logger) error {
 		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.baseURL)
 	}
 
-	opts := proxy.Options{MaxConcurrent: cfg.maxConcurrent}
+	// One cap for the whole gateway: every route and upstream draws on the
+	// same slots, so the memory bound in ADR 0001 holds however many there are.
+	opts := proxy.Options{Admission: proxy.NewAdmission(cfg.maxConcurrent)}
 	if cfg.redis == nil {
 		logger.Info("rate limiting disabled: SENTINEL_REDIS_URL is not set")
 	} else {
@@ -147,7 +149,7 @@ func run(logger *slog.Logger) error {
 
 	mux := http.NewServeMux()
 	messages := proxy.NewHandler(cfg.upstream, logger, opts)
-	mux.Handle("POST /v1/messages", proxy.RequireKey(cfg.clientKeys, logger, messages))
+	mux.Handle("POST /v1/messages", proxy.RequireKey(cfg.clientKeys, cfg.upstream, logger, messages))
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
 	// can legitimately run for minutes. The handler sets its own per-request
