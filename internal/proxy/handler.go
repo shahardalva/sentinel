@@ -148,11 +148,16 @@ type Options struct {
 	// RateLimitFailClosed answers 503 when RateLimiter returns an error. By
 	// default (fail open) the request is allowed and a warning logged.
 	RateLimitFailClosed bool
+	// Upstream names the upstream the Handler forwards to, for the request
+	// log's "upstream" field; "provider" is the protocol's Name(). Empty
+	// means the provider's Name().
+	Upstream string
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
 type Handler struct {
 	provider      Provider
+	upstream      string
 	logger        *slog.Logger
 	headerTimeout time.Duration
 	idleTimeout   time.Duration
@@ -189,8 +194,12 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 	if opts.Admission == nil {
 		opts.Admission = NewAdmission(opts.MaxConcurrent)
 	}
+	if opts.Upstream == "" {
+		opts.Upstream = p.Name()
+	}
 	return &Handler{
 		provider:      p,
+		upstream:      opts.Upstream,
 		logger:        logger,
 		headerTimeout: opts.HeaderTimeout,
 		idleTimeout:   opts.IdleTimeout,
@@ -219,6 +228,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
+			slog.String("upstream", h.upstream),
 			slog.String("provider", h.provider.Name()),
 			slog.String("model", model),
 			slog.Int("status", status),

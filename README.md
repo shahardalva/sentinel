@@ -2,7 +2,7 @@
 
 **A security gateway for LLM applications and AI agents.**
 
-Sentinel is a reverse proxy that sits between your application and an LLM provider. It speaks the Anthropic Messages API and the OpenAI Chat Completions API, so it fronts Anthropic, OpenAI, and OpenAI-compatible servers such as Ollama. Clients point their existing SDK at Sentinel instead of the provider. Sentinel authenticates them, forwards the request with its own upstream credentials, relays the response (including streams) as it arrives, and records a structured log line with per-stage timings for every request.
+Sentinel is a reverse proxy that sits between your application and an LLM provider. It speaks the Anthropic Messages API and the OpenAI Chat Completions API, so it fronts Anthropic, OpenAI, and any provider that speaks one of them, such as xAI, Groq or a local Ollama, several side by side, added by configuration alone. Clients point their existing SDK at Sentinel instead of the provider. Sentinel authenticates them, forwards the request with its own upstream credentials, relays the response (including streams) as it arrives, and records a structured log line with per-stage timings for every request.
 
 The goal is a single control point for LLM traffic: who is calling, what is being sent, and what an agent is allowed to do. Detection of prompt injection and sensitive data, policy enforcement, and an audit trail are being built on top of this core.
 
@@ -52,8 +52,8 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 **Protocols**
 - Anthropic Messages API on `POST /v1/messages`, and the OpenAI Chat Completions API on `POST /v1/chat/completions`. `SENTINEL_UPSTREAMS` picks which are served; a route exists only for an enabled upstream.
-- The OpenAI side works with OpenAI itself or any server that speaks its protocol (`OPENAI_BASE_URL`), such as Ollama or vLLM.
-- Both routes share the client keys, the rate limiter and one concurrency cap. Each answers the gateway's own errors in its protocol's shape.
+- Named upstreams: any OpenAI- or Anthropic-compatible provider (xAI, Groq, Ollama, vLLM, ...) is added with three environment variables and served on its own prefix, such as `POST /xai/v1/chat/completions`. Several of one protocol run side by side, each with its own key. See [Named upstreams](#named-upstreams).
+- Every route shares the client keys, the rate limiter and one concurrency cap. Each answers the gateway's own errors in its protocol's shape.
 
 **Security**
 - Per-client gateway keys, accepted as `x-api-key` or `Authorization: Bearer`. Keys are compared as SHA-256 digests in constant time.
@@ -118,7 +118,9 @@ docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock u
 docker compose up -d --build                                                                  # real
 ```
 
-Run `make` to list the targets with a line on each. `make bench-gateway` load-tests a separate `gateway-bench` service that is fixed to the mock upstream and holds no real key, and refuses to run unless both of that gateway's upstreams are the mock, so a load test never reaches a real API.
+`make up` also enables a custom upstream, `mockcompat`, on the mock's OpenAI API, so the prefixed route `POST /mockcompat/v1/chat/completions` works out of the box.
+
+Run `make` to list the targets with a line on each. `make bench-gateway` load-tests a separate `gateway-bench` service that is fixed to the mock upstream and holds no real key. It reads the base URLs that gateway logs at startup and refuses to run unless every one is the mock's, so a load test never reaches a real API.
 
 ### Run the gateway
 
@@ -204,19 +206,45 @@ print(completion.choices[0].message.content)
 
 The SDK sends the client key as `Authorization: Bearer`. The gateway swaps it for its own `OPENAI_API_KEY`. `stream=True` works the same way.
 
-### Use a local model with Ollama
+### Use a named upstream
 
-Run the gateway on the host, next to Ollama, and point the openai upstream at Ollama's OpenAI-compatible API. Plain `http` is allowed because the host is loopback. Ollama ignores the upstream key, but the gateway requires one:
+Any other provider that speaks one of the two protocols is a named upstream: list a name in `SENTINEL_UPSTREAMS` and give it a protocol, a base URL and a key. Here xAI runs next to OpenAI:
 
 ```bash
-SENTINEL_UPSTREAMS=openai \
-OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
-OPENAI_API_KEY=ollama \
+export SENTINEL_UPSTREAMS=openai,xai
+export OPENAI_API_KEY="sk-..."
+export SENTINEL_UPSTREAM_XAI_PROTOCOL=openai
+export SENTINEL_UPSTREAM_XAI_BASE_URL=https://api.x.ai/v1
+export SENTINEL_UPSTREAM_XAI_API_KEY="xai-..."
+export SENTINEL_API_KEYS="$(openssl rand -hex 32)"
+go run ./cmd/gateway
+```
+
+A client picks the upstream with the prefix in its base URL. The client key is the same for every upstream:
+
+```python
+from openai import OpenAI
+
+xai = OpenAI(base_url="http://127.0.0.1:8081/xai/v1", api_key="<your client key>")
+openai = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="<your client key>")  # the built-in openai upstream
+```
+
+An upstream with protocol `anthropic` works the same way with the Anthropic SDK, whose base URL has no `/v1`: `Anthropic(base_url="http://127.0.0.1:8081/<name>")`.
+
+### Use a local model with Ollama
+
+Run the gateway on the host, next to Ollama, and add Ollama's OpenAI-compatible API as a named upstream. Plain `http` is allowed because the host is loopback. Ollama ignores the upstream key, but the gateway requires one:
+
+```bash
+SENTINEL_UPSTREAMS=ollama \
+SENTINEL_UPSTREAM_OLLAMA_PROTOCOL=openai \
+SENTINEL_UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434/v1 \
+SENTINEL_UPSTREAM_OLLAMA_API_KEY=ollama \
 SENTINEL_API_KEYS="$(openssl rand -hex 32)" \
 go run ./cmd/gateway
 ```
 
-Clients then use the OpenAI SDK as above, with a model Ollama has pulled, such as `model="llama3.2"`. Inside the compose stack the gateway can't reach the host's loopback, and plain `http` is refused for any other host, so this recipe is for a gateway on the host.
+Clients then use the OpenAI SDK with `base_url="http://127.0.0.1:8081/ollama/v1"` and a model Ollama has pulled, such as `model="llama3.2"`. Add `openai` or `anthropic` to the list to serve them next to it. Inside the compose stack the gateway can't reach the host's loopback, and plain `http` is refused for any other host, so this recipe is for a gateway on the host.
 
 ## Configuration
 
@@ -224,7 +252,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: `anthropic` (`POST /v1/messages`), `openai` (`POST /v1/chat/completions`), or both. An unknown name, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its base URL. |
+| `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: the built-in `anthropic` (`POST /v1/messages`) and `openai` (`POST /v1/chat/completions`), and any [named upstreams](#named-upstreams). A name that breaks the naming rule, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its name, protocol and base URL. |
 | `ANTHROPIC_API_KEY` | When `anthropic` is listed | | The gateway's own key for the Anthropic API. Clients never see it. |
 | `OPENAI_API_KEY` | When `openai` is listed | | The gateway's own key for the OpenAI-compatible API. Clients never see it. |
 | `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys, shared by every route. The gateway refuses to start without at least one. |
@@ -239,7 +267,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` values. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves both protocols from the mock, and `make bench-gateway` refuses to run unless both of its base URLs are the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -255,6 +283,46 @@ Built-in limits:
 | Header read timeout | 10 s | Bounds slow request headers |
 | Auth read timeout | 5 s | Bounds reads while a request is unauthenticated |
 | Shutdown grace period | 30 s | Lets in-flight streams finish |
+
+### Named upstreams
+
+Any provider that speaks the Anthropic or OpenAI protocol is added by listing a name in `SENTINEL_UPSTREAMS` and setting three variables, with the name upper-cased:
+
+| Variable | Description |
+| --- | --- |
+| `SENTINEL_UPSTREAM_<NAME>_PROTOCOL` | `anthropic` or `openai`. |
+| `SENTINEL_UPSTREAM_<NAME>_BASE_URL` | The provider's base URL. For `openai` it includes `/v1`, as in the OpenAI SDKs, and the gateway appends `/chat/completions`; for `anthropic` the gateway appends `/v1/messages`. Same `https` rule as the built-ins. |
+| `SENTINEL_UPSTREAM_<NAME>_API_KEY` | The gateway's own key for that provider. Clients never see it. |
+
+All three are required; there is no default base URL. Startup fails, naming the variable, if one is missing or invalid, and the error never contains a URL or a key. Each named upstream is served on `POST /<name>/v1/chat/completions` or `POST /<name>/v1/messages`, by its protocol, so a client sets its SDK's base URL to `http://<gateway>/<name>/v1` (OpenAI SDKs) or `http://<gateway>/<name>` (Anthropic SDKs). The unprefixed routes belong to the built-in `anthropic` and `openai`, which are also served on `/anthropic/...` and `/openai/...`. An unknown prefix gets a `404`.
+
+```bash
+SENTINEL_UPSTREAMS=anthropic,xai,groq,ollama
+
+# xAI
+SENTINEL_UPSTREAM_XAI_PROTOCOL=openai
+SENTINEL_UPSTREAM_XAI_BASE_URL=https://api.x.ai/v1
+SENTINEL_UPSTREAM_XAI_API_KEY=xai-...
+
+# Groq
+SENTINEL_UPSTREAM_GROQ_PROTOCOL=openai
+SENTINEL_UPSTREAM_GROQ_BASE_URL=https://api.groq.com/openai/v1
+SENTINEL_UPSTREAM_GROQ_API_KEY=gsk_...
+
+# Ollama on the gateway's host; it ignores the key, but one is required
+SENTINEL_UPSTREAM_OLLAMA_PROTOCOL=openai
+SENTINEL_UPSTREAM_OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+SENTINEL_UPSTREAM_OLLAMA_API_KEY=ollama
+```
+
+Rules:
+
+- A name is a lowercase letter followed by up to 31 lowercase letters or digits: `^[a-z][a-z0-9]{0,31}$`. No hyphens or underscores, so each variable maps back to one name. `v1` is reserved.
+- `anthropic` and `openai` keep their own variables (`ANTHROPIC_*`, `OPENAI_*`). Setting any `SENTINEL_UPSTREAM_ANTHROPIC_*` or `SENTINEL_UPSTREAM_OPENAI_*` variable stops startup.
+- Only listed upstreams are used. `SENTINEL_UPSTREAM_<NAME>_*` variables for a name not in the list are neither validated nor used, and the gateway logs one `WARN` per such name, without the values.
+- Every upstream shares the client keys, the rate limit and the concurrency cap. `SENTINEL_UPSTREAM_CA_FILE` applies to all of them.
+
+The design is in [ADR 0003](docs/adr/0003-named-upstreams.md).
 
 ## Request lifecycle
 
@@ -312,6 +380,7 @@ Logs are JSON on stdout, one line per request:
   "level": "INFO",
   "msg": "request",
   "request_id": "JM4FWMO5DFDCXTXC6U6SFNSX6Z",
+  "upstream": "anthropic",
   "provider": "anthropic",
   "model": "claude-haiku-5-5",
   "status": 200,
@@ -326,6 +395,7 @@ Logs are JSON on stdout, one line per request:
 ```
 
 - `request_id` matches the `X-Request-Id` response header, so a client report can be traced to its log line.
+- `upstream` is the name of the upstream the request went to (`anthropic`, `openai`, or a [named upstream](#named-upstreams) such as `xai`), and `provider` is its protocol. A request to `/xai/v1/chat/completions` logs `"upstream": "xai", "provider": "openai"`.
 - `upstream_request_id` is the provider's ID for the same request, for support cases with the provider.
 - `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; see [Performance](#performance) for load-test numbers.
 - With rate limiting on, `rate_limit_us` is how long the Redis call took, and `rate_limit_remaining` how many requests the key has left right now. `rate_limit_remaining` is missing when Redis couldn't answer.
@@ -353,6 +423,8 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 - **Protocol-owned errors.** The core knows error kinds (invalid request, authentication, rate limit, too large, timeout, overloaded, upstream failure), not error shapes. Every error the gateway itself answers with, including the `401` from `RequireKey`, is rendered by the route's `ErrorFormatter`, so clients of each protocol get errors their SDK can parse. The Anthropic provider maps the kinds to Anthropic's error types.
 - **Shared upstream plumbing.** `internal/provider/upstream` holds the security-critical parts every provider needs: the https-only rule with its loopback exception, the pooled HTTP client with a TLS 1.2 floor and extra CAs added to the system pool, and the header control-character check. A new provider calls it instead of copying it.
 
+**Upstreams are named and routed by prefix.** A protocol (Anthropic or OpenAI) is code; an upstream is configuration: a name, a protocol, a base URL and a key. A client picks the upstream with the path prefix in its SDK's base URL, not by the `model` field, which is client-controlled and would need a model table kept current across providers. Custom upstreams have no defaults, so a key meant for one provider can't end up at another's public API. See [ADR 0003](docs/adr/0003-named-upstreams.md).
+
 **Per-chunk deadlines instead of a request deadline.** A single deadline for the whole request would cut off long, healthy streams. Sentinel bounds the time to first byte, the idle time between chunks, and each write to the client instead. The server has no global `ReadTimeout` or `WriteTimeout` for the same reason.
 
 **Read the body before taking a slot.** Otherwise one client could fill every slot with slow uploads and lock everyone else out. Admission happens only once the body is fully in memory.
@@ -370,6 +442,7 @@ sentinel/
 ├── cmd/gateway/              # entry point: config, server, graceful shutdown
 ├── cmd/mockupstream/         # fake Messages and Chat Completions APIs for load tests, http or https
 ├── cmd/devcerts/             # writes a dev CA and server certificate to ./certs
+├── cmd/benchguard/           # make bench-gateway's check that every upstream gateway-bench resolved is the mock
 ├── internal/devcert/         # certificate generation used by devcerts and tests
 ├── internal/ratelimit/       # per-key rate limiting
 │   ├── ratelimit.go          #   token bucket as an atomic Redis Lua script
@@ -422,13 +495,17 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - response header filtering and `anthropic-version` validation
 - the OpenAI route end to end: only the gateway's bearer key and `Content-Type` reach the upstream, never a client's `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` or `X-Stainless-*`; streamed chunks and `data: [DONE]` arriving as sent; and the exact OpenAI-shaped bodies of the gateway's `401`, `429`, `502` and `503`
 - `SENTINEL_UPSTREAMS` parsing, a route existing only for an enabled upstream, and one shared concurrency cap: a request held on `/v1/messages` makes `/v1/chat/completions` answer `503`
+- named upstreams: the naming rule, missing or invalid protocol, base URL and key, `SENTINEL_UPSTREAM_OPENAI_*` rejected, unlisted upstreams warned about and not used, and no key or URL secret in any error or log line; two upstreams of one protocol, each on its own test server with its own key, where each prefix reaches only its server and neither key reaches the other; unprefixed routes only for the built-ins, `404` with `Connection: close` for an unknown prefix, and one concurrency cap across prefixes
+- the `upstream` and `provider` fields of the request log
+- the bench guard's matching: base URLs that only look like the mock's (`https://mockupstream:9090.example.com`, another port, userinfo) are refused
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
 
 ## Known limitations
 
 - Only `POST /v1/messages` is proxied on the Anthropic side. Other Anthropic endpoints return `404`.
 - Only `POST /v1/chat/completions` is proxied on the OpenAI side. The Responses API, embeddings, models and other endpoints return `404`.
-- One OpenAI-compatible upstream at a time: `OPENAI_BASE_URL` names a single server, so OpenAI and Ollama can't be served side by side until named upstreams land.
+- One CA file for all upstreams: `SENTINEL_UPSTREAM_CA_FILE` is trusted for every enabled upstream, so a private CA added for a local server is trusted for the public providers too. The warning about this covers only the built-ins on their default hosts.
+- Upstreams are picked by path prefix only. There is no routing by model and no fallback between upstreams, and the rate limit is per client key, not per upstream.
 - The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
 - Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.
 - Upstream error bodies are passed through as-is, so they may name the gateway's upstream account (its organization or project IDs), even though those response headers are dropped. Tracked as an issue.
@@ -454,7 +531,7 @@ Where the project is heading. Not yet built; the diagram at the top of this READ
 | Phase | Scope |
 | --- | --- |
 | **1. Core proxy** | Anthropic provider, auth, streaming, timeouts, resource limits, structured logging. **Done.** |
-| **2. Platform** | Docker Compose with Postgres and Redis, CI, per-key rate limits, OpenAI provider (**done**: OpenAI-compatible Chat Completions), k6 load tests with published p50/p99 overhead |
+| **2. Platform** | Docker Compose with Postgres and Redis, CI, per-key rate limits, OpenAI provider (**done**: OpenAI-compatible Chat Completions), named upstreams (**done**: any OpenAI- or Anthropic-compatible provider by configuration; per-upstream CA and limits next), k6 load tests with published p50/p99 overhead |
 | **3. Detection** | Secret detection in the gateway, a Python detector service over gRPC for PII and prompt injection, a public evaluation set with precision and recall |
 | **4. Agents** | MCP proxy with tool pinning, tool allowlists and scopes per tenant |
 | **5. Audit pipeline** | Kafka event stream, workers for LLM-as-judge and alerts, ClickHouse audit log with a hash chain, dashboard |

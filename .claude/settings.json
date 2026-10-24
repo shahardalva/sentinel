@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(docker:*)",
+      "Bash(docker compose:*)",
+      "Bash(make up:*)",
+      "Bash(make up-real:*)",
+      "Bash(make bench:*)",
+      "Bash(make bench-gateway:*)",
+      "Bash(make test-redis:*)",
+      "Read(./.env)"
+    ]
+  }
+}

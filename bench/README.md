@@ -24,6 +24,7 @@ You need [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and Go.
 |--------------|-------------------------|--------------------------------------------|
 | `TARGET_URL` | `http://127.0.0.1:9090` | base URL; the script appends the path      |
 | `BENCH_API`  | `anthropic`             | `anthropic`: `POST /v1/messages`, key as `x-api-key`. `openai`: `POST /v1/chat/completions` with an OpenAI-shaped body, key as `Authorization: Bearer` |
+| `BENCH_PREFIX` | empty                 | prepended to the path, for a gateway's named upstream: `BENCH_API=openai BENCH_PREFIX=/mockcompat` sends `POST /mockcompat/v1/chat/completions`. The mock itself has no prefixed routes, so use it only through a gateway |
 | `API_KEY`    | `bench`                 | the key, sent as `BENCH_API` says           |
 | `STREAM`     | unset                   | `1` sends `"stream": true`, for either `BENCH_API` |
 | `DURATION_S` | `30`                    | seconds per rate; lower it for a smoke run  |
@@ -134,12 +135,19 @@ make bench-gateway   # k6 through gateway-bench, a gateway fixed to the mock
 ```
 
 `make bench-gateway` starts its own `gateway-bench` service, which serves
-both protocols, points both upstreams at the mock and holds no real upstream
-key. It refuses to run unless that gateway has both
-`ANTHROPIC_BASE_URL=https://mockupstream:9090` and
-`OPENAI_BASE_URL=https://mockupstream:9090/v1`. `BENCH_API`, `DURATION_S` and
-`STREAM` pass through, for example `make bench-gateway DURATION_S=5` or
-`make bench-gateway BENCH_API=openai STREAM=1`.
+both protocols plus a named upstream, `mockcompat` (protocol `openai`), all
+pointed at the mock, and holds no real upstream key. Before k6 starts, it
+waits up to about 15 seconds for that gateway to log `listening`, then
+checks the `upstream enabled` lines it logged at startup: there must be at
+least one, and every `base_url` must be `https://mockupstream:9090` or a path
+under it. Otherwise it refuses to run and names the upstream at fault. It
+checks what the gateway resolved rather than its environment variables,
+since an upstream listed without a base URL variable silently gets its
+public default; the matching is in `cmd/benchguard`. `BENCH_API`,
+`BENCH_PREFIX`, `DURATION_S` and `STREAM` pass through, for example
+`make bench-gateway DURATION_S=5`, `make bench-gateway BENCH_API=openai STREAM=1`,
+or `make bench-gateway BENCH_API=openai BENCH_PREFIX=/mockcompat` for the
+prefixed route.
 
 `gateway-bench` rate limits through the compose Redis, like a production
 gateway, so every request includes the Redis call and the overhead you

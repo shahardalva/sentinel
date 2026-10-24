@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,24 +42,17 @@ func main() {
 	}
 }
 
-// upstreamSpec is an upstream the gateway can enable by naming it in
-// SENTINEL_UPSTREAMS.
-type upstreamSpec struct {
-	name       string // as listed in SENTINEL_UPSTREAMS
-	label      string // for log messages
-	keyVar     string // the upstream key's variable; required when enabled
-	baseURLVar string
-	defaultURL string
-	route      string // the mux pattern its handler serves
-	newFunc    func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error)
+// protocol is a wire protocol an upstream speaks. It fixes the route's path
+// and the Provider that forwards to the upstream.
+type protocol struct {
+	name    string // as in SENTINEL_UPSTREAM_<NAME>_PROTOCOL
+	path    string // the route's path, after any /<name> prefix
+	newFunc func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error)
 }
 
-// upstreamSpecs are the upstreams SENTINEL_UPSTREAMS may name.
-var upstreamSpecs = []upstreamSpec{
-	{
-		name: "anthropic", label: "Anthropic",
-		keyVar: "ANTHROPIC_API_KEY", baseURLVar: "ANTHROPIC_BASE_URL", defaultURL: anthropic.DefaultBaseURL,
-		route: "POST /v1/messages",
+var (
+	anthropicProtocol = protocol{
+		name: "anthropic", path: "/v1/messages",
 		newFunc: func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error) {
 			p, err := anthropic.New(anthropic.Config{APIKey: apiKey, BaseURL: baseURL, MaxIdleConns: maxIdleConns, ExtraRootCAs: extraCAs})
 			if err != nil {
@@ -66,11 +60,9 @@ var upstreamSpecs = []upstreamSpec{
 			}
 			return p, nil
 		},
-	},
-	{
-		name: "openai", label: "OpenAI",
-		keyVar: "OPENAI_API_KEY", baseURLVar: "OPENAI_BASE_URL", defaultURL: openai.DefaultBaseURL,
-		route: "POST /v1/chat/completions",
+	}
+	openaiProtocol = protocol{
+		name: "openai", path: "/v1/chat/completions",
 		newFunc: func(apiKey, baseURL string, maxIdleConns int, extraCAs []*x509.Certificate) (proxy.Provider, error) {
 			p, err := openai.New(openai.Config{APIKey: apiKey, BaseURL: baseURL, MaxIdleConns: maxIdleConns, ExtraRootCAs: extraCAs})
 			if err != nil {
@@ -78,10 +70,58 @@ var upstreamSpecs = []upstreamSpec{
 			}
 			return p, nil
 		},
+	}
+	protocols = []*protocol{&anthropicProtocol, &openaiProtocol}
+)
+
+// upstreamSpec is an upstream the gateway can enable by naming it in
+// SENTINEL_UPSTREAMS: a built-in one from upstreamSpecs, or a custom one
+// configured by SENTINEL_UPSTREAM_<NAME>_* variables.
+type upstreamSpec struct {
+	name       string // as listed in SENTINEL_UPSTREAMS
+	protocol   *protocol
+	keyVar     string // the upstream key's variable; required when enabled
+	baseURLVar string
+	// Built-in upstreams only. A built-in upstream also serves its
+	// protocol's unprefixed route, and its base URL has a default.
+	builtin    bool
+	label      string // for log messages
+	defaultURL string
+}
+
+// upstreamSpecs are the built-in upstreams.
+var upstreamSpecs = []upstreamSpec{
+	{
+		name: "anthropic", protocol: &anthropicProtocol, builtin: true, label: "Anthropic",
+		keyVar: "ANTHROPIC_API_KEY", baseURLVar: "ANTHROPIC_BASE_URL", defaultURL: anthropic.DefaultBaseURL,
+	},
+	{
+		name: "openai", protocol: &openaiProtocol, builtin: true, label: "OpenAI",
+		keyVar: "OPENAI_API_KEY", baseURLVar: "OPENAI_BASE_URL", defaultURL: openai.DefaultBaseURL,
 	},
 }
 
+// routes returns the mux patterns s's handler serves: /<name> followed by
+// its protocol's path, and for a built-in upstream the path on its own too.
+func (s *upstreamSpec) routes() []string {
+	prefixed := "POST /" + s.name + s.protocol.path
+	if s.builtin {
+		return []string{"POST " + s.protocol.path, prefixed}
+	}
+	return []string{prefixed}
+}
+
 const defaultUpstreams = "anthropic"
+
+// customVarPrefix starts the variables of a custom upstream:
+// SENTINEL_UPSTREAM_<NAME>_PROTOCOL, _BASE_URL and _API_KEY, with NAME
+// upper-cased. Names have no underscores, so the mapping is one to one.
+const customVarPrefix = "SENTINEL_UPSTREAM_"
+
+var customVarFields = []string{"PROTOCOL", "BASE_URL", "API_KEY"}
+
+// upstreamName is the rule for names in SENTINEL_UPSTREAMS.
+var upstreamName = regexp.MustCompile(`^[a-z][a-z0-9]{0,31}$`)
 
 // enabledUpstream is an upstream listed in SENTINEL_UPSTREAMS, ready to serve.
 type enabledUpstream struct {
@@ -98,9 +138,13 @@ type config struct {
 	caFile        string // SENTINEL_UPSTREAM_CA_FILE; empty if unset
 	extraCAs      []*x509.Certificate
 	upstreams     []enabledUpstream // in SENTINEL_UPSTREAMS order
-	// ignored are the upstreams not in SENTINEL_UPSTREAMS whose key
+	// ignored are the built-in upstreams not in SENTINEL_UPSTREAMS whose key
 	// variable is set anyway. The key is not used.
 	ignored []*upstreamSpec
+	// ignoredCustom are the names, sorted, of custom upstreams not in
+	// SENTINEL_UPSTREAMS whose SENTINEL_UPSTREAM_<NAME>_* variables are set
+	// anyway. They are neither validated nor used.
+	ignoredCustom []string
 	// Rate limiting; redis is nil when SENTINEL_REDIS_URL is unset.
 	redis          *redis.Client
 	rateRPM        int
@@ -108,16 +152,27 @@ type config struct {
 }
 
 // loadConfig reads and validates the gateway's environment variables via
-// getenv. Each error starts with the name of the variable at fault.
-func loadConfig(getenv func(string) string) (config, error) {
-	specs, err := parseUpstreams(getenv("SENTINEL_UPSTREAMS"))
+// getenv, and looks through environ for custom upstream variables. Each
+// error starts with the name of the variable at fault.
+func loadConfig(getenv func(string) string, environ func() []string) (config, error) {
+	names, err := parseUpstreams(getenv("SENTINEL_UPSTREAMS"))
 	if err != nil {
 		return config{}, fmt.Errorf("SENTINEL_UPSTREAMS: %w", err)
 	}
-	for _, s := range specs {
+	ignoredCustom, err := scanUpstreamVars(environ(), names)
+	if err != nil {
+		return config{}, err
+	}
+	var specs []*upstreamSpec
+	for _, name := range names {
+		s, err := resolveUpstream(name, getenv)
+		if err != nil {
+			return config{}, err
+		}
 		if err := checkUpstreamKey(getenv(s.keyVar)); err != nil {
 			return config{}, fmt.Errorf("%s %w; it is required while SENTINEL_UPSTREAMS lists %s", s.keyVar, err, s.name)
 		}
+		specs = append(specs, s)
 	}
 	var ignored []*upstreamSpec
 	for i := range upstreamSpecs {
@@ -150,7 +205,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	var upstreams []enabledUpstream
 	for _, s := range specs {
 		baseURL := getenv(s.baseURLVar)
-		p, err := s.newFunc(getenv(s.keyVar), baseURL, maxConcurrent, extraCAs)
+		p, err := s.protocol.newFunc(getenv(s.keyVar), baseURL, maxConcurrent, extraCAs)
 		if err != nil {
 			return config{}, providerError(s, err)
 		}
@@ -184,6 +239,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		extraCAs:       extraCAs,
 		upstreams:      upstreams,
 		ignored:        ignored,
+		ignoredCustom:  ignoredCustom,
 		redis:          rdb,
 		rateRPM:        rateRPM,
 		rateFailClosed: failClosed,
@@ -191,7 +247,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 }
 
 func run(logger *slog.Logger) error {
-	cfg, err := loadConfig(os.Getenv)
+	cfg, err := loadConfig(os.Getenv, os.Environ)
 	if err != nil {
 		return err
 	}
@@ -255,20 +311,24 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
-// newMux registers one route per enabled upstream, each behind the same
-// client keys. Every handler gets the same opts, so they share its rate
-// limiter, and one Admission: when opts has none, newMux creates it with
-// cfg.maxConcurrent slots. One cap for the whole gateway means every route
-// and upstream draws on the same slots, so the memory bound in ADR 0001
-// holds however many there are.
+// newMux registers the routes of every enabled upstream (see
+// upstreamSpec.routes), each behind the same client keys. Every handler
+// gets the same opts, so they share its rate limiter, and one Admission:
+// when opts has none, newMux creates it with cfg.maxConcurrent slots. One
+// cap for the whole gateway means every route and upstream draws on the
+// same slots, so the memory bound in ADR 0001 holds however many there are.
 func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux {
 	if opts.Admission == nil {
 		opts.Admission = proxy.NewAdmission(cfg.maxConcurrent)
 	}
 	mux := http.NewServeMux()
 	for _, u := range cfg.upstreams {
-		h := proxy.NewHandler(u.provider, logger, opts)
-		mux.Handle(u.spec.route, proxy.RequireKey(cfg.clientKeys, u.provider, logger, h))
+		o := opts
+		o.Upstream = u.spec.name
+		h := proxy.RequireKey(cfg.clientKeys, u.provider, logger, proxy.NewHandler(u.provider, logger, o))
+		for _, route := range u.spec.routes() {
+			mux.Handle(route, h)
+		}
 	}
 	return mux
 }
@@ -289,7 +349,7 @@ func checkUpstreamKey(key string) error {
 	return nil
 }
 
-// providerError attributes an error from s.newFunc: a rejected base URL to
+// providerError attributes an error from s.protocol.newFunc: a rejected base URL to
 // s's base URL variable, anything else (the trust store, the client) to the
 // upstream itself.
 func providerError(s *upstreamSpec, err error) error {
@@ -300,48 +360,110 @@ func providerError(s *upstreamSpec, err error) error {
 }
 
 // parseUpstreams reads SENTINEL_UPSTREAMS, a comma-separated list of
-// upstream names. Empty means defaultUpstreams. A name that is unknown or
-// listed twice is an error, as is a list with no names in it.
-func parseUpstreams(s string) ([]*upstreamSpec, error) {
+// upstream names. Empty means defaultUpstreams. A name must match
+// upstreamName and must not be "v1"; a name that doesn't, or is listed
+// twice, is an error, as is a list with no names in it. Whether a name is
+// built-in or custom is resolveUpstream's business.
+func parseUpstreams(s string) ([]string, error) {
 	if s == "" {
 		s = defaultUpstreams
 	}
-	var specs []*upstreamSpec
+	var names []string
 	for name := range strings.SplitSeq(s, ",") {
 		if name = strings.TrimSpace(name); name == "" {
 			continue
 		}
-		i := slices.IndexFunc(upstreamSpecs, func(u upstreamSpec) bool { return u.name == name })
-		if i < 0 {
-			return nil, fmt.Errorf("unknown upstream %q; known upstreams are %s", name, knownUpstreams())
-		}
-		if slices.Contains(specs, &upstreamSpecs[i]) {
+		switch {
+		case !upstreamName.MatchString(name):
+			return nil, fmt.Errorf("upstream name %q must be a lowercase letter followed by up to 31 lowercase letters or digits", name)
+		case name == "v1":
+			return nil, errors.New(`upstream name "v1" is reserved: its routes would start /v1/v1/`)
+		case slices.Contains(names, name):
 			return nil, fmt.Errorf("upstream %q is listed more than once", name)
 		}
-		specs = append(specs, &upstreamSpecs[i])
+		names = append(names, name)
 	}
-	if len(specs) == 0 {
-		return nil, fmt.Errorf("%q lists no upstreams; known upstreams are %s", s, knownUpstreams())
+	if len(names) == 0 {
+		return nil, fmt.Errorf("%q lists no upstreams", s)
 	}
-	return specs, nil
+	return names, nil
 }
 
-func knownUpstreams() string {
-	var names []string
-	for _, u := range upstreamSpecs {
-		names = append(names, u.name)
+// resolveUpstream returns the spec for a name from SENTINEL_UPSTREAMS: the
+// built-in upstream of that name, or else a custom one read from its
+// SENTINEL_UPSTREAM_<NAME>_* variables. A custom upstream has no defaults,
+// so its protocol and base URL must be set; resolveUpstream checks they are
+// present and leaves the base URL itself to the provider. Errors name the
+// variable at fault, never its value.
+func resolveUpstream(name string, getenv func(string) string) (*upstreamSpec, error) {
+	if i := slices.IndexFunc(upstreamSpecs, func(u upstreamSpec) bool { return u.name == name }); i >= 0 {
+		return &upstreamSpecs[i], nil
 	}
-	return strings.Join(names, ", ")
+	prefix := customVarPrefix + strings.ToUpper(name) + "_"
+	protoVar := prefix + "PROTOCOL"
+	raw := strings.TrimSpace(getenv(protoVar))
+	if raw == "" {
+		return nil, fmt.Errorf("%s is not set; it is required while SENTINEL_UPSTREAMS lists %s", protoVar, name)
+	}
+	i := slices.IndexFunc(protocols, func(p *protocol) bool { return p.name == raw })
+	if i < 0 {
+		return nil, fmt.Errorf(`%s must be "anthropic" or "openai"`, protoVar)
+	}
+	s := &upstreamSpec{name: name, protocol: protocols[i], keyVar: prefix + "API_KEY", baseURLVar: prefix + "BASE_URL"}
+	if getenv(s.baseURLVar) == "" {
+		return nil, fmt.Errorf("%s is not set; it is required while SENTINEL_UPSTREAMS lists %s", s.baseURLVar, name)
+	}
+	return s, nil
 }
 
-// logUpstreams records each enabled upstream and warns about upstream keys
-// that are set but unused. It never logs a key.
+// scanUpstreamVars looks through environ ("KEY=value" entries) for
+// SENTINEL_UPSTREAM_<NAME>_* variables with a value. One that names a
+// built-in upstream is an error, since those are configured by their own
+// variables. Otherwise it returns the names, lower-cased and sorted, of
+// custom upstreams with a PROTOCOL, BASE_URL or API_KEY variable set that
+// are not in listed. Only variable names reach the error, never values.
+func scanUpstreamVars(environ []string, listed []string) ([]string, error) {
+	var unlisted []string
+	for _, kv := range environ {
+		key, val, _ := strings.Cut(kv, "=")
+		rest, ok := strings.CutPrefix(key, customVarPrefix)
+		if !ok || val == "" {
+			continue
+		}
+		upper, field, ok := strings.Cut(rest, "_")
+		if !ok {
+			continue
+		}
+		name := strings.ToLower(upper)
+		if i := slices.IndexFunc(upstreamSpecs, func(u upstreamSpec) bool { return u.name == name }); i >= 0 {
+			s := &upstreamSpecs[i]
+			return nil, fmt.Errorf("%s: %s is a built-in upstream with a fixed protocol; set %s and %s instead",
+				key, name, s.keyVar, s.baseURLVar)
+		}
+		// SENTINEL_UPSTREAM_CA_FILE, say, is not an upstream's.
+		if !slices.Contains(customVarFields, field) || upper != strings.ToUpper(name) || !upstreamName.MatchString(name) {
+			continue
+		}
+		if !slices.Contains(listed, name) && !slices.Contains(unlisted, name) {
+			unlisted = append(unlisted, name)
+		}
+	}
+	slices.Sort(unlisted)
+	return unlisted, nil
+}
+
+// logUpstreams records each enabled upstream and warns about upstream
+// variables that are set but unused. It never logs a key.
 func logUpstreams(logger *slog.Logger, cfg config) {
 	for _, u := range cfg.upstreams {
-		logger.Info("upstream enabled", "upstream", u.spec.name, "base_url", u.baseURL)
+		logger.Info("upstream enabled", "upstream", u.spec.name, "protocol", u.spec.protocol.name, "base_url", u.baseURL)
 	}
 	for _, s := range cfg.ignored {
 		logger.Warn(fmt.Sprintf("%s is set but %s is not in SENTINEL_UPSTREAMS; ignoring", s.keyVar, s.name))
+	}
+	for _, name := range cfg.ignoredCustom {
+		logger.Warn(fmt.Sprintf("%s%s_* is set but %s is not in SENTINEL_UPSTREAMS; ignoring",
+			customVarPrefix, strings.ToUpper(name), name))
 	}
 }
 
@@ -468,10 +590,14 @@ func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, upstreams
 	}
 }
 
-// onDefaultHost reports whether u talks to its public default host, such
-// as api.anthropic.com, whatever the path. A trailing dot (the fully
-// qualified form, api.anthropic.com.) names the same host.
+// onDefaultHost reports whether u is a built-in upstream talking to its
+// public default host, such as api.anthropic.com, whatever the path. A
+// trailing dot (the fully qualified form, api.anthropic.com.) names the
+// same host. A custom upstream has no default, so it is never on one.
 func onDefaultHost(u enabledUpstream) bool {
+	if !u.spec.builtin {
+		return false
+	}
 	got, err := url.Parse(u.baseURL)
 	if err != nil {
 		return false

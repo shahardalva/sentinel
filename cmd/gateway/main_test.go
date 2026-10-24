@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,10 +28,18 @@ import (
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
-// env returns a getenv that reads only from vars, so tests don't see the
-// real environment.
-func env(vars map[string]string) func(string) string {
-	return func(key string) string { return vars[key] }
+// env returns a getenv and an environ that read only from vars, so tests
+// don't see the real environment. environ lists vars sorted by key.
+func env(vars map[string]string) (func(string) string, func() []string) {
+	getenv := func(key string) string { return vars[key] }
+	environ := func() []string {
+		var kv []string
+		for _, k := range slices.Sorted(maps.Keys(vars)) {
+			kv = append(kv, k+"="+vars[k])
+		}
+		return kv
+	}
+	return getenv, environ
 }
 
 // wantConfigErr checks that loadConfig fails with an error starting with
@@ -454,7 +464,7 @@ func TestLoadConfig_Upstreams(t *testing.T) {
 			env:  map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_API_KEY": "sk-o"},
 			want: []string{"openai"},
 		},
-		{name: "unknown name", env: map[string]string{"SENTINEL_UPSTREAMS": "anthropic,gemini", "ANTHROPIC_API_KEY": "sk"}, wantErr: "SENTINEL_UPSTREAMS"},
+		{name: "unknown name is a custom upstream", env: map[string]string{"SENTINEL_UPSTREAMS": "anthropic,gemini", "ANTHROPIC_API_KEY": "sk"}, wantErr: "SENTINEL_UPSTREAM_GEMINI_PROTOCOL"},
 		{name: "names are case-sensitive", env: map[string]string{"SENTINEL_UPSTREAMS": "OpenAI", "OPENAI_API_KEY": "sk-o"}, wantErr: "SENTINEL_UPSTREAMS"},
 		{name: "duplicate", env: map[string]string{"SENTINEL_UPSTREAMS": "openai,openai", "OPENAI_API_KEY": "sk-o"}, wantErr: "SENTINEL_UPSTREAMS"},
 		{name: "empty list", env: map[string]string{"SENTINEL_UPSTREAMS": " , ", "ANTHROPIC_API_KEY": "sk"}, wantErr: "SENTINEL_UPSTREAMS"},
@@ -502,9 +512,11 @@ func TestLoadConfig_UpstreamErrorText(t *testing.T) {
 	tests := []struct {
 		upstreams, want string
 	}{
-		{"anthropic,gemini", `SENTINEL_UPSTREAMS: unknown upstream "gemini"; known upstreams are anthropic, openai`},
+		{"anthropic,Gemini", `SENTINEL_UPSTREAMS: upstream name "Gemini" must be a lowercase letter followed by up to 31 lowercase letters or digits`},
+		{"v1", `SENTINEL_UPSTREAMS: upstream name "v1" is reserved: its routes would start /v1/v1/`},
+		{"gemini", "SENTINEL_UPSTREAM_GEMINI_PROTOCOL is not set; it is required while SENTINEL_UPSTREAMS lists gemini"},
 		{"openai,openai", `SENTINEL_UPSTREAMS: upstream "openai" is listed more than once`},
-		{",", `SENTINEL_UPSTREAMS: "," lists no upstreams; known upstreams are anthropic, openai`},
+		{",", `SENTINEL_UPSTREAMS: "," lists no upstreams`},
 		{"openai", "OPENAI_API_KEY is not set; it is required while SENTINEL_UPSTREAMS lists openai"},
 	}
 	for _, tt := range tests {
@@ -610,7 +622,7 @@ func TestLogUpstreams(t *testing.T) {
 		t.Fatalf("log = %q, want 2 lines", lines)
 	}
 	for i, want := range []string{
-		`level=INFO msg="upstream enabled" upstream=openai base_url=http://127.0.0.1:11434/v1`,
+		`level=INFO msg="upstream enabled" upstream=openai protocol=openai base_url=http://127.0.0.1:11434/v1`,
 		`level=WARN msg="ANTHROPIC_API_KEY is set but anthropic is not in SENTINEL_UPSTREAMS; ignoring"`,
 	} {
 		if !strings.Contains(lines[i], want) {
@@ -628,7 +640,7 @@ func TestLogUpstreams(t *testing.T) {
 	}
 	buf.Reset()
 	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
-	if want := "upstream=anthropic base_url=https://api.anthropic.com\n"; !strings.HasSuffix(buf.String(), want) {
+	if want := "upstream=anthropic protocol=anthropic base_url=https://api.anthropic.com\n"; !strings.HasSuffix(buf.String(), want) {
 		t.Errorf("log = %q, want it to end with %q", buf.String(), want)
 	}
 }
@@ -743,5 +755,452 @@ func TestNewMux_SharedAdmission(t *testing.T) {
 	want := `{"error":{"message":"gateway is at capacity","type":"server_error","param":null,"code":"overloaded"}}` + "\n"
 	if string(body) != want {
 		t.Errorf("body = %q, want %q", body, want)
+	}
+}
+
+// customVars returns the variables for a custom upstream named name.
+func customVars(name, protocol, baseURL, key string) map[string]string {
+	prefix := "SENTINEL_UPSTREAM_" + strings.ToUpper(name) + "_"
+	return map[string]string{prefix + "PROTOCOL": protocol, prefix + "BASE_URL": baseURL, prefix + "API_KEY": key}
+}
+
+func TestLoadConfig_CustomUpstreams(t *testing.T) {
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "xai, anthropic, local", "ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1"}
+	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-key"))
+	maps.Copy(vars, customVars("local", " anthropic ", "http://127.0.0.1:9090", "local-key"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if got := upstreamNames(cfg); !slices.Equal(got, []string{"xai", "anthropic", "local"}) {
+		t.Fatalf("upstreams = %q", got)
+	}
+	tests := []struct {
+		protocol, baseURL, keyVar string
+		routes                    []string
+	}{
+		{"openai", "https://api.x.ai/v1", "SENTINEL_UPSTREAM_XAI_API_KEY", []string{"POST /xai/v1/chat/completions"}},
+		{"anthropic", anthropic.DefaultBaseURL, "ANTHROPIC_API_KEY", []string{"POST /v1/messages", "POST /anthropic/v1/messages"}},
+		{"anthropic", "http://127.0.0.1:9090", "SENTINEL_UPSTREAM_LOCAL_API_KEY", []string{"POST /local/v1/messages"}},
+	}
+	for i, want := range tests {
+		u := cfg.upstreams[i]
+		if u.spec.protocol.name != want.protocol || u.provider.Name() != want.protocol || u.baseURL != want.baseURL ||
+			u.spec.keyVar != want.keyVar || !slices.Equal(u.spec.routes(), want.routes) {
+			t.Errorf("upstream %s: protocol %s, provider %s, base URL %s, key %s, routes %q; want %+v",
+				u.spec.name, u.spec.protocol.name, u.provider.Name(), u.baseURL, u.spec.keyVar, u.spec.routes(), want)
+		}
+	}
+	if cfg.ignored != nil || cfg.ignoredCustom != nil {
+		t.Errorf("ignored = %v, %q; want none", cfg.ignored, cfg.ignoredCustom)
+	}
+}
+
+func TestLoadConfig_UpstreamNames(t *testing.T) {
+	long := strings.Repeat("a", 32)
+	for _, name := range []string{"a", "a1", long} {
+		vars := map[string]string{"SENTINEL_UPSTREAMS": name, "SENTINEL_API_KEYS": "k1"}
+		maps.Copy(vars, customVars(name, "openai", "https://example.com/v1", "sk"))
+		if _, err := loadConfig(env(vars)); err != nil {
+			t.Errorf("name %q: %v", name, err)
+		}
+	}
+	for _, name := range []string{"Xai", "XAI", "x-ai", "x_ai", "1ai", long + "a", "v1", "x.ai", "x/ai"} {
+		vars := map[string]string{"SENTINEL_UPSTREAMS": "anthropic," + name, "ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1"}
+		maps.Copy(vars, customVars(name, "openai", "https://example.com/v1", "sk"))
+		t.Run(name, func(t *testing.T) { wantConfigErr(t, vars, "SENTINEL_UPSTREAMS:") })
+	}
+}
+
+func TestLoadConfig_CustomUpstreamRequiresVars(t *testing.T) {
+	tests := []struct {
+		name    string
+		unset   string            // field left unset
+		set     map[string]string // overrides
+		wantErr string
+	}{
+		{name: "no protocol", unset: "PROTOCOL", wantErr: "SENTINEL_UPSTREAM_XAI_PROTOCOL is not set; it is required while SENTINEL_UPSTREAMS lists xai"},
+		{name: "no base URL", unset: "BASE_URL", wantErr: "SENTINEL_UPSTREAM_XAI_BASE_URL is not set; it is required while SENTINEL_UPSTREAMS lists xai"},
+		{name: "no key", unset: "API_KEY", wantErr: "SENTINEL_UPSTREAM_XAI_API_KEY is not set; it is required while SENTINEL_UPSTREAMS lists xai"},
+		{name: "unknown protocol", set: map[string]string{"SENTINEL_UPSTREAM_XAI_PROTOCOL": "grpc"}, wantErr: `SENTINEL_UPSTREAM_XAI_PROTOCOL must be "anthropic" or "openai"`},
+		{name: "protocols are case-sensitive", set: map[string]string{"SENTINEL_UPSTREAM_XAI_PROTOCOL": "OpenAI"}, wantErr: `SENTINEL_UPSTREAM_XAI_PROTOCOL must be "anthropic" or "openai"`},
+		{
+			name:    "plain-http base URL",
+			set:     map[string]string{"SENTINEL_UPSTREAM_XAI_BASE_URL": "http://api.x.ai/v1"},
+			wantErr: "SENTINEL_UPSTREAM_XAI_BASE_URL: openai: base URL for http://api.x.ai must use https (http is allowed only for loopback hosts)",
+		},
+		{
+			name:    "key with trailing whitespace",
+			set:     map[string]string{"SENTINEL_UPSTREAM_XAI_API_KEY": "xai-key "},
+			wantErr: "SENTINEL_UPSTREAM_XAI_API_KEY has leading or trailing whitespace; it is required while SENTINEL_UPSTREAMS lists xai",
+		},
+		{
+			name:    "key with a control character",
+			set:     map[string]string{"SENTINEL_UPSTREAM_XAI_API_KEY": "xai\x00key"},
+			wantErr: "SENTINEL_UPSTREAM_XAI_API_KEY contains a control character; it is required while SENTINEL_UPSTREAMS lists xai",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"SENTINEL_UPSTREAMS": "xai", "SENTINEL_API_KEYS": "k1"}
+			maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-key"))
+			delete(vars, "SENTINEL_UPSTREAM_XAI_"+tt.unset)
+			maps.Copy(vars, tt.set)
+			_, err := loadConfig(env(vars))
+			if err == nil || err.Error() != tt.wantErr {
+				t.Errorf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_RejectsBuiltinUpstreamVars(t *testing.T) {
+	for _, v := range []string{
+		"SENTINEL_UPSTREAM_OPENAI_BASE_URL",
+		"SENTINEL_UPSTREAM_OPENAI_API_KEY",
+		"SENTINEL_UPSTREAM_OPENAI_PROTOCOL",
+		"SENTINEL_UPSTREAM_OPENAI_ANYTHING",
+		"SENTINEL_UPSTREAM_ANTHROPIC_API_KEY",
+	} {
+		// Rejected whether or not the built-in is listed.
+		for _, list := range []string{"anthropic", "anthropic,openai"} {
+			_, err := loadConfig(env(map[string]string{
+				"SENTINEL_UPSTREAMS": list,
+				"ANTHROPIC_API_KEY":  "sk",
+				"OPENAI_API_KEY":     "sk-o",
+				"SENTINEL_API_KEYS":  "k1",
+				v:                    "sk-secret-value",
+			}))
+			if err == nil || !strings.HasPrefix(err.Error(), v+": ") || strings.Contains(err.Error(), "secret") {
+				t.Errorf("%s with SENTINEL_UPSTREAMS=%s: err = %v, want an error naming %s without its value", v, list, err, v)
+			}
+		}
+	}
+	_, err := loadConfig(env(map[string]string{
+		"OPENAI_API_KEY":                    "sk-o",
+		"SENTINEL_UPSTREAMS":                "openai",
+		"SENTINEL_API_KEYS":                 "k1",
+		"SENTINEL_UPSTREAM_OPENAI_BASE_URL": "https://api.x.ai/v1",
+	}))
+	want := "SENTINEL_UPSTREAM_OPENAI_BASE_URL: openai is a built-in upstream with a fixed protocol; set OPENAI_API_KEY and OPENAI_BASE_URL instead"
+	if err == nil || err.Error() != want {
+		t.Errorf("err = %v, want %q", err, want)
+	}
+	// Set but empty counts as unset, as it does for every other variable.
+	if _, err := loadConfig(env(map[string]string{
+		"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1", "SENTINEL_UPSTREAM_OPENAI_API_KEY": "",
+	})); err != nil {
+		t.Errorf("empty SENTINEL_UPSTREAM_OPENAI_API_KEY: %v", err)
+	}
+}
+
+func TestLoadConfig_UnlistedCustomUpstreams(t *testing.T) {
+	vars := map[string]string{
+		"SENTINEL_UPSTREAMS":        "anthropic,xai",
+		"ANTHROPIC_API_KEY":         "sk",
+		"SENTINEL_API_KEYS":         "k1",
+		"SENTINEL_UPSTREAM_CA_FILE": writeFile(t, generate(t).CACert), // not an upstream's
+		// Not validated and not used: a plain-http public URL would stop
+		// startup if groq were listed.
+		"SENTINEL_UPSTREAM_GROQ_API_KEY":    "gsk-secret-1",
+		"SENTINEL_UPSTREAM_GROQ_BASE_URL":   "http://user:secret@api.groq.com/openai/v1",
+		"SENTINEL_UPSTREAM_OLLAMA_PROTOCOL": "openai",
+		"SENTINEL_UPSTREAM_EMPTY_API_KEY":   "",       // empty counts as unset
+		"SENTINEL_UPSTREAM_OTHER_SETTING":   "secret", // not a field
+		"SENTINEL_UPSTREAM_lower_API_KEY":   "secret", // NAME must be upper-cased
+		"SENTINEL_UPSTREAM_X-AI_API_KEY":    "secret", // not a valid name
+	}
+	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-secret"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if got := upstreamNames(cfg); !slices.Equal(got, []string{"anthropic", "xai"}) {
+		t.Errorf("upstreams = %q", got)
+	}
+	if !slices.Equal(cfg.ignoredCustom, []string{"groq", "ollama"}) {
+		t.Errorf("ignoredCustom = %q, want [groq ollama]", cfg.ignoredCustom)
+	}
+
+	var buf strings.Builder
+	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	var warns []string
+	for line := range strings.Lines(buf.String()) {
+		if strings.Contains(line, "level=WARN") {
+			warns = append(warns, line)
+		}
+	}
+	wantWarns := []string{
+		`msg="SENTINEL_UPSTREAM_GROQ_* is set but groq is not in SENTINEL_UPSTREAMS; ignoring"`,
+		`msg="SENTINEL_UPSTREAM_OLLAMA_* is set but ollama is not in SENTINEL_UPSTREAMS; ignoring"`,
+	}
+	if len(warns) != len(wantWarns) {
+		t.Fatalf("warnings = %q, want %d", warns, len(wantWarns))
+	}
+	for i, want := range wantWarns {
+		if !strings.Contains(warns[i], want) {
+			t.Errorf("warning %d = %q, want %q", i, warns[i], want)
+		}
+	}
+	if strings.Contains(buf.String(), "secret") || strings.Contains(buf.String(), "groq.com") {
+		t.Errorf("log repeats a value:\n%s", buf.String())
+	}
+}
+
+// TestLoadConfig_CustomUpstreamSecretsNotEchoed checks that no error or log
+// line repeats a custom upstream's key or its base URL's userinfo or query.
+func TestLoadConfig_CustomUpstreamSecretsNotEchoed(t *testing.T) {
+	tests := []struct{ field, value, want string }{
+		{"BASE_URL", "https://user:secret@api.x.ai/v1", "SENTINEL_UPSTREAM_XAI_BASE_URL: openai: base URL for https://api.x.ai must not contain credentials"},
+		{"BASE_URL", "https://api.x.ai/v1?key=sk-secret-123", "SENTINEL_UPSTREAM_XAI_BASE_URL: openai: base URL for https://api.x.ai must not contain a query"},
+		{"BASE_URL", "https://user:secret@api.x.ai:port/v1", "SENTINEL_UPSTREAM_XAI_BASE_URL: openai: base URL is not a valid URL"},
+		{"API_KEY", " xai-secret", "SENTINEL_UPSTREAM_XAI_API_KEY has leading or trailing whitespace; it is required while SENTINEL_UPSTREAMS lists xai"},
+		{"API_KEY", "xai-secret\n", "SENTINEL_UPSTREAM_XAI_API_KEY has leading or trailing whitespace; it is required while SENTINEL_UPSTREAMS lists xai"},
+		{"PROTOCOL", "secret", `SENTINEL_UPSTREAM_XAI_PROTOCOL must be "anthropic" or "openai"`},
+	}
+	for _, tt := range tests {
+		vars := map[string]string{"SENTINEL_UPSTREAMS": "xai", "SENTINEL_API_KEYS": "k1"}
+		maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-key"))
+		vars["SENTINEL_UPSTREAM_XAI_"+tt.field] = tt.value
+		_, err := loadConfig(env(vars))
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("%s=%q: err = %v, want %q", tt.field, tt.value, err, tt.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Errorf("%s=%q: error %q repeats a secret", tt.field, tt.value, err)
+		}
+	}
+
+	// A valid custom upstream logs its base URL, never its key.
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "xai", "SENTINEL_API_KEYS": "k1"}
+	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-secret"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	if want := `msg="upstream enabled" upstream=xai protocol=openai base_url=https://api.x.ai/v1`; !strings.Contains(buf.String(), want) {
+		t.Errorf("log = %q, want it to contain %q", buf.String(), want)
+	}
+	if strings.Contains(buf.String(), "secret") {
+		t.Errorf("log contains the key:\n%s", buf.String())
+	}
+}
+
+// recordingUpstream is an OpenAI-compatible upstream that records the
+// Authorization header of every request it gets.
+type recordingUpstream struct {
+	*httptest.Server
+	mu    sync.Mutex
+	auths []string
+}
+
+func newRecordingUpstream(t *testing.T) *recordingUpstream {
+	t.Helper()
+	u := &recordingUpstream{}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		u.auths = append(u.auths, r.Header.Get("Authorization"))
+		u.mu.Unlock()
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"object":"chat.completion"}`))
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+func (u *recordingUpstream) received() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.auths)
+}
+
+func TestNewMux_CustomUpstreams(t *testing.T) {
+	alpha, beta := newRecordingUpstream(t), newRecordingUpstream(t)
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "alpha,beta", "SENTINEL_API_KEYS": "k1"}
+	maps.Copy(vars, customVars("alpha", "openai", alpha.URL+"/v1", "alpha-upstream-key"))
+	maps.Copy(vars, customVars("beta", "openai", beta.URL+"/v1", "beta-upstream-key"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{})))
+	defer srv.Close()
+
+	send := func(path string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer k1")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+
+	for range 2 {
+		for _, path := range []string{"/alpha/v1/chat/completions", "/beta/v1/chat/completions"} {
+			if resp := send(path); resp.StatusCode != http.StatusOK {
+				t.Errorf("POST %s: status %d, want 200", path, resp.StatusCode)
+			}
+		}
+	}
+	// Each prefix reaches only its own server, with only its own key.
+	for _, tt := range []struct {
+		u    *recordingUpstream
+		want string
+	}{{alpha, "Bearer alpha-upstream-key"}, {beta, "Bearer beta-upstream-key"}} {
+		got := tt.u.received()
+		if len(got) != 2 || slices.ContainsFunc(got, func(a string) bool { return a != tt.want }) {
+			t.Errorf("upstream got Authorization %q, want %q twice", got, tt.want)
+		}
+	}
+
+	// No unprefixed route without a built-in upstream, no route for an
+	// unknown prefix or for another protocol's path, and each 404 closes
+	// the connection.
+	for _, path := range []string{
+		"/v1/chat/completions", "/v1/messages", "/gamma/v1/chat/completions",
+		"/alpha/v1/messages", "/alpha/chat/completions", "/v1/alpha/v1/chat/completions",
+	} {
+		resp := send(path)
+		if resp.StatusCode != http.StatusNotFound || !resp.Close {
+			t.Errorf("POST %s: status %d, close %v; want 404 with Connection: close", path, resp.StatusCode, resp.Close)
+		}
+	}
+	if n := len(alpha.received()) + len(beta.received()); n != 4 {
+		t.Errorf("upstreams got %d requests, want 4", n)
+	}
+
+	// The log line names the upstream and the protocol's provider.
+	var got []string
+	for line := range strings.Lines(logs.String()) {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("parse log line %q: %v", line, err)
+		}
+		if m["msg"] == "request" {
+			got = append(got, fmt.Sprintf("%v/%v", m["upstream"], m["provider"]))
+		}
+	}
+	if want := []string{"alpha/openai", "beta/openai", "alpha/openai", "beta/openai"}; !slices.Equal(got, want) {
+		t.Errorf("logged upstream/provider = %q, want %q", got, want)
+	}
+}
+
+// TestNewMux_UnprefixedRoutesOnlyForBuiltins checks which routes exist with
+// built-in and custom upstreams side by side.
+func TestNewMux_UnprefixedRoutesOnlyForBuiltins(t *testing.T) {
+	vars := map[string]string{
+		"SENTINEL_UPSTREAMS": "anthropic,openai,xai,claude",
+		"ANTHROPIC_API_KEY":  "sk",
+		"OPENAI_API_KEY":     "sk-o",
+		"SENTINEL_API_KEYS":  "k1",
+	}
+	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-key"))
+	maps.Copy(vars, customVars("claude", "anthropic", "https://example.com", "c-key"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})
+	// Without a key a route answers 401 from RequireKey and never reaches
+	// the upstream.
+	routed := []string{
+		"/v1/messages", "/v1/chat/completions",
+		"/anthropic/v1/messages", "/openai/v1/chat/completions",
+		"/xai/v1/chat/completions", "/claude/v1/messages",
+	}
+	unrouted := []string{"/xai/v1/messages", "/claude/v1/chat/completions", "/anthropic/v1/chat/completions", "/groq/v1/chat/completions"}
+	for _, path := range slices.Concat(routed, unrouted) {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}")))
+		want := http.StatusNotFound
+		if slices.Contains(routed, path) {
+			want = http.StatusUnauthorized
+		}
+		if rec.Code != want {
+			t.Errorf("POST %s: status = %d, want %d", path, rec.Code, want)
+		}
+	}
+}
+
+// TestNewMux_SharedAdmissionAcrossPrefixes holds the only slot with a
+// request on /alpha, so /beta and the built-in routes must shed theirs.
+func TestNewMux_SharedAdmissionAcrossPrefixes(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	held := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer held.Close()
+	defer close(release) // runs first, so Close doesn't wait on the held handler
+
+	vars := map[string]string{
+		"SENTINEL_UPSTREAMS":      "openai,alpha,beta",
+		"SENTINEL_MAX_CONCURRENT": "1",
+		"OPENAI_API_KEY":          "sk-o",
+		"OPENAI_BASE_URL":         "http://127.0.0.1:1/v1", // never reached
+		"SENTINEL_API_KEYS":       "k1",
+	}
+	maps.Copy(vars, customVars("alpha", "openai", held.URL+"/v1", "a-key"))
+	maps.Copy(vars, customVars("beta", "openai", "http://127.0.0.1:1/v1", "b-key")) // never reached
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}))
+	defer srv.Close()
+
+	// Cancelled before srv.Close, which would wait for it.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/alpha/v1/chat/completions", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer k1")
+	go func() {
+		if resp, err := srv.Client().Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached upstream")
+	}
+
+	for _, path := range []string{"/beta/v1/chat/completions", "/v1/chat/completions", "/openai/v1/chat/completions"} {
+		r, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Authorization", "Bearer k1")
+		resp, err := srv.Client().Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"overloaded"`) {
+			t.Errorf("POST %s: status %d, body %q; want 503 overloaded", path, resp.StatusCode, body)
+		}
 	}
 }
