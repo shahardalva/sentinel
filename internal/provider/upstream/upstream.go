@@ -93,7 +93,31 @@ func NewClient(cfg ClientConfig) (*http.Client, error) {
 		return nil, err
 	}
 	t.TLSClientConfig = tlsCfg
-	return &http.Client{Transport: t}, nil
+	return &http.Client{Transport: t, CheckRedirect: refuseRedirect}, nil
+}
+
+// StripURL returns err, an error from http.Client.Do, without the request
+// URL a *url.Error carries: "Post: dial tcp ...", not
+// `Post "https://host/path": dial tcp ...`. A base URL's path may hold a key,
+// and for a refused redirect the URL is the target the upstream sent. The
+// cause stays wrapped, so errors.Is and errors.As still see it. Any other
+// error is returned as is.
+func StripURL(err error) error {
+	if ue, ok := err.(*url.Error); ok {
+		return fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	return err
+}
+
+// ErrRedirect is the error NewClient's client returns for a redirect.
+var ErrRedirect = errors.New("upstream redirect refused")
+
+// refuseRedirect never follows a redirect. On a redirect to another host
+// net/http drops Authorization but keeps every other header, so a key sent
+// as X-Api-Key would reach whatever host the upstream names, over plain
+// http too. An upstream API has no reason to redirect.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return ErrRedirect
 }
 
 // tlsConfig builds on base (which may be nil) rather than replacing it, so

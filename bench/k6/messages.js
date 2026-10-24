@@ -7,9 +7,11 @@
 //   BENCH_API    "anthropic" (default): POST /v1/messages with the key as
 //                x-api-key; "openai": POST /v1/chat/completions with the key
 //                as Authorization: Bearer
-//   BENCH_PREFIX prepended to the path, default empty; "/mockcompat" with
-//                BENCH_API=openai hits the gateway's prefixed route
-//                /mockcompat/v1/chat/completions
+//   BENCH_UPSTREAM  a gateway's named upstream, default empty: a bare name
+//                such as "mockcompat", no slash. With BENCH_API=openai it
+//                sends POST /mockcompat/v1/chat/completions. A bare name,
+//                because Git Bash rewrites an argument that starts with "/"
+//                into a Windows path.
 //   API_KEY      the key, default "bench"
 //   STREAM       "1" to send "stream": true
 //   DURATION_S   seconds per rate, default 30 (lower it for a smoke run)
@@ -18,9 +20,12 @@ import { check } from 'k6';
 
 const TARGET_URL = (__ENV.TARGET_URL || 'http://127.0.0.1:9090').replace(/\/+$/, '');
 const BENCH_API = __ENV.BENCH_API || 'anthropic';
-// Empty, or one or more path segments: "/name" (a missing leading slash is
-// added, a trailing one dropped).
-const BENCH_PREFIX = (__ENV.BENCH_PREFIX || '').replace(/\/+$/, '').replace(/^(?=[^/])/, '/');
+// The gateway's rule for upstream names.
+const BENCH_UPSTREAM = __ENV.BENCH_UPSTREAM || '';
+if (BENCH_UPSTREAM && !/^[a-z][a-z0-9]{0,31}$/.test(BENCH_UPSTREAM)) {
+  throw new Error(`BENCH_UPSTREAM must be an upstream name such as "mockcompat" (lowercase letters and digits, no slash), not "${BENCH_UPSTREAM}"`);
+}
+const PREFIX = BENCH_UPSTREAM ? `/${BENCH_UPSTREAM}` : '';
 const API_KEY = __ENV.API_KEY || 'bench';
 const STREAM = __ENV.STREAM === '1';
 
@@ -99,7 +104,7 @@ const protocol = protocols[BENCH_API];
 if (!protocol) {
   throw new Error(`BENCH_API must be "anthropic" or "openai", not "${BENCH_API}"`);
 }
-const url = `${TARGET_URL}${BENCH_PREFIX}${protocol.path}`;
+const url = `${TARGET_URL}${PREFIX}${protocol.path}`;
 const body = JSON.stringify(protocol.body);
 const params = { headers: protocol.headers };
 

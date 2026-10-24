@@ -7,7 +7,8 @@ import (
 
 const mock = "https://mockupstream:9090"
 
-// enabled is the gateway's "upstream enabled" line for name at baseURL.
+// enabled is the gateway's "upstream enabled" line for name at baseURL,
+// which the gateway logs as scheme://host[:port].
 func enabled(name, baseURL string) string {
 	return `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"upstream enabled","upstream":"` + name +
 		`","protocol":"openai","base_url":"` + baseURL + `"}`
@@ -26,19 +27,43 @@ func TestCheck(t *testing.T) {
 			lines: []string{
 				"some non-JSON line\r",
 				enabled("anthropic", mock),
-				enabled("openai", mock+"/v1") + "\r", // Docker Desktop may add \r
-				enabled("mockcompat", mock+"/v1"),
+				enabled("openai", mock) + "\r", // Docker Desktop may add \r
+				enabled("mockcompat", mock),
 				`{"level":"INFO","msg":"rate limiting enabled","redis":"redis:6379"}`,
 				listening,
 			},
 		},
-		{name: "one upstream on a public API", lines: []string{enabled("anthropic", mock), enabled("openai", "https://api.openai.com/v1"), listening}, wantErr: `upstream "openai" is not on the mock`},
-		{name: "host that only starts like the mock", lines: []string{enabled("xai", mock+".example.com/v1"), listening}, wantErr: `upstream "xai"`},
-		{name: "longer port", lines: []string{enabled("xai", mock+"1/v1"), listening}, wantErr: `upstream "xai"`},
-		{name: "userinfo trick", lines: []string{enabled("xai", mock+"@api.x.ai/v1"), listening}, wantErr: `upstream "xai"`},
-		{name: "plain http", lines: []string{enabled("xai", "http://mockupstream:9090/v1"), listening}, wantErr: `upstream "xai"`},
-		{name: "no base_url field", lines: []string{`{"msg":"upstream enabled","upstream":"xai"}`, listening}, wantErr: `upstream "xai"`},
-		{name: "escaped slash still on the mock", lines: []string{enabled("openai", mock+`/v1`), listening}},
+		{name: "escaped slashes still the mock", lines: []string{enabled("openai", `https:\/\/mockupstream:9090`), listening}},
+
+		// Not the mock, or not exactly.
+		{name: "one upstream on a public API", lines: []string{enabled("anthropic", mock), enabled("openai", "https://api.openai.com"), listening}, wantErr: `upstream "openai" is not on the mock`},
+		{name: "a path", lines: []string{enabled("xai", mock+"/v1"), listening}, wantErr: `upstream "xai" is not on the mock`},
+		{name: "a trailing slash", lines: []string{enabled("xai", mock+"/"), listening}, wantErr: `upstream "xai" is not on the mock`},
+		{name: "host that only starts like the mock", lines: []string{enabled("xai", mock+".example.com"), listening}, wantErr: `upstream "xai"`},
+		{name: "longer port", lines: []string{enabled("xai", mock+"1"), listening}, wantErr: `upstream "xai"`},
+		{name: "userinfo trick", lines: []string{enabled("xai", mock+"@api.x.ai"), listening}, wantErr: `upstream "xai"`},
+		{name: "plain http", lines: []string{enabled("xai", "http://mockupstream:9090"), listening}, wantErr: `upstream "xai"`},
+		{name: "different case", lines: []string{enabled("xai", "https://MockUpstream:9090"), listening}, wantErr: `upstream "xai"`},
+
+		// Lines that can't be read as one "upstream enabled" line.
+		{name: "no base_url field", lines: []string{`{"msg":"upstream enabled","upstream":"xai"}`, listening}, wantErr: `upstream "xai": 0 base_url fields`},
+		{
+			name:    "base_url twice",
+			lines:   []string{`{"msg":"upstream enabled","upstream":"xai","base_url":"https://api.x.ai","base_url":"` + mock + `"}`, listening},
+			wantErr: `upstream "xai": 2 base_url fields`,
+		},
+		{
+			name:    "base_url in another case",
+			lines:   []string{`{"msg":"upstream enabled","upstream":"xai","base_url":"https://api.x.ai","BASE_URL":"` + mock + `"}`, listening},
+			wantErr: `upstream "xai": 2 base_url fields`,
+		},
+		{name: "base_url not a string", lines: []string{`{"msg":"upstream enabled","upstream":"xai","base_url":null}`, listening}, wantErr: `base_url is not a string`},
+		{name: "truncated line", lines: []string{enabled("anthropic", mock), `{"msg":"upstream enabled","upstream":"xai","base_url":"https://api`, listening}, wantErr: `line 2 mentions "upstream enabled"`},
+		{name: "msg twice", lines: []string{`{"msg":"x","MSG":"upstream enabled","upstream":"xai","base_url":"https://api.x.ai"}`, listening}, wantErr: `line 1 mentions "upstream enabled"`},
+		{name: "data after the object", lines: []string{enabled("xai", mock) + `{"base_url":"https://api.x.ai"}`, listening}, wantErr: `line 1 mentions "upstream enabled"`},
+		{name: "not JSON", lines: []string{`level=INFO msg="upstream enabled" upstream=xai base_url=https://api.x.ai`, listening}, wantErr: `line 1 mentions`},
+
+		// Missing lines.
 		{name: "no upstream lines", lines: []string{listening}, wantErr: `no "upstream enabled" line`},
 		{name: "never listening", lines: []string{enabled("anthropic", mock), `{"level":"ERROR","msg":"gateway exited","error":"OPENAI_API_KEY is not set"}`}, wantErr: `did not log "listening"`},
 		{name: "empty log", wantErr: `did not log "listening"`},

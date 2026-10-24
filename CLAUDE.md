@@ -41,11 +41,12 @@ tool policies, and writes an audit log.
   the mock for all its upstreams (anthropic, openai, mockcompat) with dummy
   upstream keys. It checks resolved config, not env vars: it waits (about
   15s) for gateway-bench's "listening" line, then cmd/benchguard refuses
-  to run unless there is at least one "upstream enabled" line and every
-  base_url is https://mockupstream:9090 or starts with
-  https://mockupstream:9090/. BENCH_API
-  ("anthropic" or "openai"), BENCH_PREFIX (e.g. /mockcompat, prepended to
-  the path), DURATION_S and STREAM pass through.
+  to run unless there is at least one "upstream enabled" line and each has
+  exactly one base_url (logged as scheme://host:port), equal to
+  https://mockupstream:9090; a line it can't read refuses too. BENCH_API
+  ("anthropic" or "openai"), BENCH_UPSTREAM (a bare name such as
+  mockcompat, never a path: Git Bash rewrites a leading "/"), DURATION_S
+  and STREAM pass through.
 - Compose without make: docker compose up (real), or add
   -f docker-compose.yml -f docker-compose.mock.yml --profile mock (mock).
 
@@ -53,21 +54,29 @@ tool policies, and writes an audit log.
 - SENTINEL_UPSTREAMS (optional): comma-separated upstreams to serve: the
   built-ins anthropic (POST /v1/messages) and openai
   (POST /v1/chat/completions), and named upstreams; default anthropic.
-  Names match ^[a-z][a-z0-9]{0,31}$ and "v1" is reserved; a bad name, a
+  Names match ^[a-z][a-z0-9]{0,31}$; "v1" and "ca" are reserved. A bad name, a
   duplicate, or a list with no names stops startup. Every enabled upstream
   gets POST /<name>/v1/messages or /<name>/v1/chat/completions by protocol;
   only the built-ins also get the unprefixed route. A route exists only for
   an enabled upstream; all routes share the client keys, the rate limiter
   and one proxy.Admission. One INFO line per enabled upstream logs its
-  name, protocol and base URL, never the key. The request log has
+  name, protocol and base URL as scheme://host[:port] only (a path may
+  hold a token), never the key. The request log has
   "upstream" (the name, via proxy.Options.Upstream) and "provider" (the
-  protocol's Name()).
+  protocol's Name()). A request path that isn't already clean (//, a dot
+  segment, a trailing slash) gets a plain-text 400 with Connection: close
+  before the mux, never a redirect. Upstream clients never follow a
+  redirect (upstream.ErrRedirect): the client gets a 502. Forward errors
+  go through upstream.StripURL, so the logged error never holds a URL.
 - SENTINEL_UPSTREAM_<NAME>_PROTOCOL, _BASE_URL, _API_KEY (all required for
   a listed named upstream, NAME upper-cased): "anthropic" or "openai", the
   base URL (no default; same https rule and error rules as the built-ins),
-  and the gateway's key for it. Any SENTINEL_UPSTREAM_ANTHROPIC_* or
+  and the gateway's key for it. SENTINEL_UPSTREAM_* names are matched
+  ignoring case, as Windows does. Any SENTINEL_UPSTREAM_ANTHROPIC_* or
   SENTINEL_UPSTREAM_OPENAI_* variable stops startup. Variables of an
   unlisted NAME are not validated or used; one WARN per name, no values.
+  A listed NAME's variables with another suffix (_APIKEY) get one WARN per
+  upstream, naming them without values.
   loadConfig takes getenv and environ, so tests stay hermetic.
 - ANTHROPIC_API_KEY (required when anthropic is listed): the gateway's own
   upstream key. Clients never see it.

@@ -58,10 +58,11 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 **Security**
 - Per-client gateway keys, accepted as `x-api-key` or `Authorization: Bearer`. Keys are compared as SHA-256 digests in constant time.
 - The upstream provider key never leaves the gateway. Client credential headers are stripped before the request is forwarded.
+- The gateway never follows an upstream redirect. On a redirect to another host Go's HTTP client keeps every header except `Authorization`, so following one would hand the gateway's `x-api-key` to whatever host the upstream named. A redirect is answered with `502` and logged as `upstream redirect refused`.
 - On the OpenAI route no client header is forwarded at all. `OpenAI-Organization` and `OpenAI-Project` choose who is billed, so a client never gets to set them; `OpenAI-Beta` and the SDKs' `X-Stainless-*` headers are dropped too.
 - Upstream response headers pass through an allowlist. Organization and project IDs, cookies and CDN headers are dropped.
 - Per-key rate limiting in Redis: a token bucket per client key, answered with `429` and `Retry-After` before the body is read. Redis stores only a SHA-256 digest of each key.
-- Early rejections (401, 413, 415, 429, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
+- Early rejections (400 for an unclean path, 401, 413, 415, 429, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
 - `anthropic-version` must be a real `YYYY-MM-DD` date. `anthropic-beta` values with control characters are rejected.
 - The upstream base URL must be `https` (plain `http` is allowed only for loopback test servers). The gateway refuses to start otherwise.
 - Binds to `127.0.0.1` by default. Exposing it on a network is an explicit choice.
@@ -252,7 +253,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: the built-in `anthropic` (`POST /v1/messages`) and `openai` (`POST /v1/chat/completions`), and any [named upstreams](#named-upstreams). A name that breaks the naming rule, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its name, protocol and base URL. |
+| `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: the built-in `anthropic` (`POST /v1/messages`) and `openai` (`POST /v1/chat/completions`), and any [named upstreams](#named-upstreams). A name that breaks the naming rule, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its name, protocol and base URL, as `scheme://host[:port]` only, since a path may hold a token. |
 | `ANTHROPIC_API_KEY` | When `anthropic` is listed | | The gateway's own key for the Anthropic API. Clients never see it. |
 | `OPENAI_API_KEY` | When `openai` is listed | | The gateway's own key for the OpenAI-compatible API. Clients never see it. |
 | `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys, shared by every route. The gateway refuses to start without at least one. |
@@ -317,9 +318,9 @@ SENTINEL_UPSTREAM_OLLAMA_API_KEY=ollama
 
 Rules:
 
-- A name is a lowercase letter followed by up to 31 lowercase letters or digits: `^[a-z][a-z0-9]{0,31}$`. No hyphens or underscores, so each variable maps back to one name. `v1` is reserved.
-- `anthropic` and `openai` keep their own variables (`ANTHROPIC_*`, `OPENAI_*`). Setting any `SENTINEL_UPSTREAM_ANTHROPIC_*` or `SENTINEL_UPSTREAM_OPENAI_*` variable stops startup.
-- Only listed upstreams are used. `SENTINEL_UPSTREAM_<NAME>_*` variables for a name not in the list are neither validated nor used, and the gateway logs one `WARN` per such name, without the values.
+- A name is a lowercase letter followed by up to 31 lowercase letters or digits: `^[a-z][a-z0-9]{0,31}$`. No hyphens or underscores, so each variable maps back to one name. `v1` and `ca` are reserved (`ca` would collide with `SENTINEL_UPSTREAM_CA_FILE`).
+- `anthropic` and `openai` keep their own variables (`ANTHROPIC_*`, `OPENAI_*`). Setting any `SENTINEL_UPSTREAM_ANTHROPIC_*` or `SENTINEL_UPSTREAM_OPENAI_*` variable stops startup. Variable names are matched ignoring case, as Windows does.
+- Only listed upstreams are used. `SENTINEL_UPSTREAM_<NAME>_*` variables for a name not in the list are neither validated nor used, and the gateway logs one `WARN` per such name, without the values. A listed upstream's variables with any other suffix, such as `SENTINEL_UPSTREAM_XAI_APIKEY`, get one `WARN` per upstream, too.
 - Every upstream shares the client keys, the rate limit and the concurrency cap. `SENTINEL_UPSTREAM_CA_FILE` applies to all of them.
 
 The design is in [ADR 0003](docs/adr/0003-named-upstreams.md).
@@ -354,12 +355,13 @@ On `/v1/chat/completions` it is the OpenAI API's shape:
 | Status | Anthropic `error.type` | OpenAI `error.type` / `error.code` | When |
 | --- | --- | --- | --- |
 | 400 | `invalid_request_error` | `invalid_request_error` / `null` | Body can't be read, or a provider header is invalid |
+| 400 | plain text | plain text | The path isn't already clean: a double slash, a `.` or `..` segment, or a trailing slash (`//v1/messages`, `/xai/./v1/chat/completions`). Answered before routing, with `Connection: close`, never with a redirect to the cleaned path |
 | 401 | `authentication_error` | `invalid_request_error` / `invalid_api_key` | Missing or unknown gateway key |
 | 408 | `timeout_error` | `timeout_error` / `null` | Request body not received in time |
 | 413 | `request_too_large` | `invalid_request_error` / `request_too_large` | Body larger than the limit, declared or actual |
 | 415 | `invalid_request_error` | `invalid_request_error` / `null` | Request has a `Content-Encoding` |
 | 429 | `rate_limit_error` | `requests` / `rate_limit_exceeded` | The client key is over its rate limit. `Retry-After` says when a token is back |
-| 502 | `api_error` | `server_error` / `null` | Provider unreachable, or it rejected the gateway's own credentials |
+| 502 | `api_error` | `server_error` / `null` | Provider unreachable, it rejected the gateway's own credentials, or it answered with a redirect |
 | 503 | `overloaded_error` | `server_error` / `overloaded` | Gateway at capacity. Includes `Retry-After` |
 | 503 | `api_error` | `server_error` / `null` | Redis unavailable with `SENTINEL_RATE_LIMIT_FAIL_MODE=closed`. Includes `Retry-After` |
 | 504 | `timeout_error` | `timeout_error` / `null` | Provider didn't respond in time |
@@ -399,7 +401,7 @@ Logs are JSON on stdout, one line per request:
 - `upstream_request_id` is the provider's ID for the same request, for support cases with the provider.
 - `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; see [Performance](#performance) for load-test numbers.
 - With rate limiting on, `rate_limit_us` is how long the Redis call took, and `rate_limit_remaining` how many requests the key has left right now. `rate_limit_remaining` is missing when Redis couldn't answer.
-- Failed requests add `error` and `phase` (`rate_limit`, `read_body`, `admit`, `upstream` or `stream`).
+- Failed requests add `error` and `phase` (`rate_limit`, `read_body`, `admit`, `upstream` or `stream`). An upstream `error` names the cause without the request URL, such as `openai: forward: Post: dial tcp 10.0.0.5:443: connect: connection refused`, since a base URL's path may hold a token.
 
 ## Performance
 
@@ -497,14 +499,15 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - `SENTINEL_UPSTREAMS` parsing, a route existing only for an enabled upstream, and one shared concurrency cap: a request held on `/v1/messages` makes `/v1/chat/completions` answer `503`
 - named upstreams: the naming rule, missing or invalid protocol, base URL and key, `SENTINEL_UPSTREAM_OPENAI_*` rejected, unlisted upstreams warned about and not used, and no key or URL secret in any error or log line; two upstreams of one protocol, each on its own test server with its own key, where each prefix reaches only its server and neither key reaches the other; unprefixed routes only for the built-ins, `404` with `Connection: close` for an unknown prefix, and one concurrency cap across prefixes
 - the `upstream` and `provider` fields of the request log
-- the bench guard's matching: base URLs that only look like the mock's (`https://mockupstream:9090.example.com`, another port, userinfo) are refused
+- the bench guard: anything but exactly `https://mockupstream:9090` (a path, another port, a look-alike host) is refused, as are duplicate or differently-cased `base_url` keys and unreadable lines
+- refused upstream redirects (both protocols: the redirect target never sees a request) and unclean paths answered `400` over a raw connection instead of hanging
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
 
 ## Known limitations
 
 - Only `POST /v1/messages` is proxied on the Anthropic side. Other Anthropic endpoints return `404`.
 - Only `POST /v1/chat/completions` is proxied on the OpenAI side. The Responses API, embeddings, models and other endpoints return `404`.
-- One CA file for all upstreams: `SENTINEL_UPSTREAM_CA_FILE` is trusted for every enabled upstream, so a private CA added for a local server is trusted for the public providers too. The warning about this covers only the built-ins on their default hosts.
+- One CA file for all upstreams: `SENTINEL_UPSTREAM_CA_FILE` is trusted for every enabled upstream, so a private CA added for a local server is trusted for the public providers too. The gateway warns for every enabled upstream, built-in or custom, on a public default host (`api.anthropic.com`, `api.openai.com`).
 - Upstreams are picked by path prefix only. There is no routing by model and no fallback between upstreams, and the rate limit is per client key, not per upstream.
 - The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
 - Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.

@@ -29,9 +29,11 @@ A name matches `^[a-z][a-z0-9]{0,31}$`. A custom upstream `NAME` is configured b
 - `SENTINEL_UPSTREAM_<NAME>_BASE_URL`
 - `SENTINEL_UPSTREAM_<NAME>_API_KEY`
 
-There are no hyphens or underscores in names, so a variable maps back to exactly one name and the scan for unlisted upstreams is unambiguous (`SENTINEL_UPSTREAM_CA_FILE` is not an upstream's, since `FILE` is not one of the three fields). `v1` is rejected, since `/v1/v1/...` routes would be confusing next to the unprefixed `/v1/...` ones.
+There are no hyphens or underscores in names, so a variable maps back to exactly one name and the scan for unlisted upstreams is unambiguous. `v1` is rejected, since `/v1/v1/...` routes would be confusing next to the unprefixed `/v1/...` ones. `ca` is rejected, since its variables would share a prefix with `SENTINEL_UPSTREAM_CA_FILE`. The scan matches variable names ignoring case, as Windows does, so a variable `getenv` would find is never missed by the checks. A listed upstream's variable with another suffix, such as `_APIKEY`, gets a `WARN` naming it.
 
-The built-in names `anthropic` and `openai` keep `ANTHROPIC_*` and `OPENAI_*`, so existing setups don't change. Setting any `SENTINEL_UPSTREAM_ANTHROPIC_*` or `SENTINEL_UPSTREAM_OPENAI_*` variable stops startup with an error naming the variables the built-in uses. Two ways to configure one upstream would make it unclear which one won.
+The built-in names `anthropic` and `openai` keep `ANTHROPIC_*` and `OPENAI_*`, so existing setups don't change. Setting any `SENTINEL_UPSTREAM_ANTHROPIC_*` or `SENTINEL_UPSTREAM_OPENAI_*` variable, in any case, stops startup with an error naming the variables the built-in uses. Two ways to configure one upstream would make it unclear which one won.
+
+The startup log names each upstream's base URL only as `scheme://host[:port]`. The URL rule rejects credentials and queries but not a path, and some gateways put a token in the path. For the same reason a failed upstream call is logged without the request URL that Go's HTTP client puts in its error.
 
 ### No defaults for custom upstreams
 
@@ -45,25 +47,33 @@ The alternative was routing by the request's `model` field. It needs no client c
 
 All routes share the client keys, the rate limiter and one `proxy.Admission`, so the memory bound in ADR 0001 holds however many upstreams there are.
 
+### Clean paths only
+
+A request path that isn't already clean (a double slash, a `.` or `..` segment, a trailing slash) gets a plain-text `400` with `Connection: close` before routing. `ServeMux` would answer it with a redirect to the cleaned path, which counts as matched, so the unread body would be drained with no deadline before auth; every prefix adds such paths.
+
+### Upstream redirects are refused
+
+The upstream HTTP client never follows a redirect; the client gets a `502` and the log says `upstream redirect refused`. On a redirect to another host Go drops `Authorization` but keeps `X-Api-Key`, so following one would hand the gateway's key to any host a less-trusted upstream names, including another upstream's.
+
 ### Environment variables, not a config file, for now
 
 Upstreams are configured like everything else, from the environment. A config file would be one more format to parse and validate and one more place for keys to end up on disk. The long-term home for upstreams is Postgres, per tenant, with keys in a secret store; a file format designed now would be replaced then.
 
 ### The bench guard checks resolved configuration
 
-`make bench-gateway` used to check that `gateway-bench` had the two base URL variables set to the mock. A check of variables has to know every upstream in advance, and a built-in upstream added to `SENTINEL_UPSTREAMS` without its base URL silently gets its public default, which such a check doesn't see. Now the guard waits for `gateway-bench` to log `listening` and reads its `upstream enabled` lines, which carry the base URL the gateway will actually call. It refuses to run k6 unless there is at least one, and every one is `https://mockupstream:9090` or a path under it, naming the upstream at fault otherwise. The matching is in `cmd/benchguard`, which has unit tests.
+`make bench-gateway` used to check that `gateway-bench` had the two base URL variables set to the mock. A check of variables has to know every upstream in advance, and a built-in upstream added to `SENTINEL_UPSTREAMS` without its base URL silently gets its public default, which such a check doesn't see. Now the guard waits for `gateway-bench` to log `listening` and reads its `upstream enabled` lines, which carry the base URL the gateway will actually call. It refuses to run k6 unless there is at least one, and each has exactly one `base_url`, equal to `https://mockupstream:9090`, naming the upstream at fault otherwise. It fails closed: a line that mentions `upstream enabled` but can't be read, or has `base_url` more than once in any case, refuses too. The gateway logs `listening` only after the port is bound. The matching is in `cmd/benchguard`, which has unit tests.
 
 ## Consequences
 
 - Any OpenAI- or Anthropic-compatible provider is a few variables, with no code change.
 - Several upstreams of one protocol can run side by side, each with its own key; a key reaches only its own upstream.
 - Clients of a custom upstream change their base URL to include the prefix. Clients of the built-ins don't change.
-- The startup log has one `upstream enabled` line per upstream with its protocol and base URL, and the request log names the upstream.
+- The startup log has one `upstream enabled` line per upstream with its protocol and `scheme://host[:port]`, and the request log names the upstream.
 - `loadConfig` takes the environment list as well as `getenv`, so tests stay hermetic.
 
 ## Deferred
 
-- **Per-upstream CA.** `SENTINEL_UPSTREAM_CA_FILE` still applies to every enabled upstream. A private CA for a local vLLM is then also trusted for the public providers. The default-host warning covers only the built-ins.
+- **Per-upstream CA.** `SENTINEL_UPSTREAM_CA_FILE` still applies to every enabled upstream. A private CA for a local vLLM is then also trusted for the public providers. The gateway warns for any upstream, built-in or custom, on `api.anthropic.com` or `api.openai.com`, but not for other public hosts.
 - **Per-upstream rate limits.** The limit is per client key and shared across upstreams.
 - **Routing by model**, and fallback between upstreams.
 - **Azure OpenAI, Amazon Bedrock and Google Vertex AI.** They differ in authentication (Azure `api-key` headers and deployments, SigV4, Google OAuth), not just in base URL, so they need providers of their own.

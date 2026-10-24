@@ -49,8 +49,9 @@ bench: ## Load test mockupstream directly with k6 (after make up); BENCH_API, DU
 # real upstream key, never the gateway from make up-real. Before k6 starts,
 # the check waits up to about 15s for gateway-bench to log "listening", then
 # cmd/benchguard reads its startup log and refuses to run unless it enabled
-# at least one upstream and every "upstream enabled" line has a base_url of
-# $(MOCK_URL) or under it, naming the upstream at fault otherwise.
+# at least one upstream and every "upstream enabled" line has exactly one
+# base_url, equal to $(MOCK_URL) (the gateway logs only scheme://host:port),
+# naming the upstream at fault otherwise. A line it can't read refuses too.
 #
 # It checks the configuration the gateway resolved, not the variables it was
 # given. A check of env vars has to know every upstream in advance, and an
@@ -58,7 +59,10 @@ bench: ## Load test mockupstream directly with k6 (after make up); BENCH_API, DU
 # openai to SENTINEL_UPSTREAMS without OPENAI_BASE_URL silently gets the
 # public default, api.openai.com. The log line is what the gateway will
 # actually call, whatever the env says, and it covers custom upstreams too.
-bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; BENCH_API, BENCH_PREFIX, DURATION_S and STREAM pass through
+#
+# BENCH_UPSTREAM is a bare name (mockcompat), not a path: Git Bash rewrites
+# an argument starting with "/" into a Windows path.
+bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; BENCH_API, BENCH_UPSTREAM, DURATION_S and STREAM pass through
 	$(COMPOSE_BENCH) up -d --build --force-recreate --always-recreate-deps gateway-bench
 	@id="$$($(COMPOSE_BENCH) ps -q gateway-bench)"; \
 	if [ -z "$$id" ]; then echo "bench-gateway: gateway-bench is not running" >&2; exit 1; fi; \

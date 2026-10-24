@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,6 +311,25 @@ func TestLogCAs(t *testing.T) {
 		{
 			"CA, openai-compatible elsewhere", ca,
 			map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_BASE_URL": "https://localhost:9090/v1"}, nil,
+		},
+		{
+			"CA, custom upstreams on public hosts", ca,
+			map[string]string{
+				"SENTINEL_UPSTREAMS":                "oai2,claude,xai",
+				"SENTINEL_UPSTREAM_OAI2_PROTOCOL":   "openai",
+				"SENTINEL_UPSTREAM_OAI2_BASE_URL":   "https://API.OpenAI.com./v1",
+				"SENTINEL_UPSTREAM_OAI2_API_KEY":    "sk",
+				"SENTINEL_UPSTREAM_CLAUDE_PROTOCOL": "anthropic",
+				"SENTINEL_UPSTREAM_CLAUDE_BASE_URL": "https://api.anthropic.com",
+				"SENTINEL_UPSTREAM_CLAUDE_API_KEY":  "sk",
+				"SENTINEL_UPSTREAM_XAI_PROTOCOL":    "openai",
+				"SENTINEL_UPSTREAM_XAI_BASE_URL":    "https://api.x.ai/v1",
+				"SENTINEL_UPSTREAM_XAI_API_KEY":     "sk",
+			},
+			[]string{
+				"default OpenAI API; anyone holding one of their keys could impersonate it and read SENTINEL_UPSTREAM_OAI2_API_KEY",
+				"default Anthropic API; anyone holding one of their keys could impersonate it and read SENTINEL_UPSTREAM_CLAUDE_API_KEY",
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -622,7 +644,7 @@ func TestLogUpstreams(t *testing.T) {
 		t.Fatalf("log = %q, want 2 lines", lines)
 	}
 	for i, want := range []string{
-		`level=INFO msg="upstream enabled" upstream=openai protocol=openai base_url=http://127.0.0.1:11434/v1`,
+		"level=INFO msg=\"upstream enabled\" upstream=openai protocol=openai base_url=http://127.0.0.1:11434\n",
 		`level=WARN msg="ANTHROPIC_API_KEY is set but anthropic is not in SENTINEL_UPSTREAMS; ignoring"`,
 	} {
 		if !strings.Contains(lines[i], want) {
@@ -907,7 +929,7 @@ func TestLoadConfig_UnlistedCustomUpstreams(t *testing.T) {
 		"SENTINEL_UPSTREAM_OLLAMA_PROTOCOL": "openai",
 		"SENTINEL_UPSTREAM_EMPTY_API_KEY":   "",       // empty counts as unset
 		"SENTINEL_UPSTREAM_OTHER_SETTING":   "secret", // not a field
-		"SENTINEL_UPSTREAM_lower_API_KEY":   "secret", // NAME must be upper-cased
+		"sentinel_upstream_lower_api_key":   "secret", // names are compared ignoring case
 		"SENTINEL_UPSTREAM_X-AI_API_KEY":    "secret", // not a valid name
 	}
 	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-secret"))
@@ -918,8 +940,8 @@ func TestLoadConfig_UnlistedCustomUpstreams(t *testing.T) {
 	if got := upstreamNames(cfg); !slices.Equal(got, []string{"anthropic", "xai"}) {
 		t.Errorf("upstreams = %q", got)
 	}
-	if !slices.Equal(cfg.ignoredCustom, []string{"groq", "ollama"}) {
-		t.Errorf("ignoredCustom = %q, want [groq ollama]", cfg.ignoredCustom)
+	if !slices.Equal(cfg.ignoredCustom, []string{"groq", "lower", "ollama"}) {
+		t.Errorf("ignoredCustom = %q, want [groq lower ollama]", cfg.ignoredCustom)
 	}
 
 	var buf strings.Builder
@@ -932,6 +954,7 @@ func TestLoadConfig_UnlistedCustomUpstreams(t *testing.T) {
 	}
 	wantWarns := []string{
 		`msg="SENTINEL_UPSTREAM_GROQ_* is set but groq is not in SENTINEL_UPSTREAMS; ignoring"`,
+		`msg="SENTINEL_UPSTREAM_LOWER_* is set but lower is not in SENTINEL_UPSTREAMS; ignoring"`,
 		`msg="SENTINEL_UPSTREAM_OLLAMA_* is set but ollama is not in SENTINEL_UPSTREAMS; ignoring"`,
 	}
 	if len(warns) != len(wantWarns) {
@@ -971,20 +994,29 @@ func TestLoadConfig_CustomUpstreamSecretsNotEchoed(t *testing.T) {
 		}
 	}
 
-	// A valid custom upstream logs its base URL, never its key.
-	vars := map[string]string{"SENTINEL_UPSTREAMS": "xai", "SENTINEL_API_KEYS": "k1"}
-	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-secret"))
+	// A valid custom upstream logs only its base URL's scheme, host and
+	// port, never its key or its path, which may hold a token. The CA
+	// warning does the same.
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "gw", "SENTINEL_API_KEYS": "k1"}
+	maps.Copy(vars, customVars("gw", "openai", "https://API.openai.com:8443/k/sk-path-secret/v1", "gw-secret"))
 	cfg, err := loadConfig(env(vars))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf strings.Builder
-	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
-	if want := `msg="upstream enabled" upstream=xai protocol=openai base_url=https://api.x.ai/v1`; !strings.Contains(buf.String(), want) {
-		t.Errorf("log = %q, want it to contain %q", buf.String(), want)
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	logUpstreams(logger, cfg)
+	logCAs(logger, "ca.pem", nil, cfg.upstreams)
+	for _, want := range []string{
+		"msg=\"upstream enabled\" upstream=gw protocol=openai base_url=https://API.openai.com:8443\n",
+		"upstream=gw base_url=https://API.openai.com:8443\n",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log = %q, want it to contain %q", buf.String(), want)
+		}
 	}
-	if strings.Contains(buf.String(), "secret") {
-		t.Errorf("log contains the key:\n%s", buf.String())
+	if strings.Contains(buf.String(), "secret") || strings.Contains(buf.String(), "/v1") {
+		t.Errorf("log contains the key or the path:\n%s", buf.String())
 	}
 }
 
@@ -1201,6 +1233,273 @@ func TestNewMux_SharedAdmissionAcrossPrefixes(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"overloaded"`) {
 			t.Errorf("POST %s: status %d, body %q; want 503 overloaded", path, resp.StatusCode, body)
+		}
+	}
+}
+
+// TestNewMux_RefusesUpstreamRedirects has an upstream of each protocol
+// answer 307 to a second server. The gateway must not follow it: the second
+// server never sees a request, so neither key reaches it, and the client
+// gets a 502 whose log line names the cause.
+func TestNewMux_RefusesUpstreamRedirects(t *testing.T) {
+	var hits sync.Map // header name -> value, as the second server saw them
+	var other atomic.Int32
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		other.Add(1)
+		hits.Store("X-Api-Key", r.Header.Get("X-Api-Key"))
+		hits.Store("Authorization", r.Header.Get("Authorization"))
+	}))
+	defer elsewhere.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "ant,oai", "SENTINEL_API_KEYS": "k1"}
+	maps.Copy(vars, customVars("ant", "anthropic", redirector.URL, "ant-upstream-secret"))
+	maps.Copy(vars, customVars("oai", "openai", redirector.URL+"/v1", "oai-upstream-secret"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}))
+	defer srv.Close()
+
+	for _, path := range []string{"/ant/v1/messages", "/oai/v1/chat/completions"} {
+		logs.Reset()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer k1")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("POST %s: status %d, want 502", path, resp.StatusCode)
+		}
+		if !strings.Contains(logs.String(), "upstream redirect refused") {
+			t.Errorf("POST %s: log %q does not name the refused redirect", path, logs.String())
+		}
+	}
+	if n := other.Load(); n != 0 {
+		var seen []string
+		hits.Range(func(k, v any) bool { seen = append(seen, fmt.Sprintf("%v=%v", k, v)); return true })
+		t.Errorf("the redirect target got %d requests, last with %q", n, seen)
+	}
+}
+
+// TestGateway_UncleanPathsDoNotHang sends each path over a raw connection
+// with headers declaring a body it never finishes. Every one must get a
+// prompt answer and a closed connection: a redirect to the cleaned path
+// would leave net/http draining the body with no deadline.
+func TestGateway_UncleanPathsDoNotHang(t *testing.T) {
+	cfg, err := loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})))
+	defer srv.Close()
+
+	tests := []struct {
+		path string
+		want int
+	}{
+		{"/nope", http.StatusNotFound},
+		{"//anthropic/v1/messages", http.StatusBadRequest},
+		{"/anthropic/./v1/messages", http.StatusBadRequest},
+		{"/anthropic//v1/messages", http.StatusBadRequest},
+		{"/x/../anthropic/v1/messages", http.StatusBadRequest},
+		{"/anthropic/v1/messages/", http.StatusBadRequest},
+		{"//v1/messages", http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(proxy.RejectDrainTimeout + 2*time.Second))
+			fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: gw\r\nX-Api-Key: k1\r\nContent-Length: 100000\r\n\r\n{\"m", tt.path)
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("no response while the body was incomplete: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != tt.want || resp.Header.Get("Location") != "" {
+				t.Errorf("status %d, Location %q, body %q; want %d and no redirect", resp.StatusCode, resp.Header.Get("Location"), body, tt.want)
+			}
+			if tt.want == http.StatusBadRequest && !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+				t.Errorf("Content-Type = %q, want text/plain", resp.Header.Get("Content-Type"))
+			}
+			// EOF or a reset both mean the server let go; only a timeout
+			// means it is still holding the connection.
+			if _, err := br.ReadByte(); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("connection not closed after the response: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_BuiltinUpstreamVarsIgnoreCase checks the conflict check
+// on names in any case: Windows getenv finds them that way, so they must
+// not slip past it.
+func TestLoadConfig_BuiltinUpstreamVarsIgnoreCase(t *testing.T) {
+	for _, v := range []string{"sentinel_upstream_openai_base_url", "Sentinel_Upstream_Anthropic_Api_Key"} {
+		_, err := loadConfig(env(map[string]string{
+			"ANTHROPIC_API_KEY": "sk",
+			"SENTINEL_API_KEYS": "k1",
+			v:                   "sk-secret-value",
+		}))
+		if err == nil || !strings.HasPrefix(err.Error(), v+": ") || strings.Contains(err.Error(), "secret") {
+			t.Errorf("%s: err = %v, want an error naming %s without its value", v, err, v)
+		}
+	}
+}
+
+func TestLoadConfig_UnknownCustomUpstreamVars(t *testing.T) {
+	vars := map[string]string{
+		"SENTINEL_UPSTREAMS":              "xai,groq",
+		"SENTINEL_API_KEYS":               "k1",
+		"SENTINEL_UPSTREAM_XAI_APIKEY":    "xai-secret-typo",
+		"SENTINEL_UPSTREAM_XAI_BASEURL":   "https://secret.example/v1",
+		"SENTINEL_UPSTREAM_GROQ_TIMEOUT":  "30s",
+		"SENTINEL_UPSTREAM_OTHER_APIKEY":  "secret", // unlisted, and not a field
+		"SENTINEL_UPSTREAM_GROQ_PROTOCOL": "openai",
+	}
+	maps.Copy(vars, customVars("xai", "openai", "https://api.x.ai/v1", "xai-key"))
+	maps.Copy(vars, customVars("groq", "openai", "https://api.groq.com/openai/v1", "gsk"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	var buf strings.Builder
+	logUpstreams(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	var warns []string
+	for line := range strings.Lines(buf.String()) {
+		if strings.Contains(line, "level=WARN") {
+			warns = append(warns, line)
+		}
+	}
+	// One warning per upstream, in SENTINEL_UPSTREAMS order.
+	wantWarns := []string{
+		`msg="SENTINEL_UPSTREAM_XAI_APIKEY, SENTINEL_UPSTREAM_XAI_BASEURL set for upstream xai, which reads only SENTINEL_UPSTREAM_XAI_PROTOCOL, _BASE_URL and _API_KEY; ignoring"`,
+		`msg="SENTINEL_UPSTREAM_GROQ_TIMEOUT set for upstream groq, which reads only SENTINEL_UPSTREAM_GROQ_PROTOCOL, _BASE_URL and _API_KEY; ignoring"`,
+	}
+	if len(warns) != len(wantWarns) {
+		t.Fatalf("warnings = %q, want %d", warns, len(wantWarns))
+	}
+	for i, want := range wantWarns {
+		if !strings.Contains(warns[i], want) {
+			t.Errorf("warning %d = %q, want %q", i, warns[i], want)
+		}
+	}
+	if strings.Contains(buf.String(), "secret") || strings.Contains(buf.String(), "30s") {
+		t.Errorf("log repeats a value:\n%s", buf.String())
+	}
+}
+
+func TestLoadConfig_ReservedNames(t *testing.T) {
+	for name, want := range map[string]string{
+		"v1": `SENTINEL_UPSTREAMS: upstream name "v1" is reserved: its routes would start /v1/v1/`,
+		"ca": `SENTINEL_UPSTREAMS: upstream name "ca" is reserved: its variables would share a prefix with SENTINEL_UPSTREAM_CA_FILE`,
+	} {
+		vars := map[string]string{"SENTINEL_UPSTREAMS": name, "SENTINEL_API_KEYS": "k1"}
+		maps.Copy(vars, customVars(name, "openai", "https://example.com/v1", "sk"))
+		if _, err := loadConfig(env(vars)); err == nil || err.Error() != want {
+			t.Errorf("%s: err = %v, want %q", name, err, want)
+		}
+	}
+}
+
+// TestListen checks that "listening" is logged only once the port is bound.
+func TestListen(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	ln, err := listen(logger, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if want := "msg=listening addr=" + ln.Addr().String() + "\n"; !strings.HasSuffix(buf.String(), want) {
+		t.Errorf("log = %q, want it to end with %q", buf.String(), want)
+	}
+
+	buf.Reset()
+	if ln2, err := listen(logger, ln.Addr().String()); err == nil {
+		ln2.Close()
+		t.Fatal("second listen on a bound port succeeded")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("a failed bind logged %q", buf.String())
+	}
+}
+
+// TestNewMux_ForwardErrorsOmitURLs checks that a failed upstream call logs
+// its cause without the request URL. A base URL's path may hold a token,
+// and a refused redirect's target is whatever the upstream sent.
+func TestNewMux_ForwardErrorsOmitURLs(t *testing.T) {
+	elsewhere := httptest.NewServer(http.NotFoundHandler()) // never reached
+	defer elsewhere.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		http.Redirect(w, r, elsewhere.URL+"/tok/sk-target-secret", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	vars := map[string]string{"SENTINEL_UPSTREAMS": "deada,deado,redira,rediro", "SENTINEL_API_KEYS": "k1"}
+	// Nothing listens on port 1.
+	maps.Copy(vars, customVars("deada", "anthropic", "http://127.0.0.1:1/k/sk-path-secret", "sk"))
+	maps.Copy(vars, customVars("deado", "openai", "http://127.0.0.1:1/k/sk-path-secret/v1", "sk"))
+	maps.Copy(vars, customVars("redira", "anthropic", redirector.URL+"/k/sk-path-secret", "sk"))
+	maps.Copy(vars, customVars("rediro", "openai", redirector.URL+"/k/sk-path-secret/v1", "sk"))
+	cfg, err := loadConfig(env(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}))
+	defer srv.Close()
+
+	tests := []struct{ path, wantErr string }{
+		{"/deada/v1/messages", "anthropic: forward: Post: dial tcp 127.0.0.1:1: "},
+		{"/deado/v1/chat/completions", "openai: forward: Post: dial tcp 127.0.0.1:1: "},
+		{"/redira/v1/messages", "anthropic: forward: Post: upstream redirect refused"},
+		{"/rediro/v1/chat/completions", "openai: forward: Post: upstream redirect refused"},
+	}
+	for _, tt := range tests {
+		logs.Reset()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+tt.path, strings.NewReader(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer k1")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("POST %s: status %d, want 502", tt.path, resp.StatusCode)
+		}
+		var line map[string]any
+		if err := json.Unmarshal(logs.Bytes(), &line); err != nil {
+			t.Fatalf("POST %s: parse log %q: %v", tt.path, logs.String(), err)
+		}
+		if msg, _ := line["error"].(string); !strings.HasPrefix(msg, tt.wantErr) {
+			t.Errorf("POST %s: logged error %q, want it to start %q", tt.path, msg, tt.wantErr)
+		}
+		if strings.Contains(logs.String(), "secret") || strings.Contains(logs.String(), "/k/") {
+			t.Errorf("POST %s: log repeats a URL:\n%s", tt.path, logs.String())
 		}
 	}
 }
