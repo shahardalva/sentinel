@@ -6,8 +6,9 @@ tool policies, and writes an audit log.
 
 ## Stack
 - Gateway: Go, net/http, log/slog
-- Upstreams: Anthropic and OpenAI-compatible (internal/provider/openai),
-  behind a Provider interface
+- Upstreams: two protocols, Anthropic and OpenAI-compatible
+  (internal/provider/openai), behind a Provider interface; any number of
+  named upstreams per protocol (docs/adr/0003-named-upstreams.md)
 - Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
   Python detector service over gRPC
 
@@ -18,6 +19,8 @@ tool policies, and writes an audit log.
   is test-only.
 - Every change comes with tests.
 - Never commit secrets. API keys come only from environment variables.
+- Claude Code never runs docker, docker compose, or make targets that start
+  containers, and never reads .env. Ask the user to run them.
 
 ## Commands
 - go run ./cmd/gateway (needs the env vars below), or make run
@@ -26,28 +29,55 @@ tool policies, and writes an audit log.
   SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis for rate limiting. The gateway serves both protocols there, both
-  upstreams on the mock. Runs make certs first, which rewrites ./certs when a
+  redis for rate limiting. The gateway serves both protocols there, with
+  anthropic, openai and the named upstream mockcompat (openai) all on the
+  mock. Runs make certs first, which rewrites ./certs when a
   file is missing or server.pem expires within 7 days, and recreates the
   containers. Gateway on 127.0.0.1:8081 only. make up-real: gateway
   against the real APIs in SENTINEL_UPSTREAMS from .env (default
   anthropic). make down, make logs.
 - make bench: k6 in a container against the mock directly (after make up).
   make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
-  the mock for both upstreams with dummy upstream keys; it refuses to run
-  unless that container has both ANTHROPIC_BASE_URL=https://mockupstream:9090
-  and OPENAI_BASE_URL=https://mockupstream:9090/v1. BENCH_API ("anthropic" or
-  "openai"), DURATION_S and STREAM pass through.
+  the mock for all its upstreams (anthropic, openai, mockcompat) with dummy
+  upstream keys. It checks resolved config, not env vars: it waits (about
+  15s) for gateway-bench's "listening" line, then cmd/benchguard refuses
+  to run unless there is at least one "upstream enabled" line and each has
+  exactly one base_url (logged as scheme://host:port), equal to
+  https://mockupstream:9090; a line it can't read refuses too. BENCH_API
+  ("anthropic" or "openai"), BENCH_UPSTREAM (a bare name such as
+  mockcompat, never a path: Git Bash rewrites a leading "/"), DURATION_S
+  and STREAM pass through.
 - Compose without make: docker compose up (real), or add
   -f docker-compose.yml -f docker-compose.mock.yml --profile mock (mock).
 
 ## Configuration (environment variables)
-- SENTINEL_UPSTREAMS (optional): comma-separated upstreams to serve, from
-  anthropic (POST /v1/messages) and openai (POST /v1/chat/completions);
-  default anthropic. An unknown name, a duplicate, or a list with no names
-  stops startup. A route exists only for an enabled upstream; all routes
-  share the client keys, the rate limiter and one proxy.Admission. One INFO
-  line per enabled upstream logs its name and base URL, never the key.
+- SENTINEL_UPSTREAMS (optional): comma-separated upstreams to serve: the
+  built-ins anthropic (POST /v1/messages) and openai
+  (POST /v1/chat/completions), and named upstreams; default anthropic.
+  Names match ^[a-z][a-z0-9]{0,31}$; "v1" and "ca" are reserved. A bad name, a
+  duplicate, or a list with no names stops startup. Every enabled upstream
+  gets POST /<name>/v1/messages or /<name>/v1/chat/completions by protocol;
+  only the built-ins also get the unprefixed route. A route exists only for
+  an enabled upstream; all routes share the client keys, the rate limiter
+  and one proxy.Admission. One INFO line per enabled upstream logs its
+  name, protocol and base URL as scheme://host[:port] only (a path may
+  hold a token), never the key. The request log has
+  "upstream" (the name, via proxy.Options.Upstream) and "provider" (the
+  protocol's Name()). A request path that isn't already clean (//, a dot
+  segment, a trailing slash) gets a plain-text 400 with Connection: close
+  before the mux, never a redirect. Upstream clients never follow a
+  redirect (upstream.ErrRedirect): the client gets a 502. Forward errors
+  go through upstream.StripURL, so the logged error never holds a URL.
+- SENTINEL_UPSTREAM_<NAME>_PROTOCOL, _BASE_URL, _API_KEY (all required for
+  a listed named upstream, NAME upper-cased): "anthropic" or "openai", the
+  base URL (no default; same https rule and error rules as the built-ins),
+  and the gateway's key for it. SENTINEL_UPSTREAM_* names are matched
+  ignoring case, as Windows does. Any SENTINEL_UPSTREAM_ANTHROPIC_* or
+  SENTINEL_UPSTREAM_OPENAI_* variable stops startup. Variables of an
+  unlisted NAME are not validated or used; one WARN per name, no values.
+  A listed NAME's variables with another suffix (_APIKEY) get one WARN per
+  upstream, naming them without values.
+  loadConfig takes getenv and environ, so tests stay hermetic.
 - ANTHROPIC_API_KEY (required when anthropic is listed): the gateway's own
   upstream key. Clients never see it.
 - OPENAI_API_KEY (required when openai is listed): the gateway's own key for
@@ -99,18 +129,18 @@ tool policies, and writes an audit log.
   during the check is logged as 499, not as a Redis failure.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY, OPENAI_API_KEY,
-OPENAI_BASE_URL and SENTINEL_API_KEYS from .env (copy .env.example, which
-leaves the keys empty; .env is gitignored), and SENTINEL_UPSTREAMS too,
-defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
+OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_* and SENTINEL_API_KEYS from .env
+(copy .env.example, which leaves the keys empty; .env is gitignored), and
+SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
 port on 127.0.0.1 only. gateway-bench uses Redis database 1 with
 SENTINEL_RATE_LIMIT_RPM=1000000, so the bench includes the Redis call but
 never gets a 429. The mock override and gateway-bench set
-SENTINEL_UPSTREAMS=anthropic,openai, ANTHROPIC_BASE_URL=
+SENTINEL_UPSTREAMS=anthropic,openai,mockcompat, ANTHROPIC_BASE_URL=
 https://mockupstream:9090, OPENAI_BASE_URL=https://mockupstream:9090/v1,
-SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and dummy ANTHROPIC_API_KEY and
-OPENAI_API_KEY values (mock-not-a-real-key), so load tests never reach a
-real API. The gateway, gateway-bench and k6 mount only
+mockcompat as protocol openai on https://mockupstream:9090/v1,
+SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and dummy keys for all three
+(mock-not-a-real-key), so load tests never reach a real API. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
 copies the server key into a volume as a file owned by the nonroot user
 (65532) with mode 0400, since devcerts writes it 0600 for the host user; the

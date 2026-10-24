@@ -906,6 +906,23 @@ func TestHandler_TruncatesLoggedModel(t *testing.T) {
 	}
 }
 
+func TestHandler_LogsUpstreamAndProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	for _, tt := range []struct{ opt, want string }{
+		{"", "anthropic"}, // defaults to the provider's Name()
+		{"claude", "claude"},
+	} {
+		gw, logs := newGateway(t, upstream.URL, proxy.Options{Upstream: tt.opt})
+		post(gw, reqBody)
+		line := logLine(t, logs)
+		if line["upstream"] != tt.want || line["provider"] != "anthropic" {
+			t.Errorf("Upstream %q: logged upstream %v, provider %v; want %q, anthropic", tt.opt, line["upstream"], line["provider"], tt.want)
+		}
+	}
+}
+
 func TestHandler_SharedAdmission(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})

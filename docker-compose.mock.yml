@@ -6,15 +6,21 @@
 services:
   gateway:
     environment:
-      # Both protocols, both served by the mock.
-      SENTINEL_UPSTREAMS: anthropic,openai
+      # Both protocols, both served by the mock, plus a custom upstream on
+      # the mock's OpenAI API for the prefixed route
+      # /mockcompat/v1/chat/completions. Custom upstreams from .env are
+      # not listed, so the gateway warns about them and doesn't use them.
+      SENTINEL_UPSTREAMS: anthropic,openai,mockcompat
       ANTHROPIC_BASE_URL: https://mockupstream:9090
       OPENAI_BASE_URL: https://mockupstream:9090/v1
+      SENTINEL_UPSTREAM_MOCKCOMPAT_PROTOCOL: openai
+      SENTINEL_UPSTREAM_MOCKCOMPAT_BASE_URL: https://mockupstream:9090/v1
       SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
       # The mock ignores the upstream keys, so keep the real ones from .env
       # away from it.
       ANTHROPIC_API_KEY: mock-not-a-real-key
       OPENAI_API_KEY: mock-not-a-real-key
+      SENTINEL_UPSTREAM_MOCKCOMPAT_API_KEY: mock-not-a-real-key
     # Only the CA certificate; the server key stays with mockupstream.
     volumes:
       - type: bind

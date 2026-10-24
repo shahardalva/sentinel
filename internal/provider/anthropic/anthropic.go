@@ -135,7 +135,7 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 	}
 	resp, err := p.client.Do(up)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: forward: %w", err)
+		return nil, fmt.Errorf("anthropic: forward: %w", upstream.StripURL(err))
 	}
 
 	header := make(http.Header)

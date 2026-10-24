@@ -1,11 +1,13 @@
 package upstream
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -17,6 +19,47 @@ func mustClient(t *testing.T, cfg ClientConfig) *http.Client {
 		t.Fatalf("NewClient: %v", err)
 	}
 	return c
+}
+
+func TestNewClient_RefusesRedirects(t *testing.T) {
+	var followed bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { followed = true }))
+	defer target.Close()
+	for _, code := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		src := httptest.NewServer(http.RedirectHandler(target.URL, code))
+		req, err := http.NewRequest(http.MethodPost, src.URL, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Api-Key", "secret")
+		resp, err := mustClient(t, ClientConfig{MaxIdleConns: 1}).Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		if !errors.Is(err, ErrRedirect) {
+			t.Errorf("%d: Do = %v, want ErrRedirect", code, err)
+		}
+		src.Close()
+	}
+	if followed {
+		t.Error("a redirect was followed")
+	}
+}
+
+func TestStripURL(t *testing.T) {
+	for _, cause := range []error{ErrRedirect, context.Canceled} {
+		err := StripURL(&url.Error{Op: "Post", URL: "https://gw.example/k/sk-secret/v1", Err: cause})
+		if got, want := err.Error(), "Post: "+cause.Error(); got != want {
+			t.Errorf("StripURL = %q, want %q", got, want)
+		}
+		if !errors.Is(err, cause) {
+			t.Errorf("errors.Is(%v, %v) = false; the cause must stay wrapped", err, cause)
+		}
+	}
+	other := errors.New("build request")
+	if got := StripURL(other); got != other {
+		t.Errorf("StripURL(non-url error) = %v, want it unchanged", got)
+	}
 }
 
 func TestValidateBaseURL(t *testing.T) {

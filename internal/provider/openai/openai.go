@@ -143,7 +143,7 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 	up.Header.Set("Authorization", "Bearer "+p.apiKey)
 	resp, err := p.client.Do(up)
 	if err != nil {
-		return nil, fmt.Errorf("openai: forward: %w", err)
+		return nil, fmt.Errorf("openai: forward: %w", upstream.StripURL(err))
 	}
 
 	header := make(http.Header)
