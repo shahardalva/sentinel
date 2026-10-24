@@ -43,7 +43,7 @@ func newGateway(t *testing.T, upstreamURL string, opts proxy.Options) (http.Hand
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey}, logger, proxy.NewHandler(p, logger, opts)))
+	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey}, p, logger, proxy.NewHandler(p, logger, opts)))
 	return mux, &logs
 }
 
@@ -770,6 +770,9 @@ type stubProvider struct {
 }
 
 func (s stubProvider) Name() string { return "stub" }
+func (s stubProvider) FormatError(status int, kind proxy.ErrorKind, msg string) (string, []byte) {
+	return anthropic.FormatError(status, kind, msg)
+}
 func (s stubProvider) Forward(context.Context, *proxy.Request) (*proxy.Response, error) {
 	return s.resp, s.err
 }
@@ -860,5 +863,56 @@ func TestHandler_TruncatesLoggedModel(t *testing.T) {
 	model, _ := logLine(t, logs)["model"].(string)
 	if want := strings.Repeat("a", 127); model != want {
 		t.Errorf("logged model = %d bytes %q..., want the 127-byte prefix", len(model), model[:min(len(model), 10)])
+	}
+}
+
+func TestHandler_SharedAdmission(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	defer close(release) // runs first if the test fails before releasing
+
+	p, err := anthropic.New(anthropic.Config{APIKey: upstreamKey, BaseURL: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.DiscardHandler)
+	admission := proxy.NewAdmission(1)
+	first := proxy.NewHandler(p, logger, proxy.Options{Admission: admission})
+	// MaxConcurrent is ignored when an Admission is given.
+	second := proxy.NewHandler(p, logger, proxy.Options{Admission: admission, MaxConcurrent: 10})
+
+	done := make(chan int, 1)
+	go func() { done <- post(first, reqBody).Code }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached upstream")
+	}
+
+	rec := post(second, reqBody) // the shared slot is held by first
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "overloaded_error" {
+		t.Errorf("error type = %q", typ)
+	}
+
+	release <- struct{}{}
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", code)
+	}
+	// The slot freed by first is available to second.
+	go func() { <-started; release <- struct{}{} }()
+	if code := post(second, reqBody).Code; code != http.StatusOK {
+		t.Errorf("second after release: status = %d, want 200", code)
 	}
 }

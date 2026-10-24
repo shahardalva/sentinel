@@ -14,6 +14,7 @@ The load test in [bench/RESULTS.md](../../bench/RESULTS.md) ran at 1000 req/s ag
 - The cap is set by `SENTINEL_MAX_CONCURRENT`. The default stays at 128.
 - The value must be a positive integer. The gateway refuses to start on anything else, instead of falling back to the default without saying so.
 - The provider's idle connection pool is sized to the same value, so the two can't drift apart.
+- The cap is one pool shared by all routes and upstreams (`proxy.Admission`), not one per route, so adding a protocol or upstream doesn't raise the memory bound below.
 - At the cap, the gateway still sheds load with a fast `503` and `Retry-After` rather than queueing. A queued request still holds a connection and its memory, so a queue only moves the pressure.
 
 ## Sizing

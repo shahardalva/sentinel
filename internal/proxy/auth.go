@@ -21,8 +21,8 @@ var authReadTimeout = 5 * time.Second
 // token. With no non-empty keys every request is rejected. The credential
 // headers are removed before next runs, so later stages never see them.
 // They see only a SHA-256 digest of the key, as the client's identity for
-// rate limiting.
-func RequireKey(keys []string, logger *slog.Logger, next http.Handler) http.Handler {
+// rate limiting. A rejection is rendered by errs, the route's protocol.
+func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next http.Handler) http.Handler {
 	// Compare SHA-256 digests so every comparison is over the same length and
 	// timing reveals nothing about a key's length or contents.
 	var digests [][sha256.Size]byte
@@ -46,7 +46,7 @@ func RequireKey(keys []string, logger *slog.Logger, next http.Handler) http.Hand
 				slog.String("path", r.URL.Path),
 				slog.String("remote_addr", r.RemoteAddr),
 			)
-			rejectEarly(w, http.StatusUnauthorized, "authentication_error", "invalid x-api-key")
+			rejectEarly(w, errs, http.StatusUnauthorized, ErrAuthentication, "invalid x-api-key")
 			return
 		}
 

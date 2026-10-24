@@ -288,7 +288,11 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 
 **Fail open on a Redis outage, by default.** If Redis can't answer within 50 ms, the request goes through and the gateway logs a warning. An outage then loses rate limiting rather than all traffic. `SENTINEL_RATE_LIMIT_FAIL_MODE=closed` reverses that choice.
 
-**A provider-agnostic core.** The handler talks to a `Provider` interface that returns a small `Response` struct. Header filtering, request IDs and version validation live in the Anthropic provider. Adding OpenAI means implementing one `Forward` method; the handler doesn't change.
+**A provider-agnostic core.** The handler talks to a `Provider` interface that returns a small `Response` struct. Header filtering, request IDs and version validation live in the Anthropic provider. Three seams keep the core free of any one protocol, so a second protocol or upstream adds code beside it rather than inside it:
+
+- **Shared admission.** The concurrency cap is a `proxy.Admission` created once in `cmd/gateway` and handed to every handler. Each new route or upstream draws on the same slots, so the memory bound in [ADR 0001](docs/adr/0001-concurrency-cap.md) stays one bound rather than one per route.
+- **Protocol-owned errors.** The core knows error kinds (invalid request, authentication, rate limit, too large, timeout, overloaded, upstream failure), not error shapes. Every error the gateway itself answers with, including the `401` from `RequireKey`, is rendered by the route's `ErrorFormatter`, so clients of each protocol get errors their SDK can parse. The Anthropic provider maps the kinds to Anthropic's error types.
+- **Shared upstream plumbing.** `internal/provider/upstream` holds the security-critical parts every provider needs: the https-only rule with its loopback exception, the pooled HTTP client with a TLS 1.2 floor and extra CAs added to the system pool, and the header control-character check. A new provider calls it instead of copying it.
 
 **Per-chunk deadlines instead of a request deadline.** A single deadline for the whole request would cut off long, healthy streams. Sentinel bounds the time to first byte, the idle time between chunks, and each write to the client instead. The server has no global `ReadTimeout` or `WriteTimeout` for the same reason.
 
@@ -312,10 +316,13 @@ sentinel/
 │   ├── ratelimit.go          #   token bucket as an atomic Redis Lua script
 │   └── breaker.go            #   circuit breaker around Redis
 ├── internal/proxy/           # provider-agnostic core
+│   ├── admission.go          #   concurrency cap shared by all routes
 │   ├── auth.go               #   gateway key authentication
+│   ├── errors.go             #   error kinds and the ErrorFormatter seam
 │   └── handler.go            #   rate limit, intake, admission, forwarding, stream relay, logging
 ├── internal/provider/
-│   └── anthropic/            # Anthropic Messages API provider
+│   ├── anthropic/            # Anthropic Messages API provider and its error shape
+│   └── upstream/             # shared upstream plumbing: base URL rule, TLS client, header checks
 ├── bench/                    # k6 load test and results
 ├── docs/
 │   ├── adr/                  # architecture decision records

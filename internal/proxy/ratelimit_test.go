@@ -74,7 +74,7 @@ func newRateLimited(t *testing.T, perMinute int, failClosed bool, redisURL strin
 	}
 	h := proxy.NewHandler(p, logger, proxy.Options{RateLimiter: limiter, RateLimitFailClosed: failClosed})
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey, otherKey}, logger, h))
+	mux.Handle("POST /v1/messages", proxy.RequireKey([]string{gatewayKey, otherKey}, p, logger, h))
 	return &rateLimited{gw: mux, logs: &logs, mr: mr, calls: calls}
 }
 

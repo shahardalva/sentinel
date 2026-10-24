@@ -36,3 +36,7 @@ go.work.sum
 
 # Dev certificates from cmd/devcerts
 certs/
+
+# Claude Code: personal settings and worktrees
+.claude/settings.local.json
+.claude/worktrees/
