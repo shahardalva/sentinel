@@ -93,6 +93,12 @@ func TestLogLevel_Stream(t *testing.T) {
 	}
 }
 
+// plainErrors renders errors as plain text; this package can't import a
+// provider.
+var plainErrors = ErrorFormatterFunc(func(_ int, _ ErrorKind, msg string) (string, []byte) {
+	return "text/plain; charset=utf-8", []byte(msg)
+})
+
 func TestRequireKey_ClearsReadDeadline(t *testing.T) {
 	old := authReadTimeout
 	authReadTimeout = 50 * time.Millisecond
@@ -107,7 +113,7 @@ func TestRequireKey_ClearsReadDeadline(t *testing.T) {
 		}
 		got <- string(b)
 	})
-	srv := httptest.NewServer(RequireKey([]string{"k"}, slog.New(slog.DiscardHandler), next))
+	srv := httptest.NewServer(RequireKey([]string{"k"}, plainErrors, slog.New(slog.DiscardHandler), next))
 	defer srv.Close()
 
 	// The body arrives after the auth deadline would have passed.

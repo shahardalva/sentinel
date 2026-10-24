@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +20,12 @@ import (
 
 func post(t *testing.T, url, body string) *http.Response {
 	t.Helper()
-	resp, err := http.Post(url+"/v1/messages", "application/json", strings.NewReader(body))
+	return postPath(t, url, "/v1/messages", body)
+}
+
+func postPath(t *testing.T, url, path, body string) *http.Response {
+	t.Helper()
+	resp, err := http.Post(url+path, "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +140,131 @@ func TestStreamEventSequence(t *testing.T) {
 	}
 }
 
+func TestChatCompletion(t *testing.T) {
+	const delay = 50 * time.Millisecond
+	srv := httptest.NewServer(newHandler(delay, 0))
+	defer srv.Close()
+
+	start := time.Now()
+	resp := postPath(t, srv.URL, "/v1/chat/completions", `{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Errorf("responded after %v, want at least %v", elapsed, delay)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if id := resp.Header.Get("X-Request-Id"); id != "req_mock" {
+		t.Errorf("X-Request-Id = %q, want req_mock", id)
+	}
+
+	var c struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Object != "chat.completion" || c.ID == "" || c.Created == 0 {
+		t.Errorf("object/id/created = %q/%q/%d", c.Object, c.ID, c.Created)
+	}
+	if c.Model != "gpt-test" {
+		t.Errorf("model = %q, want the request's model echoed", c.Model)
+	}
+	if len(c.Choices) != 1 || c.Choices[0].Message.Role != "assistant" ||
+		c.Choices[0].Message.Content != strings.Join(replyChunks, "") || c.Choices[0].FinishReason != "stop" {
+		t.Errorf("choices = %+v", c.Choices)
+	}
+	if c.Usage.TotalTokens != c.Usage.PromptTokens+c.Usage.CompletionTokens || c.Usage.CompletionTokens == 0 {
+		t.Errorf("usage = %+v", c.Usage)
+	}
+}
+
+func TestChatCompletionStream(t *testing.T) {
+	srv := httptest.NewServer(newHandler(0, time.Millisecond))
+	defer srv.Close()
+
+	resp := postPath(t, srv.URL, "/v1/chat/completions", `{"model":"gpt-test","stream":true}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if id := resp.Header.Get("X-Request-Id"); id != "req_mock" {
+		t.Errorf("X-Request-Id = %q, want req_mock", id)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every event is a data line and a blank line, with no event: names.
+	events := strings.Split(strings.TrimSuffix(string(raw), "\n\n"), "\n\n")
+	if want := len(replyChunks) + 2; len(events) != want {
+		t.Fatalf("got %d events, want %d:\n%s", len(events), want, raw)
+	}
+	if last := events[len(events)-1]; last != "data: [DONE]" {
+		t.Errorf("last event = %q, want data: [DONE]", last)
+	}
+	var text strings.Builder
+	var finishes []string
+	for i, ev := range events[:len(events)-1] {
+		data, ok := strings.CutPrefix(ev, "data: ")
+		if !ok || strings.Contains(data, "\n") {
+			t.Fatalf("event %d = %q, want a single data line", i, ev)
+		}
+		var chunk struct {
+			Object  string `json:"object"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("event %d: bad data: %v", i, err)
+		}
+		if chunk.Object != "chat.completion.chunk" || chunk.Model != "gpt-test" || len(chunk.Choices) != 1 {
+			t.Fatalf("event %d = %s", i, data)
+		}
+		choice := chunk.Choices[0]
+		if i == 0 && choice.Delta.Role != "assistant" {
+			t.Errorf("first chunk role = %q, want assistant", choice.Delta.Role)
+		}
+		text.WriteString(choice.Delta.Content)
+		if choice.FinishReason != nil {
+			finishes = append(finishes, fmt.Sprintf("%d:%s", i, *choice.FinishReason))
+		}
+	}
+	if got := text.String(); got != strings.Join(replyChunks, "") {
+		t.Errorf("streamed text = %q", got)
+	}
+	if want := fmt.Sprintf("%d:stop", len(replyChunks)); len(finishes) != 1 || finishes[0] != want {
+		t.Errorf("finish reasons = %q, want only %q on the final chunk", finishes, want)
+	}
+}
+
 func TestRejectsWrongMethodPathAndBody(t *testing.T) {
 	srv := httptest.NewServer(newHandler(0, 0))
 	defer srv.Close()
@@ -145,6 +277,9 @@ func TestRejectsWrongMethodPathAndBody(t *testing.T) {
 		{http.MethodPost, "/v1/complete", "{}", http.StatusNotFound},
 		{http.MethodPost, "/", "{}", http.StatusNotFound},
 		{http.MethodPost, "/v1/messages", "not json", http.StatusBadRequest},
+		{http.MethodGet, "/v1/chat/completions", "", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/v1/chat/completions", "not json", http.StatusBadRequest},
+		{http.MethodPost, "/chat/completions", "{}", http.StatusNotFound},
 	}
 	for _, tt := range tests {
 		req, err := http.NewRequest(tt.method, srv.URL+tt.path, strings.NewReader(tt.body))

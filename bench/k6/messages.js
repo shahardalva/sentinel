@@ -1,15 +1,31 @@
-// Load test for POST /v1/messages at 100, 500 and 1000 req/s, 30s each,
-// run one after another. Point TARGET_URL at the mock upstream or at the
-// gateway; see bench/README.md.
+// Load test at 100, 500 and 1000 req/s, 30s each, run one after another,
+// for either protocol: POST /v1/messages (Anthropic) or
+// POST /v1/chat/completions (OpenAI). Point TARGET_URL at the mock upstream
+// or at the gateway; see bench/README.md.
 //
 //   TARGET_URL   base URL, default http://127.0.0.1:9090
-//   API_KEY      sent as x-api-key, default "bench"
+//   BENCH_API    "anthropic" (default): POST /v1/messages with the key as
+//                x-api-key; "openai": POST /v1/chat/completions with the key
+//                as Authorization: Bearer
+//   BENCH_UPSTREAM  a gateway's named upstream, default empty: a bare name
+//                such as "mockcompat", no slash. With BENCH_API=openai it
+//                sends POST /mockcompat/v1/chat/completions. A bare name,
+//                because Git Bash rewrites an argument that starts with "/"
+//                into a Windows path.
+//   API_KEY      the key, default "bench"
 //   STREAM       "1" to send "stream": true
 //   DURATION_S   seconds per rate, default 30 (lower it for a smoke run)
 import http from 'k6/http';
 import { check } from 'k6';
 
 const TARGET_URL = (__ENV.TARGET_URL || 'http://127.0.0.1:9090').replace(/\/+$/, '');
+const BENCH_API = __ENV.BENCH_API || 'anthropic';
+// The gateway's rule for upstream names.
+const BENCH_UPSTREAM = __ENV.BENCH_UPSTREAM || '';
+if (BENCH_UPSTREAM && !/^[a-z][a-z0-9]{0,31}$/.test(BENCH_UPSTREAM)) {
+  throw new Error(`BENCH_UPSTREAM must be an upstream name such as "mockcompat" (lowercase letters and digits, no slash), not "${BENCH_UPSTREAM}"`);
+}
+const PREFIX = BENCH_UPSTREAM ? `/${BENCH_UPSTREAM}` : '';
 const API_KEY = __ENV.API_KEY || 'bench';
 const STREAM = __ENV.STREAM === '1';
 
@@ -54,22 +70,45 @@ export const options = {
   discardResponseBodies: true,
 };
 
-const body = JSON.stringify({
-  model: 'claude-bench',
-  max_tokens: 16,
-  stream: STREAM,
-  messages: [{ role: 'user', content: 'Say hello.' }],
-});
-
-const params = {
-  headers: {
-    'content-type': 'application/json',
-    'x-api-key': API_KEY,
-    'anthropic-version': '2023-06-01',
+const protocols = {
+  anthropic: {
+    path: '/v1/messages',
+    body: {
+      model: 'claude-bench',
+      max_tokens: 16,
+      stream: STREAM,
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+  },
+  openai: {
+    path: '/v1/chat/completions',
+    body: {
+      model: 'gpt-bench',
+      max_tokens: 16,
+      stream: STREAM,
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${API_KEY}`,
+    },
   },
 };
 
+const protocol = protocols[BENCH_API];
+if (!protocol) {
+  throw new Error(`BENCH_API must be "anthropic" or "openai", not "${BENCH_API}"`);
+}
+const url = `${TARGET_URL}${PREFIX}${protocol.path}`;
+const body = JSON.stringify(protocol.body);
+const params = { headers: protocol.headers };
+
 export default function () {
-  const res = http.post(`${TARGET_URL}/v1/messages`, body, params);
+  const res = http.post(url, body, params);
   check(res, { 'status is 200': (r) => r.status === 200 });
 }

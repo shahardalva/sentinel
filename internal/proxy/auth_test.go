@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
+
+var anthropicErrors = proxy.ErrorFormatterFunc(anthropic.FormatError)
 
 func TestRequireKey(t *testing.T) {
 	tests := []struct {
@@ -35,7 +38,7 @@ func TestRequireKey(t *testing.T) {
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				seen = r.Header
 			})
-			h := proxy.RequireKey([]string{"key-one", "key-two"}, slog.New(slog.DiscardHandler), next)
+			h := proxy.RequireKey([]string{"key-one", "key-two"}, anthropicErrors, slog.New(slog.DiscardHandler), next)
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 			for k, v := range tt.header {
@@ -67,7 +70,7 @@ func TestRequireKey(t *testing.T) {
 }
 
 func TestRequireKey_NoKeysRejectsAll(t *testing.T) {
-	h := proxy.RequireKey([]string{"", ""}, slog.New(slog.DiscardHandler), http.NotFoundHandler())
+	h := proxy.RequireKey([]string{"", ""}, anthropicErrors, slog.New(slog.DiscardHandler), http.NotFoundHandler())
 	for _, key := range []string{"", "anything"} {
 		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 		req.Header.Set("X-Api-Key", key)

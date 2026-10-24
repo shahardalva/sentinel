@@ -22,8 +22,10 @@ import (
 
 // Provider forwards a request to an upstream LLM API. Implementations own
 // authentication and decide which client headers are passed upstream and
-// which upstream response headers are passed back.
+// which upstream response headers are passed back. A Provider also renders
+// the gateway's own errors in its protocol's shape.
 type Provider interface {
+	ErrorFormatter
 	Name() string
 	// Forward sends req upstream. It returns a *RequestError to reject the
 	// client's request without contacting upstream.
@@ -133,7 +135,12 @@ type Options struct {
 	MaxBodyBytes int64
 	// MaxConcurrent caps requests in flight upstream; requests beyond it get
 	// a 503. A request takes its slot only once its body is fully read.
+	// Ignored when Admission is set.
 	MaxConcurrent int
+	// Admission, if set, is the cap shared with other Handlers; it must come
+	// from NewAdmission. If nil, the Handler gets its own, of MaxConcurrent
+	// slots.
+	Admission *Admission
 	// RateLimiter, if set, is asked before the body is read whether the
 	// authenticated client may make this request. Requests that did not pass
 	// through RequireKey have no client identity and are not limited.
@@ -141,17 +148,22 @@ type Options struct {
 	// RateLimitFailClosed answers 503 when RateLimiter returns an error. By
 	// default (fail open) the request is allowed and a warning logged.
 	RateLimitFailClosed bool
+	// Upstream names the upstream the Handler forwards to, for the request
+	// log's "upstream" field; "provider" is the protocol's Name(). Empty
+	// means the provider's Name().
+	Upstream string
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
 type Handler struct {
 	provider      Provider
+	upstream      string
 	logger        *slog.Logger
 	headerTimeout time.Duration
 	idleTimeout   time.Duration
 	bodyTimeout   time.Duration
 	maxBody       int64
-	slots         chan struct{} // counting semaphore of MaxConcurrent
+	admission     *Admission
 	limiter       RateLimiter
 	failClosed    bool
 	// Fail-open warnings: when the last one was logged (UnixNano), and how
@@ -160,7 +172,13 @@ type Handler struct {
 	skippedLimiterWarn atomic.Int64
 }
 
+// NewHandler returns a Handler forwarding to p. It panics if opts.Admission
+// was not built by NewAdmission, since a zero-value Admission would shed
+// every request.
 func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
+	if opts.Admission != nil && opts.Admission.slots == nil {
+		panic("proxy: Options.Admission must be created with NewAdmission")
+	}
 	if opts.HeaderTimeout <= 0 {
 		opts.HeaderTimeout = DefaultHeaderTimeout
 	}
@@ -173,17 +191,21 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = DefaultMaxBodyBytes
 	}
-	if opts.MaxConcurrent <= 0 {
-		opts.MaxConcurrent = DefaultMaxConcurrent
+	if opts.Admission == nil {
+		opts.Admission = NewAdmission(opts.MaxConcurrent)
+	}
+	if opts.Upstream == "" {
+		opts.Upstream = p.Name()
 	}
 	return &Handler{
 		provider:      p,
+		upstream:      opts.Upstream,
 		logger:        logger,
 		headerTimeout: opts.HeaderTimeout,
 		idleTimeout:   opts.IdleTimeout,
 		bodyTimeout:   opts.BodyTimeout,
 		maxBody:       opts.MaxBodyBytes,
-		slots:         make(chan struct{}, opts.MaxConcurrent),
+		admission:     opts.Admission,
 		limiter:       opts.RateLimiter,
 		failClosed:    opts.RateLimitFailClosed,
 	}
@@ -206,6 +228,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
+			slog.String("upstream", h.upstream),
 			slog.String("provider", h.provider.Name()),
 			slog.String("model", model),
 			slog.Int("status", status),
@@ -241,7 +264,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ce := r.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
 		failure = errContentEncoding
 		status = http.StatusUnsupportedMediaType
-		rejectEarly(w, status, "invalid_request_error", "content-encoding is not supported; send an uncompressed body")
+		rejectEarly(w, h.provider, status, ErrInvalidRequest, "content-encoding is not supported; send an uncompressed body")
 		return
 	}
 
@@ -249,7 +272,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > h.maxBody {
 		failure = &http.MaxBytesError{Limit: h.maxBody}
 		status = http.StatusRequestEntityTooLarge
-		rejectEarly(w, status, "request_too_large", "request body too large")
+		rejectEarly(w, h.provider, status, ErrRequestTooLarge, "request body too large")
 		return
 	}
 
@@ -271,7 +294,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			failure = fmt.Errorf("rate limiter unavailable: %w", err)
 			status = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
-			rejectEarly(w, status, "api_error", "rate limiter unavailable")
+			rejectEarly(w, h.provider, status, ErrAPI, "rate limiter unavailable")
 			return
 		case err != nil:
 			h.warnLimiterDown(r.Context(), err)
@@ -280,7 +303,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			failure = errRateLimited
 			status = http.StatusTooManyRequests
 			w.Header().Set("Retry-After", retryAfterSeconds(lim.RetryAfter))
-			rejectEarly(w, status, "rate_limit_error", "rate limit exceeded")
+			rejectEarly(w, h.provider, status, ErrRateLimit, "rate limit exceeded")
 			return
 		default:
 			limit = &lim
@@ -301,16 +324,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		failure = err
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			status = http.StatusRequestEntityTooLarge
-			rejectEarly(w, status, "request_too_large", "request body too large")
+			rejectEarly(w, h.provider, status, ErrRequestTooLarge, "request body too large")
 			return
 		}
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			status = http.StatusRequestTimeout
-			rejectEarly(w, status, "timeout_error", "request body not received in time")
+			rejectEarly(w, h.provider, status, ErrTimeout, "request body not received in time")
 			return
 		}
 		status = http.StatusBadRequest
-		rejectEarly(w, status, "invalid_request_error", "could not read request body")
+		rejectEarly(w, h.provider, status, ErrInvalidRequest, "could not read request body")
 		return
 	}
 	model = truncate(extractModel(body), maxLoggedModel)
@@ -319,16 +342,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// one. Shed load rather than queue: a queued request still holds its
 	// connection, and waiting only moves the memory pressure elsewhere.
 	phase = phaseAdmit
-	select {
-	case h.slots <- struct{}{}:
-		defer func() { <-h.slots }()
-	default:
+	if !h.admission.TryAcquire() {
 		failure = errOverloaded
 		status = http.StatusServiceUnavailable
 		w.Header().Set("Retry-After", "1")
-		rejectEarly(w, status, "overloaded_error", "gateway is at capacity")
+		rejectEarly(w, h.provider, status, ErrOverloaded, "gateway is at capacity")
 		return
 	}
+	defer h.admission.Release()
 
 	// One context for the whole upstream exchange. Timers cancel it with a
 	// cause, so a timeout is distinguishable from the client going away.
@@ -347,16 +368,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case invalid:
 			status = http.StatusBadRequest
-			writeError(w, status, "invalid_request_error", reqErr.Message)
+			writeError(w, h.provider, status, ErrInvalidRequest, reqErr.Message)
 		case r.Context().Err() != nil:
 			status = 499 // client closed request; nobody to answer
 		case errors.Is(context.Cause(ctx), errHeaderTimeout):
 			failure = errHeaderTimeout
 			status = http.StatusGatewayTimeout
-			writeError(w, status, "timeout_error", "upstream timed out")
+			writeError(w, h.provider, status, ErrTimeout, "upstream timed out")
 		default:
 			status = http.StatusBadGateway
-			writeError(w, status, "api_error", "upstream unavailable")
+			writeError(w, h.provider, status, ErrAPI, "upstream unavailable")
 		}
 		return
 	}
@@ -369,7 +390,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.Status == http.StatusUnauthorized || resp.Status == http.StatusForbidden {
 		failure = fmt.Errorf("%w (status %d)", errUpstreamAuth, resp.Status)
 		status = http.StatusBadGateway
-		writeError(w, status, "api_error", "upstream authentication failed")
+		writeError(w, h.provider, status, ErrAPI, "upstream authentication failed")
 		return
 	}
 	for k, vv := range resp.Header {
@@ -524,25 +545,4 @@ func truncate(s string, n int) string {
 		n--
 	}
 	return s[:n]
-}
-
-// rejectEarly answers a request whose body may still be unread. net/http
-// drains up to 256 KiB of an unread body, with no deadline, before sending
-// the response and again when the handler returns, so a client that stalls
-// mid-body would hold the connection open indefinitely. Connection: close
-// skips the first drain; the read deadline bounds the second.
-func rejectEarly(w http.ResponseWriter, status int, typ, msg string) {
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(RejectDrainTimeout))
-	w.Header().Set("Connection", "close")
-	writeError(w, status, typ, msg)
-}
-
-// writeError writes an error in Anthropic's error response shape.
-func writeError(w http.ResponseWriter, status int, typ, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"type":  "error",
-		"error": map[string]string{"type": typ, "message": msg},
-	})
 }

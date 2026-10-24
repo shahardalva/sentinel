@@ -1,6 +1,7 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -25,32 +26,15 @@ func mustNew(t *testing.T, cfg Config) *Provider {
 	return p
 }
 
+// The full base-URL rule is tested in package upstream; this checks New
+// applies it, after defaulting an empty BaseURL.
 func TestNew_ValidatesBaseURL(t *testing.T) {
-	valid := []string{
-		"", // DefaultBaseURL
-		"https://api.anthropic.com",
-		"https://proxy.internal:8443/anthropic/",
-		"http://127.0.0.1:9000",
-		"http://[::1]:9000",
-		"http://localhost:9000",
-	}
-	for _, u := range valid {
+	for _, u := range []string{"", "https://api.anthropic.com", "http://127.0.0.1:9000"} {
 		if _, err := New(Config{BaseURL: u}); err != nil {
 			t.Errorf("New(%q) = %v, want ok", u, err)
 		}
 	}
-	invalid := []string{
-		"http://api.anthropic.com", // key in plaintext over the network
-		"http://10.0.0.5:8080",
-		"api.anthropic.com", // no scheme
-		"https://",
-		"ftp://api.anthropic.com",
-		"https://user:pass@api.anthropic.com",
-		"https://api.anthropic.com?x=1",
-		"https://api.anthropic.com/#frag",
-		"https://api.anthropic.com/\x7f",
-	}
-	for _, u := range invalid {
+	for _, u := range []string{"http://api.anthropic.com", "https://user:pass@api.anthropic.com"} {
 		if _, err := New(Config{BaseURL: u}); err == nil {
 			t.Errorf("New(%q) = ok, want error", u)
 		}
@@ -144,6 +128,18 @@ func TestForward_WrapsErrors(t *testing.T) {
 	}
 }
 
+// The full TLS setup is tested in package upstream; this checks New's
+// default client gets it.
+func TestNew_TLSFloor(t *testing.T) {
+	tr, ok := mustNew(t, Config{}).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("default client has no *http.Transport")
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Errorf("TLSClientConfig = %+v, want MinVersion >= TLS 1.2", tr.TLSClientConfig)
+	}
+}
+
 func TestNew_ConnectionPool(t *testing.T) {
 	tests := []struct {
 		name string
@@ -167,43 +163,6 @@ func TestNew_ConnectionPool(t *testing.T) {
 				t.Error("shares http.DefaultTransport; must be a clone")
 			}
 		})
-	}
-}
-
-func TestNew_TLSConfig(t *testing.T) {
-	tr := mustNew(t, Config{}).client.Transport.(*http.Transport)
-	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
-		t.Errorf("TLSClientConfig = %+v, want MinVersion >= TLS 1.2", tr.TLSClientConfig)
-	}
-	if tr.TLSClientConfig.RootCAs != nil {
-		t.Error("RootCAs set without ExtraRootCAs; want the system default")
-	}
-	if !tr.ForceAttemptHTTP2 {
-		t.Error("ForceAttemptHTTP2 lost; a custom TLS config would disable HTTP/2")
-	}
-}
-
-func TestNew_ExtraRootCAs(t *testing.T) {
-	// httptest's certificate is self-signed and marked as a CA, so it can
-	// stand in for a private CA.
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-	forward := func(cfg Config) error {
-		cfg.BaseURL = srv.URL
-		resp, err := mustNew(t, cfg).Forward(t.Context(), &proxy.Request{Body: []byte("{}"), Header: http.Header{}})
-		if err != nil {
-			return err
-		}
-		resp.Body.Close()
-		return nil
-	}
-
-	var verr *tls.CertificateVerificationError
-	if err := forward(Config{}); !errors.As(err, &verr) {
-		t.Errorf("system roots only: Forward = %v, want certificate verification error", err)
-	}
-	if err := forward(Config{ExtraRootCAs: []*x509.Certificate{srv.Certificate()}}); err != nil {
-		t.Errorf("server's CA trusted: Forward = %v, want ok", err)
 	}
 }
 
@@ -330,4 +289,52 @@ func TestForward_RejectsInvalidBeta(t *testing.T) {
 		t.Fatalf("beta with tab: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// TestNew_ErrorText pins New's error messages, which reach the operator via
+// the gateway's startup error.
+func TestNew_ErrorText(t *testing.T) {
+	tests := []struct{ url, want string }{
+		{"https://user:pass@api.anthropic.com", `anthropic: base URL for https://api.anthropic.com must not contain credentials`},
+		{"http://api.anthropic.com", `anthropic: base URL for http://api.anthropic.com must use https (http is allowed only for loopback hosts)`},
+		{"https://api.anthropic.com/\x7f", `anthropic: base URL is not a valid URL`},
+	}
+	for _, tt := range tests {
+		if _, err := New(Config{BaseURL: tt.url}); err == nil || err.Error() != tt.want {
+			t.Errorf("New(%q) = %v, want %q", tt.url, err, tt.want)
+		}
+	}
+}
+
+func TestFormatError(t *testing.T) {
+	tests := []struct {
+		kind proxy.ErrorKind
+		want string
+	}{
+		{proxy.ErrInvalidRequest, "invalid_request_error"},
+		{proxy.ErrAuthentication, "authentication_error"},
+		{proxy.ErrRateLimit, "rate_limit_error"},
+		{proxy.ErrRequestTooLarge, "request_too_large"},
+		{proxy.ErrTimeout, "timeout_error"},
+		{proxy.ErrOverloaded, "overloaded_error"},
+		{proxy.ErrAPI, "api_error"},
+		{proxy.ErrorKind(0), "api_error"},  // zero value: no kind set
+		{proxy.ErrorKind(-1), "api_error"}, // unknown
+	}
+	for _, tt := range tests {
+		ct, body := (&Provider{}).FormatError(http.StatusTeapot, tt.kind, `say "hi"`)
+		if ct != "application/json" {
+			t.Errorf("kind %d: content type = %q", tt.kind, ct)
+		}
+		// The trailing newline is part of the bytes clients have always
+		// received.
+		want := `{"error":{"message":"say \"hi\"","type":"` + tt.want + `"},"type":"error"}` + "\n"
+		if string(body) != want {
+			t.Errorf("kind %d: body = %q, want %q", tt.kind, body, want)
+		}
+		// So is encoding/json's default HTML escaping.
+		if _, body := FormatError(0, tt.kind, "<b>"); bytes.ContainsAny(body, "<>") {
+			t.Errorf("kind %d: body = %q, want < and > escaped", tt.kind, body)
+		}
+	}
 }

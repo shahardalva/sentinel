@@ -44,6 +44,11 @@ services:
       # Listen on all interfaces inside the container; the host port below
       # is bound to loopback only.
       SENTINEL_ADDR: 0.0.0.0:8081
+      # Which upstreams to serve, from .env; Anthropic only by default.
+      # Each one listed needs its key in .env, and a custom one its
+      # SENTINEL_UPSTREAM_<NAME>_* variables, which reach the container
+      # through env_file.
+      SENTINEL_UPSTREAMS: ${SENTINEL_UPSTREAMS:-anthropic}
       # Per-key rate limiting. SENTINEL_RATE_LIMIT_RPM and
       # SENTINEL_RATE_LIMIT_FAIL_MODE can be set in .env.
       SENTINEL_REDIS_URL: redis://redis:6379/0
@@ -99,12 +104,14 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # The gateway for make bench-gateway. It always points at mockupstream,
-  # holds only a dummy upstream key and reads nothing from .env except
-  # BENCH_API_KEY, so a load test can never reach the real API. Not
-  # published on the host. It rate limits through Redis like the real
-  # gateway, so the bench measures the Redis call, but with a limit no
-  # bench reaches, so it never sees a 429.
+  # The gateway for make bench-gateway. All of its upstreams always point
+  # at mockupstream, it holds only dummy upstream keys, and it reads nothing
+  # from .env except BENCH_API_KEY, so a load test can never reach a real
+  # API; make bench-gateway checks the base URLs it logs before k6 starts.
+  # mockcompat is a custom upstream on the mock's OpenAI API, for
+  # BENCH_UPSTREAM=mockcompat. Not published on the host. It rate limits
+  # through Redis like the real gateway, so the bench measures the Redis
+  # call, but with a limit no bench reaches, so it never sees a 429.
   gateway-bench:
     build:
       context: .
@@ -114,8 +121,14 @@ services:
     <<: *hardening
     environment:
       SENTINEL_ADDR: 0.0.0.0:8081
+      SENTINEL_UPSTREAMS: anthropic,openai,mockcompat
       ANTHROPIC_BASE_URL: https://mockupstream:9090
       ANTHROPIC_API_KEY: mock-not-a-real-key
+      OPENAI_BASE_URL: https://mockupstream:9090/v1
+      OPENAI_API_KEY: mock-not-a-real-key
+      SENTINEL_UPSTREAM_MOCKCOMPAT_PROTOCOL: openai
+      SENTINEL_UPSTREAM_MOCKCOMPAT_BASE_URL: https://mockupstream:9090/v1
+      SENTINEL_UPSTREAM_MOCKCOMPAT_API_KEY: mock-not-a-real-key
       SENTINEL_UPSTREAM_CA_FILE: /certs/ca.pem
       SENTINEL_API_KEYS: ${BENCH_API_KEY:-bench}
       # Database 1, apart from the gateway's buckets in database 0.
@@ -148,6 +161,8 @@ services:
       SSL_CERT_FILE: /certs/ca.pem
       TARGET_URL: ${TARGET_URL:-https://mockupstream:9090}
       API_KEY: ${BENCH_API_KEY:-bench}
+      BENCH_API: ${BENCH_API:-anthropic}
+      BENCH_UPSTREAM: ${BENCH_UPSTREAM:-}
       STREAM: ${STREAM:-}
       DURATION_S: ${DURATION_S:-30}
     volumes:

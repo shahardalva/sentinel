@@ -1,17 +1,20 @@
 # Load test: gateway overhead
 
 Measures how much latency the Sentinel gateway adds on top of its upstream.
-The same k6 script runs twice against a mock Anthropic upstream: once
-directly, once through the gateway. The difference between the two runs is
-the gateway's overhead.
+The same k6 script runs twice against a mock upstream: once directly, once
+through the gateway. The difference between the two runs is the gateway's
+overhead.
 
-- `cmd/mockupstream`: a stdlib Go server that imitates `POST /v1/messages`.
-  It returns a fixed message after `-delay` (default 200ms), or a short SSE
-  stream when the request has `"stream": true` (`-event-delay` between
-  events, default 10ms). Listens on `-addr` (default `127.0.0.1:9090`).
+- `cmd/mockupstream`: a stdlib Go server that imitates Anthropic's
+  `POST /v1/messages` and OpenAI's `POST /v1/chat/completions`. It returns a
+  fixed response after `-delay` (default 200ms), or a short SSE stream when
+  the request has `"stream": true` (`-event-delay` between events, default
+  10ms). The OpenAI stream ends with `data: [DONE]`. Listens on `-addr`
+  (default `127.0.0.1:9090`).
 - `bench/k6/messages.js`: three scenarios at a constant arrival rate of 100,
   500 and 1000 req/s, 30s each, run one after another with a 5s gap. Each
   request is tagged with its scenario (`rate_100`, `rate_500`, `rate_1000`).
+  `BENCH_API` picks the protocol.
 
 You need [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and Go.
 
@@ -19,9 +22,11 @@ You need [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and Go.
 
 | Variable     | Default                 | Meaning                                    |
 |--------------|-------------------------|--------------------------------------------|
-| `TARGET_URL` | `http://127.0.0.1:9090` | base URL; the script appends `/v1/messages` |
-| `API_KEY`    | `bench`                 | sent as `x-api-key`                         |
-| `STREAM`     | unset                   | `1` sends `"stream": true`                  |
+| `TARGET_URL` | `http://127.0.0.1:9090` | base URL; the script appends the path      |
+| `BENCH_API`  | `anthropic`             | `anthropic`: `POST /v1/messages`, key as `x-api-key`. `openai`: `POST /v1/chat/completions` with an OpenAI-shaped body, key as `Authorization: Bearer` |
+| `BENCH_UPSTREAM` | empty               | a gateway's named upstream, as a bare name: `BENCH_API=openai BENCH_UPSTREAM=mockcompat` sends `POST /mockcompat/v1/chat/completions`. The script refuses anything but a name (lowercase letters and digits), since Git Bash rewrites an argument starting with `/` into a Windows path. The mock itself has no prefixed routes, so use it only through a gateway |
+| `API_KEY`    | `bench`                 | the key, sent as `BENCH_API` says           |
+| `STREAM`     | unset                   | `1` sends `"stream": true`, for either `BENCH_API` |
 | `DURATION_S` | `30`                    | seconds per rate; lower it for a smoke run  |
 
 ## Run
@@ -68,6 +73,19 @@ The gateway logs one JSON line per request to stdout. At high rates, send it
 to a file (`> gateway.log`) so terminal output doesn't slow the gateway down.
 
 Repeat both runs with `STREAM=1` to measure the streaming path.
+
+#### The OpenAI route
+
+To measure `POST /v1/chat/completions`, enable the openai upstream on the
+gateway, pointed at the same mock (note the `/v1`), and run k6 with
+`BENCH_API=openai`:
+
+```bash
+SENTINEL_UPSTREAMS=openai OPENAI_BASE_URL=http://127.0.0.1:9090/v1 OPENAI_API_KEY=dummy SENTINEL_API_KEYS=bench-key go run ./cmd/gateway
+BENCH_API=openai TARGET_URL=http://127.0.0.1:8081 API_KEY=bench-key k6 run bench/k6/messages.js
+```
+
+The direct baseline is `BENCH_API=openai k6 run bench/k6/messages.js`.
 
 ### Mock over HTTPS
 
@@ -116,10 +134,21 @@ make bench           # k6 straight at mockupstream
 make bench-gateway   # k6 through gateway-bench, a gateway fixed to the mock
 ```
 
-`make bench-gateway` starts its own `gateway-bench` service, which always
-points at the mock and holds no real upstream key, and refuses to run if that
-gateway's upstream is anything else. `DURATION_S` and `STREAM` pass through,
-for example `make bench-gateway DURATION_S=5`.
+`make bench-gateway` starts its own `gateway-bench` service, which serves
+both protocols plus a named upstream, `mockcompat` (protocol `openai`), all
+pointed at the mock, and holds no real upstream key. Before k6 starts, it
+waits up to about 15 seconds for that gateway to log `listening`, then
+checks the `upstream enabled` lines it logged at startup: there must be at
+least one, and each must have exactly one `base_url` (the gateway logs only
+scheme, host and port), equal to `https://mockupstream:9090`. Otherwise,
+or if such a line can't be read, it refuses to run and names the upstream
+at fault. It checks what the gateway resolved rather than its environment
+variables, since an upstream listed without a base URL variable silently
+gets its public default; the matching is in `cmd/benchguard`. `BENCH_API`,
+`BENCH_UPSTREAM`, `DURATION_S` and `STREAM` pass through, for example
+`make bench-gateway DURATION_S=5`, `make bench-gateway BENCH_API=openai STREAM=1`,
+or `make bench-gateway BENCH_API=openai BENCH_UPSTREAM=mockcompat` for the
+prefixed route.
 
 `gateway-bench` rate limits through the compose Redis, like a production
 gateway, so every request includes the Redis call and the overhead you
