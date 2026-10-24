@@ -167,7 +167,8 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 func allowResponseHeader(name string) bool {
 	name = http.CanonicalHeaderKey(name)
 	switch name {
-	case "Content-Type", "Retry-After":
+	// The OpenAI SDKs prefer Retry-After-Ms to Retry-After when both are sent.
+	case "Content-Type", "Retry-After", "Retry-After-Ms":
 		return true
 	}
 	return strings.HasPrefix(name, "X-Ratelimit-")

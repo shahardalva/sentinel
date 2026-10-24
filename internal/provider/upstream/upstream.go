@@ -18,25 +18,43 @@ import (
 	"strings"
 )
 
+// BaseURLError is a base URL that ValidateBaseURL rejected. Its message
+// names at most the URL's scheme and hostname, never the URL itself, which
+// may carry a key in its userinfo, path or query.
+type BaseURLError struct {
+	msg string
+}
+
+func (e *BaseURLError) Error() string { return e.msg }
+
 // ValidateBaseURL checks that raw is scheme://host[/path] with no
 // credentials, query, or fragment, and uses https. Plain http is allowed only
 // to a loopback host, for local test servers, since the upstream key would
-// otherwise cross the network in the clear.
+// otherwise cross the network in the clear. Errors are *BaseURLError.
 func ValidateBaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("base URL: %w", err)
+		// Not wrapped: a *url.Error, and some of the errors inside one,
+		// repeat the URL or parts of it.
+		return &BaseURLError{"base URL is not a valid URL"}
 	}
-	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("base URL %q must be scheme://host[/path] with no credentials, query, or fragment", raw)
-	}
+	// Only the scheme and hostname are safe to name.
+	safe := u.Scheme + "://" + u.Hostname()
 	switch {
+	case u.Host == "":
+		return &BaseURLError{"base URL must be scheme://host[/path]"}
+	case u.User != nil:
+		return &BaseURLError{fmt.Sprintf("base URL for %s must not contain credentials", safe)}
+	case u.RawQuery != "":
+		return &BaseURLError{fmt.Sprintf("base URL for %s must not contain a query", safe)}
+	case u.Fragment != "":
+		return &BaseURLError{fmt.Sprintf("base URL for %s must not contain a fragment", safe)}
 	case u.Scheme == "https":
 		return nil
 	case u.Scheme == "http" && IsLoopback(u.Hostname()):
 		return nil
 	}
-	return fmt.Errorf("base URL %q must use https (http is allowed only for loopback hosts)", raw)
+	return &BaseURLError{fmt.Sprintf("base URL for %s must use https (http is allowed only for loopback hosts)", safe)}
 }
 
 // IsLoopback reports whether host is "localhost" or a loopback IP address.

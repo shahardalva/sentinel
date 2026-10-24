@@ -154,7 +154,7 @@ services:
       SSL_CERT_FILE: /certs/ca.pem
       TARGET_URL: ${TARGET_URL:-https://mockupstream:9090}
       API_KEY: ${BENCH_API_KEY:-bench}
-      API: ${API:-anthropic}
+      BENCH_API: ${BENCH_API:-anthropic}
       STREAM: ${STREAM:-}
       DURATION_S: ${DURATION_S:-30}
     volumes:

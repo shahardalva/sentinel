@@ -14,7 +14,7 @@ overhead.
 - `bench/k6/messages.js`: three scenarios at a constant arrival rate of 100,
   500 and 1000 req/s, 30s each, run one after another with a 5s gap. Each
   request is tagged with its scenario (`rate_100`, `rate_500`, `rate_1000`).
-  `API` picks the protocol.
+  `BENCH_API` picks the protocol.
 
 You need [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and Go.
 
@@ -23,9 +23,9 @@ You need [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and Go.
 | Variable     | Default                 | Meaning                                    |
 |--------------|-------------------------|--------------------------------------------|
 | `TARGET_URL` | `http://127.0.0.1:9090` | base URL; the script appends the path      |
-| `API`        | `anthropic`             | `anthropic`: `POST /v1/messages`, key as `x-api-key`. `openai`: `POST /v1/chat/completions` with an OpenAI-shaped body, key as `Authorization: Bearer` |
-| `API_KEY`    | `bench`                 | the key, sent as `API` says                 |
-| `STREAM`     | unset                   | `1` sends `"stream": true`, for either `API` |
+| `BENCH_API`  | `anthropic`             | `anthropic`: `POST /v1/messages`, key as `x-api-key`. `openai`: `POST /v1/chat/completions` with an OpenAI-shaped body, key as `Authorization: Bearer` |
+| `API_KEY`    | `bench`                 | the key, sent as `BENCH_API` says           |
+| `STREAM`     | unset                   | `1` sends `"stream": true`, for either `BENCH_API` |
 | `DURATION_S` | `30`                    | seconds per rate; lower it for a smoke run  |
 
 ## Run
@@ -77,14 +77,14 @@ Repeat both runs with `STREAM=1` to measure the streaming path.
 
 To measure `POST /v1/chat/completions`, enable the openai upstream on the
 gateway, pointed at the same mock (note the `/v1`), and run k6 with
-`API=openai`:
+`BENCH_API=openai`:
 
 ```bash
 SENTINEL_UPSTREAMS=openai OPENAI_BASE_URL=http://127.0.0.1:9090/v1 OPENAI_API_KEY=dummy SENTINEL_API_KEYS=bench-key go run ./cmd/gateway
-API=openai TARGET_URL=http://127.0.0.1:8081 API_KEY=bench-key k6 run bench/k6/messages.js
+BENCH_API=openai TARGET_URL=http://127.0.0.1:8081 API_KEY=bench-key k6 run bench/k6/messages.js
 ```
 
-The direct baseline is `API=openai k6 run bench/k6/messages.js`.
+The direct baseline is `BENCH_API=openai k6 run bench/k6/messages.js`.
 
 ### Mock over HTTPS
 
@@ -137,9 +137,9 @@ make bench-gateway   # k6 through gateway-bench, a gateway fixed to the mock
 both protocols, points both upstreams at the mock and holds no real upstream
 key. It refuses to run unless that gateway has both
 `ANTHROPIC_BASE_URL=https://mockupstream:9090` and
-`OPENAI_BASE_URL=https://mockupstream:9090/v1`. `API`, `DURATION_S` and
+`OPENAI_BASE_URL=https://mockupstream:9090/v1`. `BENCH_API`, `DURATION_S` and
 `STREAM` pass through, for example `make bench-gateway DURATION_S=5` or
-`make bench-gateway API=openai STREAM=1`.
+`make bench-gateway BENCH_API=openai STREAM=1`.
 
 `gateway-bench` rate limits through the compose Redis, like a production
 gateway, so every request includes the Redis call and the overhead you

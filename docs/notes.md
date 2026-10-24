@@ -16,7 +16,7 @@ Newest entries first. Short: what was done, what was decided, what's next.
   an enabled upstream. cmd/gateway builds the mux in newMux, which tests
   call, with one Admission and one rate limiter for every route.
 - mockupstream serves /v1/chat/completions too, streaming chunks and
-  data: [DONE]. k6 takes API=openai. make up and gateway-bench enable both
+  data: [DONE]. k6 takes BENCH_API=openai. make up and gateway-bench enable both
   upstreams on the mock with dummy keys; make bench-gateway checks both
   base URLs before it runs.
 - Tests: headers sent upstream, response allowlist, OpenAI error bodies,
@@ -37,7 +37,15 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - An upstream key set for an unlisted upstream is ignored with a WARN, not
   an error, so one .env can serve several setups.
 - The extra-CA warning fires per enabled upstream on its public default
-  host, compared by hostname so a trailing slash or a path doesn't hide it.
+  host, compared by hostname so a trailing slash, a trailing dot or a path
+  doesn't hide it.
+- Upstream error-body sanitization goes in each provider, in its own PR,
+  not in the core. Until then error bodies pass through as-is.
+- Review fixes: base URL errors name at most the scheme and hostname, and
+  never wrap url.Parse's error, which repeats the URL. Upstream keys with
+  edge whitespace or control characters stop startup. Only base URL
+  errors are blamed on the base URL variable; other provider errors read
+  "upstream <name>: ...".
 
 ### Learned
 - "OpenAI-compatible" covers most local model servers (Ollama, vLLM), so
@@ -45,9 +53,16 @@ Newest entries first. Short: what was done, what was decided, what's next.
   which suits a local Ollama but not one in another container.
 - Azure OpenAI, Bedrock and Vertex differ in auth, not just in base URL, so
   they need providers of their own.
+- A load test that returns only 200s does not prove which route it hit.
+  Count the gateway's log lines by provider, as was done for
+  BENCH_API=openai.
+- A 2 s bench right after the container is recreated shed about 8% at
+  1000 req/s with 503 at admit, during a machine stall (one Redis call
+  took 7.4 ms against a 249 us median). Use 5 s or more for smoke runs.
 
 ### Next
 - Named upstreams, so OpenAI and a local server can be served side by side.
+- Upstream error-body sanitization, one provider per PR.
 - A 401 message that doesn't say x-api-key on the OpenAI route. It comes
   from RequireKey, so it means a change in internal/proxy.
 - Per-key concurrency cap.

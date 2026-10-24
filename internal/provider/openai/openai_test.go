@@ -33,7 +33,7 @@ func TestNew_ValidatesBaseURL(t *testing.T) {
 		}
 	}
 	_, err := New(Config{BaseURL: "http://api.openai.com/v1"})
-	want := `openai: base URL "http://api.openai.com/v1" must use https (http is allowed only for loopback hosts)`
+	want := `openai: base URL for http://api.openai.com must use https (http is allowed only for loopback hosts)`
 	if err == nil || err.Error() != want {
 		t.Errorf("New(plain http) = %v, want %q", err, want)
 	}
@@ -134,7 +134,7 @@ func TestNew_TLSFloor(t *testing.T) {
 
 func TestAllowResponseHeader(t *testing.T) {
 	allowed := []string{
-		"Content-Type", "content-type", "Retry-After",
+		"Content-Type", "content-type", "Retry-After", "Retry-After-Ms", "retry-after-ms",
 		"x-ratelimit-limit-requests", "X-Ratelimit-Remaining-Tokens", "X-RateLimit-Reset-Requests",
 	}
 	for _, h := range allowed {
@@ -158,6 +158,7 @@ func TestForward_Response(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id", "req_up_1")
 		w.Header().Set("Retry-After", "3")
+		w.Header().Set("Retry-After-Ms", "2500")
 		w.Header().Set("X-Ratelimit-Remaining-Requests", "0")
 		w.Header().Set("Openai-Organization", "org-secret")
 		w.Header().Set("Openai-Project", "proj-secret")
@@ -186,6 +187,7 @@ func TestForward_Response(t *testing.T) {
 	want := http.Header{
 		"Content-Type":                   {"application/json"},
 		"Retry-After":                    {"3"},
+		"Retry-After-Ms":                 {"2500"},
 		"X-Ratelimit-Remaining-Requests": {"0"},
 	}
 	if len(resp.Header) != len(want) {

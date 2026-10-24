@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/shahardalva/sentinel/internal/devcert"
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
+	"github.com/shahardalva/sentinel/internal/provider/upstream"
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
 
@@ -289,6 +291,11 @@ func TestLogCAs(t *testing.T) {
 			[]string{"default OpenAI API"},
 		},
 		{
+			"CA, default hosts with a trailing dot", ca,
+			map[string]string{"SENTINEL_UPSTREAMS": "anthropic,openai", "ANTHROPIC_BASE_URL": "https://api.anthropic.com.", "OPENAI_BASE_URL": "https://api.openai.com./v1"},
+			[]string{"default Anthropic API", "default OpenAI API"},
+		},
+		{
 			"CA, openai-compatible elsewhere", ca,
 			map[string]string{"SENTINEL_UPSTREAMS": "openai", "OPENAI_BASE_URL": "https://localhost:9090/v1"}, nil,
 		},
@@ -505,6 +512,83 @@ func TestLoadConfig_UpstreamErrorText(t *testing.T) {
 		if err == nil || err.Error() != tt.want {
 			t.Errorf("SENTINEL_UPSTREAMS=%q: err = %v, want %q", tt.upstreams, err, tt.want)
 		}
+	}
+}
+
+// TestLoadConfig_BaseURLSecretsNotEchoed checks that a rejected base URL's
+// userinfo or query, which may hold a key, stays out of the startup error.
+func TestLoadConfig_BaseURLSecretsNotEchoed(t *testing.T) {
+	tests := []struct{ urlVar, url, want string }{
+		{"OPENAI_BASE_URL", "https://user:secret@api.openai.com/v1", "OPENAI_BASE_URL: openai: base URL for https://api.openai.com must not contain credentials"},
+		{"OPENAI_BASE_URL", "https://api.openai.com/v1?api-key=sk-secret-123", "OPENAI_BASE_URL: openai: base URL for https://api.openai.com must not contain a query"},
+		{"OPENAI_BASE_URL", "https://user:secret@api.openai.com:port/v1", "OPENAI_BASE_URL: openai: base URL is not a valid URL"},
+		{"ANTHROPIC_BASE_URL", "https://user:secret@api.anthropic.com", "ANTHROPIC_BASE_URL: anthropic: base URL for https://api.anthropic.com must not contain credentials"},
+		{"ANTHROPIC_BASE_URL", "https://api.anthropic.com/?api-key=sk-secret-123", "ANTHROPIC_BASE_URL: anthropic: base URL for https://api.anthropic.com must not contain a query"},
+	}
+	for _, tt := range tests {
+		_, err := loadConfig(env(map[string]string{
+			"SENTINEL_UPSTREAMS": "anthropic,openai",
+			"ANTHROPIC_API_KEY":  "sk",
+			"OPENAI_API_KEY":     "sk-o",
+			"SENTINEL_API_KEYS":  "k1",
+			tt.urlVar:            tt.url,
+		}))
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("%s=%q: err = %v, want %q", tt.urlVar, tt.url, err, tt.want)
+		}
+		if err != nil && (strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "sk-secret-123")) {
+			t.Errorf("%s=%q: error %q repeats a secret", tt.urlVar, tt.url, err)
+		}
+	}
+}
+
+func TestLoadConfig_RejectsMalformedUpstreamKeys(t *testing.T) {
+	for _, keyVar := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
+		for key, problem := range map[string]string{
+			" ":             "has leading or trailing whitespace",
+			"key-secret ":   "has leading or trailing whitespace",
+			" key-secret":   "has leading or trailing whitespace",
+			"key-secret\r":  "has leading or trailing whitespace",
+			"key\x00secret": "contains a control character",
+			"key\x7fsecret": "contains a control character",
+		} {
+			vars := map[string]string{
+				"SENTINEL_UPSTREAMS": "anthropic,openai",
+				"ANTHROPIC_API_KEY":  "sk",
+				"OPENAI_API_KEY":     "sk-o",
+				"SENTINEL_API_KEYS":  "k1",
+			}
+			vars[keyVar] = key
+			_, err := loadConfig(env(vars))
+			name := strings.ToLower(strings.TrimSuffix(keyVar, "_API_KEY"))
+			want := keyVar + " " + problem + "; it is required while SENTINEL_UPSTREAMS lists " + name
+			if err == nil || err.Error() != want {
+				t.Errorf("%s=%q: err = %v, want %q", keyVar, key, err, want)
+			}
+			if err != nil && strings.Contains(err.Error(), "secret") {
+				t.Errorf("%s=%q: error %q repeats the key", keyVar, key, err)
+			}
+		}
+	}
+	// A tab inside a key is a legal header character.
+	if _, err := loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "a\tb", "SENTINEL_API_KEYS": "k1"})); err != nil {
+		t.Errorf("key with an inner tab: %v", err)
+	}
+}
+
+// TestProviderError checks the attribution of provider construction errors.
+// Driving a non-URL failure through loadConfig would mean faking the system
+// trust store, so this tests the attribution on its own.
+func TestProviderError(t *testing.T) {
+	spec := &upstreamSpecs[1] // openai
+	urlErr := fmt.Errorf("openai: %w", upstream.ValidateBaseURL("http://api.openai.com/v1"))
+	if got, want := providerError(spec, urlErr).Error(),
+		"OPENAI_BASE_URL: openai: base URL for http://api.openai.com must use https (http is allowed only for loopback hosts)"; got != want {
+		t.Errorf("base URL error = %q, want %q", got, want)
+	}
+	other := fmt.Errorf("openai: %w", errors.New("load system trust store: no roots"))
+	if got, want := providerError(spec, other).Error(), "upstream openai: openai: load system trust store: no roots"; got != want {
+		t.Errorf("other error = %q, want %q", got, want)
 	}
 }
 

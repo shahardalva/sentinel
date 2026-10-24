@@ -22,6 +22,7 @@ import (
 
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/provider/openai"
+	"github.com/shahardalva/sentinel/internal/provider/upstream"
 	"github.com/shahardalva/sentinel/internal/proxy"
 	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
@@ -114,8 +115,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("SENTINEL_UPSTREAMS: %w", err)
 	}
 	for _, s := range specs {
-		if getenv(s.keyVar) == "" {
-			return config{}, fmt.Errorf("%s is not set; it is required while SENTINEL_UPSTREAMS lists %s", s.keyVar, s.name)
+		if err := checkUpstreamKey(getenv(s.keyVar)); err != nil {
+			return config{}, fmt.Errorf("%s %w; it is required while SENTINEL_UPSTREAMS lists %s", s.keyVar, err, s.name)
 		}
 	}
 	var ignored []*upstreamSpec
@@ -151,7 +152,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		baseURL := getenv(s.baseURLVar)
 		p, err := s.newFunc(getenv(s.keyVar), baseURL, maxConcurrent, extraCAs)
 		if err != nil {
-			return config{}, fmt.Errorf("%s: %w", s.baseURLVar, err)
+			return config{}, providerError(s, err)
 		}
 		if baseURL == "" {
 			baseURL = s.defaultURL
@@ -270,6 +271,32 @@ func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux 
 		mux.Handle(u.spec.route, proxy.RequireKey(cfg.clientKeys, u.provider, logger, h))
 	}
 	return mux
+}
+
+// checkUpstreamKey rejects an upstream key that is empty, has leading or
+// trailing whitespace, or holds a control character, which the HTTP client
+// would refuse to send, so every request would fail as a 502. The error
+// completes "<VAR> ..." and never includes the key.
+func checkUpstreamKey(key string) error {
+	switch {
+	case key == "":
+		return errors.New("is not set")
+	case strings.TrimSpace(key) != key:
+		return errors.New("has leading or trailing whitespace")
+	case upstream.HasControlChar(key):
+		return errors.New("contains a control character")
+	}
+	return nil
+}
+
+// providerError attributes an error from s.newFunc: a rejected base URL to
+// s's base URL variable, anything else (the trust store, the client) to the
+// upstream itself.
+func providerError(s *upstreamSpec, err error) error {
+	if _, ok := errors.AsType[*upstream.BaseURLError](err); ok {
+		return fmt.Errorf("%s: %w", s.baseURLVar, err)
+	}
+	return fmt.Errorf("upstream %s: %w", s.name, err)
 }
 
 // parseUpstreams reads SENTINEL_UPSTREAMS, a comma-separated list of
@@ -442,12 +469,13 @@ func logCAs(logger *slog.Logger, file string, cas []*x509.Certificate, upstreams
 }
 
 // onDefaultHost reports whether u talks to its public default host, such
-// as api.anthropic.com, whatever the path.
+// as api.anthropic.com, whatever the path. A trailing dot (the fully
+// qualified form, api.anthropic.com.) names the same host.
 func onDefaultHost(u enabledUpstream) bool {
 	got, err := url.Parse(u.baseURL)
 	if err != nil {
 		return false
 	}
 	def, err := url.Parse(u.spec.defaultURL)
-	return err == nil && strings.EqualFold(got.Hostname(), def.Hostname())
+	return err == nil && strings.EqualFold(strings.TrimSuffix(got.Hostname(), "."), def.Hostname())
 }

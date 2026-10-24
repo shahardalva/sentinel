@@ -36,7 +36,7 @@ tool policies, and writes an audit log.
   make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
   the mock for both upstreams with dummy upstream keys; it refuses to run
   unless that container has both ANTHROPIC_BASE_URL=https://mockupstream:9090
-  and OPENAI_BASE_URL=https://mockupstream:9090/v1. API ("anthropic" or
+  and OPENAI_BASE_URL=https://mockupstream:9090/v1. BENCH_API ("anthropic" or
   "openai"), DURATION_S and STREAM pass through.
 - Compose without make: docker compose up (real), or add
   -f docker-compose.yml -f docker-compose.mock.yml --profile mock (mock).
@@ -52,7 +52,9 @@ tool policies, and writes an audit log.
   upstream key. Clients never see it.
 - OPENAI_API_KEY (required when openai is listed): the gateway's own key for
   the OpenAI-compatible upstream. A key set for an unlisted upstream is not
-  used, and a WARN at startup says so.
+  used, and a WARN at startup says so. An enabled upstream's key with
+  leading or trailing whitespace or a control character stops startup; the
+  error names the variable, never the key.
 - SENTINEL_API_KEYS (required): comma-separated client keys. The gateway
   refuses to start without at least one. Clients send a key as `x-api-key`
   or `Authorization: Bearer <key>`; anything else gets a 401.
@@ -60,7 +62,9 @@ tool policies, and writes an audit log.
   (loopback only). Set it explicitly to expose the gateway on a network.
 - ANTHROPIC_BASE_URL (optional): upstream override, default https://api.anthropic.com.
   Must be https (plain http only for a loopback host); the gateway refuses
-  to start otherwise.
+  to start otherwise. Base URL errors name at most the scheme and hostname,
+  never the URL, which may hold a key. Other provider construction errors
+  read "upstream <name>: ...".
 - OPENAI_BASE_URL (optional): OpenAI-compatible upstream, default
   https://api.openai.com/v1. It includes /v1, like the OpenAI SDKs' own
   variable; the provider appends /chat/completions. Same https rule. For

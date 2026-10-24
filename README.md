@@ -431,6 +431,9 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - One OpenAI-compatible upstream at a time: `OPENAI_BASE_URL` names a single server, so OpenAI and Ollama can't be served side by side until named upstreams land.
 - The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
 - Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.
+- Upstream error bodies are passed through as-is, so they may name the gateway's upstream account (its organization or project IDs), even though those response headers are dropped. Tracked as an issue.
+- Request body fields that choose billing or retention, such as OpenAI's `service_tier` and `store`, reach the upstream unchanged until the policy stage lands.
+- `X-Ratelimit-*` response headers show the shared upstream account's quota, not the client's own, until per-key limits exist.
 - Tools whose vendor routes model traffic through its own servers (Cursor, for example) can't be pointed at a gateway on loopback, and only the parts of a tool that honor a custom base URL pass through the gateway at all.
 - Rate limits are per request, not per token, and every key gets the same limit. Without `SENTINEL_REDIS_URL` there is no limit, and one valid key can use the whole concurrency budget.
 - `anthropic-beta` values are forwarded without an allowlist. Restricting beta features belongs to the planned policy stage.

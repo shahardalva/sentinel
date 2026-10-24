@@ -43,14 +43,14 @@ down: ## Stop and remove all compose services
 logs: ## Follow logs from all running services
 	$(COMPOSE_MOCK) logs -f
 
-bench: ## Load test mockupstream directly with k6 (after make up); API, DURATION_S and STREAM pass through
+bench: ## Load test mockupstream directly with k6 (after make up); BENCH_API, DURATION_S and STREAM pass through
 	$(COMPOSE_MOCK) run --rm --no-deps -e TARGET_URL=$(MOCK_URL) k6
 
 # Runs against gateway-bench, which always points at the mock and has no
 # real upstream key, never the gateway from make up-real. The check refuses
 # to start k6 unless both of the running gateway-bench container's upstreams
 # are the mock, in case an override file changed one.
-bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; API, DURATION_S and STREAM pass through
+bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; BENCH_API, DURATION_S and STREAM pass through
 	$(COMPOSE_BENCH) up -d --build --force-recreate --always-recreate-deps gateway-bench
 	@id="$$($(COMPOSE_BENCH) ps -q gateway-bench)"; \
 	if [ -z "$$id" ]; then echo "bench-gateway: gateway-bench is not running" >&2; exit 1; fi; \

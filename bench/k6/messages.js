@@ -4,7 +4,7 @@
 // or at the gateway; see bench/README.md.
 //
 //   TARGET_URL   base URL, default http://127.0.0.1:9090
-//   API          "anthropic" (default): POST /v1/messages with the key as
+//   BENCH_API    "anthropic" (default): POST /v1/messages with the key as
 //                x-api-key; "openai": POST /v1/chat/completions with the key
 //                as Authorization: Bearer
 //   API_KEY      the key, default "bench"
@@ -14,7 +14,7 @@ import http from 'k6/http';
 import { check } from 'k6';
 
 const TARGET_URL = (__ENV.TARGET_URL || 'http://127.0.0.1:9090').replace(/\/+$/, '');
-const API = __ENV.API || 'anthropic';
+const BENCH_API = __ENV.BENCH_API || 'anthropic';
 const API_KEY = __ENV.API_KEY || 'bench';
 const STREAM = __ENV.STREAM === '1';
 
@@ -89,9 +89,9 @@ const protocols = {
   },
 };
 
-const protocol = protocols[API];
+const protocol = protocols[BENCH_API];
 if (!protocol) {
-  throw new Error(`API must be "anthropic" or "openai", not "${API}"`);
+  throw new Error(`BENCH_API must be "anthropic" or "openai", not "${BENCH_API}"`);
 }
 const url = `${TARGET_URL}${protocol.path}`;
 const body = JSON.stringify(protocol.body);
