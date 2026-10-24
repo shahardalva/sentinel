@@ -79,7 +79,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 **Engineering**
 - One third-party dependency, `go-redis`, for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)). Everything else is the standard library.
 - Provider-agnostic core. The handler knows nothing about Anthropic; provider-specific behavior lives behind a `Provider` interface.
-- 98 test functions covering the behavior above, passing under the race detector. Rate-limit tests run against an in-process Redis (`miniredis`), so CI needs no Redis server.
+- Tests cover the behavior above and pass under the race detector. Rate-limit tests run against an in-process Redis (`miniredis`), so CI needs no Redis server.
 
 ## Quick start
 

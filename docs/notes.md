@@ -25,8 +25,12 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - One cap for the whole gateway, not one per route. A cap per route would
   multiply the memory bound in ADR 0001 by the number of routes.
 - The core owns error meaning, the protocol owns error shape. An OpenAI
-  client can't parse Anthropic's error body, and the 401 from RequireKey
-  is the first thing a misconfigured client sees.
+  SDK reads error.message from Anthropic's shape, but the type values are
+  wrong, and other clients may not parse it at all. The 401 from
+  RequireKey is the first thing a misconfigured client sees.
+- Programmer errors panic, like http.Handle with a nil handler: a nil
+  formatter or a zero-value Admission at construction, an unmatched
+  Release when it is called.
 - Shared upstream code takes MaxIdleConns from the caller rather than
   importing proxy for the default, so any protocol can use it.
 
@@ -37,7 +41,7 @@ Newest entries first. Short: what was done, what was decided, what's next.
 
 ### Next
 - OpenAI-compatible provider on these seams.
-- Named upstreams, each with its own base URL, key and CA file.
+- Named upstreams, each with its own base URL and key.
 - Per-key concurrency cap, so one key can't take every upstream slot.
 
 ## 2026-10-23

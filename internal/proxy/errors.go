@@ -7,16 +7,17 @@ import (
 
 // ErrorKind is the protocol-independent meaning of an error the gateway
 // itself answers with. An ErrorFormatter turns it into a protocol's shape.
+// The zero value is no kind, so a kind left unset can't pass for one.
 type ErrorKind int
 
 const (
-	ErrInvalidRequest  ErrorKind = iota // the request is malformed or unacceptable
-	ErrAuthentication                   // the client's key is missing or wrong
-	ErrRateLimit                        // the client is over its rate limit
-	ErrRequestTooLarge                  // the request body is over the size limit
-	ErrTimeout                          // the client or the upstream took too long
-	ErrOverloaded                       // the gateway is at its concurrency cap
-	ErrAPI                              // an upstream or internal failure
+	ErrInvalidRequest  ErrorKind = iota + 1 // the request is malformed or unacceptable
+	ErrAuthentication                       // the client's key is missing or wrong
+	ErrRateLimit                            // the client is over its rate limit
+	ErrRequestTooLarge                      // the request body is over the size limit
+	ErrTimeout                              // the client or the upstream took too long
+	ErrOverloaded                           // the gateway is at its concurrency cap
+	ErrAPI                                  // an upstream or internal failure
 )
 
 // ErrorFormatter renders the gateway's own error responses in a protocol's
@@ -24,7 +25,8 @@ const (
 // an error body itself.
 type ErrorFormatter interface {
 	// FormatError returns the Content-Type and body of an error response.
-	// message is safe to show the client.
+	// contentType must not be empty: net/http would send the header empty
+	// rather than fill it in. message is safe to show the client.
 	FormatError(status int, kind ErrorKind, message string) (contentType string, body []byte)
 }
 

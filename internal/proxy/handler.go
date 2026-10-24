@@ -137,8 +137,9 @@ type Options struct {
 	// a 503. A request takes its slot only once its body is fully read.
 	// Ignored when Admission is set.
 	MaxConcurrent int
-	// Admission, if set, is the cap shared with other Handlers. If nil, the
-	// Handler gets its own, of MaxConcurrent slots.
+	// Admission, if set, is the cap shared with other Handlers; it must come
+	// from NewAdmission. If nil, the Handler gets its own, of MaxConcurrent
+	// slots.
 	Admission *Admission
 	// RateLimiter, if set, is asked before the body is read whether the
 	// authenticated client may make this request. Requests that did not pass
@@ -166,7 +167,13 @@ type Handler struct {
 	skippedLimiterWarn atomic.Int64
 }
 
+// NewHandler returns a Handler forwarding to p. It panics if opts.Admission
+// was not built by NewAdmission, since a zero-value Admission would shed
+// every request.
 func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
+	if opts.Admission != nil && opts.Admission.slots == nil {
+		panic("proxy: Options.Admission must be created with NewAdmission")
+	}
 	if opts.HeaderTimeout <= 0 {
 		opts.HeaderTimeout = DefaultHeaderTimeout
 	}

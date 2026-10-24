@@ -131,6 +131,11 @@ func TestGateway_ErrorResponsesOnTheWire(t *testing.T) {
 			req:      authed + "Anthropic-Version: latest\r\n" + body,
 			want:     keepAlive("400 Bad Request", "invalid_request_error", "anthropic-version must be a date in YYYY-MM-DD form"),
 		},
+		// No case for an anthropic-beta value with a control character:
+		// net/http's server answers its own 400 before the gateway sees the
+		// request, so a case here would pin net/http's response, not ours.
+		// TestGateway_InvalidAnthropicBetaBytes pins the gateway's bytes
+		// through a ResponseRecorder instead.
 		{
 			name:     "400 unreadable body",
 			upstream: unusedUpstream,
@@ -186,7 +191,7 @@ func TestGateway_ErrorResponsesOnTheWire(t *testing.T) {
 		{
 			name:     "503 overloaded",
 			upstream: held.URL,
-			opts:     proxy.Options{MaxConcurrent: 1},
+			opts:     proxy.Options{Admission: proxy.NewAdmission(1)}, // shared, as in cmd/gateway
 			hold:     true,
 			req:      authed + body,
 			want:     closing("503 Service Unavailable", "1", "overloaded_error", "gateway is at capacity"),

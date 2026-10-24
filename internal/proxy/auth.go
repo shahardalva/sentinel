@@ -21,8 +21,12 @@ var authReadTimeout = 5 * time.Second
 // token. With no non-empty keys every request is rejected. The credential
 // headers are removed before next runs, so later stages never see them.
 // They see only a SHA-256 digest of the key, as the client's identity for
-// rate limiting. A rejection is rendered by errs, the route's protocol.
+// rate limiting. A rejection is rendered by errs, the route's protocol;
+// RequireKey panics if errs is nil, like http.Handle with a nil handler.
 func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next http.Handler) http.Handler {
+	if errs == nil {
+		panic("proxy: RequireKey needs a non-nil ErrorFormatter")
+	}
 	// Compare SHA-256 digests so every comparison is over the same length and
 	// timing reveals nothing about a key's length or contents.
 	var digests [][sha256.Size]byte

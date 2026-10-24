@@ -3,6 +3,7 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"io"
@@ -124,6 +125,18 @@ func TestForward_WrapsErrors(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("errors.Is(err, context.Canceled) = false; wrapping must keep the cause: %v", err)
+	}
+}
+
+// The full TLS setup is tested in package upstream; this checks New's
+// default client gets it.
+func TestNew_TLSFloor(t *testing.T) {
+	tr, ok := mustNew(t, Config{}).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("default client has no *http.Transport")
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Errorf("TLSClientConfig = %+v, want MinVersion >= TLS 1.2", tr.TLSClientConfig)
 	}
 }
 
@@ -305,6 +318,7 @@ func TestFormatError(t *testing.T) {
 		{proxy.ErrTimeout, "timeout_error"},
 		{proxy.ErrOverloaded, "overloaded_error"},
 		{proxy.ErrAPI, "api_error"},
+		{proxy.ErrorKind(0), "api_error"},  // zero value: no kind set
 		{proxy.ErrorKind(-1), "api_error"}, // unknown
 	}
 	for _, tt := range tests {

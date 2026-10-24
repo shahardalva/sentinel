@@ -851,6 +851,46 @@ func TestGateway_InvalidAnthropicVersion(t *testing.T) {
 	}
 }
 
+// TestGateway_InvalidAnthropicBetaBytes pins the exact response to an
+// anthropic-beta value with a control character. net/http's server rejects
+// such a header before any handler runs, so this goes through a
+// ResponseRecorder rather than TestGateway_ErrorResponsesOnTheWire; the check
+// guards other servers and transports in front of the handler.
+func TestGateway_InvalidAnthropicBetaBytes(t *testing.T) {
+	var called atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+	}))
+	defer upstream.Close()
+
+	gw, _ := newGateway(t, upstream.URL, proxy.Options{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("X-Api-Key", gatewayKey)
+	req.Header["Anthropic-Beta"] = []string{"ok-beta", "a\r\nX-Injected: 1"}
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if id := rec.Header().Get("X-Request-Id"); id == "" {
+		t.Error("missing X-Request-Id")
+	}
+	h := rec.Header().Clone()
+	h.Del("X-Request-Id")
+	want := http.Header{"Content-Type": {"application/json"}}
+	if fmt.Sprint(h) != fmt.Sprint(want) {
+		t.Errorf("headers = %v, want %v plus X-Request-Id", h, want)
+	}
+	const wantBody = `{"error":{"message":"anthropic-beta contains invalid characters","type":"invalid_request_error"},"type":"error"}` + "\n"
+	if got := rec.Body.String(); got != wantBody {
+		t.Errorf("body = %q, want %q", got, wantBody)
+	}
+	if called.Load() {
+		t.Error("upstream called for an invalid beta")
+	}
+}
+
 func TestHandler_TruncatesLoggedModel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer upstream.Close()
