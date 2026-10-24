@@ -295,9 +295,9 @@ func TestForward_RejectsInvalidBeta(t *testing.T) {
 // the gateway's startup error.
 func TestNew_ErrorText(t *testing.T) {
 	tests := []struct{ url, want string }{
-		{"https://user:pass@api.anthropic.com", `anthropic: base URL "https://user:pass@api.anthropic.com" must be scheme://host[/path] with no credentials, query, or fragment`},
-		{"http://api.anthropic.com", `anthropic: base URL "http://api.anthropic.com" must use https (http is allowed only for loopback hosts)`},
-		{"https://api.anthropic.com/\x7f", `anthropic: base URL: parse "https://api.anthropic.com/\x7f": net/url: invalid control character in URL`},
+		{"https://user:pass@api.anthropic.com", `anthropic: base URL for https://api.anthropic.com must not contain credentials`},
+		{"http://api.anthropic.com", `anthropic: base URL for http://api.anthropic.com must use https (http is allowed only for loopback hosts)`},
+		{"https://api.anthropic.com/\x7f", `anthropic: base URL is not a valid URL`},
 	}
 	for _, tt := range tests {
 		if _, err := New(Config{BaseURL: tt.url}); err == nil || err.Error() != tt.want {

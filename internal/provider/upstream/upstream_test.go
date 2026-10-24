@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,41 @@ func TestValidateBaseURL(t *testing.T) {
 	for _, u := range invalid {
 		if err := ValidateBaseURL(u); err == nil {
 			t.Errorf("ValidateBaseURL(%q) = ok, want error", u)
+		}
+	}
+}
+
+// TestValidateBaseURL_NoSecretsInErrors checks that errors name at most the
+// scheme and hostname: a base URL may carry a key in its userinfo, path or
+// query, and the error reaches the startup log.
+func TestValidateBaseURL_NoSecretsInErrors(t *testing.T) {
+	tests := []struct{ url, want string }{
+		{"https://user:secret@api.openai.com/v1", "base URL for https://api.openai.com must not contain credentials"},
+		{"https://sk-secret@api.openai.com/v1", "base URL for https://api.openai.com must not contain credentials"},
+		{"https://api.openai.com/v1?api-key=sk-secret", "base URL for https://api.openai.com must not contain a query"},
+		{"https://api.openai.com/v1#sk-secret", "base URL for https://api.openai.com must not contain a fragment"},
+		{"http://api.openai.com/key/sk-secret", "base URL for http://api.openai.com must use https (http is allowed only for loopback hosts)"},
+		{"/v1/sk-secret", "base URL must be scheme://host[/path]"},
+		// url.Parse fails; its *url.Error would repeat the whole URL.
+		{"https://user:secret@api.openai.com/\x7f", "base URL is not a valid URL"},
+		{"https://user:secret@api.openai.com:port/v1", "base URL is not a valid URL"},
+		{"https://api.openai.com/v1?api-key=sk-secret%zz", "base URL for https://api.openai.com must not contain a query"},
+		{"https://us%zzer:secret@api.openai.com/v1", "base URL is not a valid URL"},
+	}
+	for _, tt := range tests {
+		err := ValidateBaseURL(tt.url)
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("ValidateBaseURL(%q) = %v, want %q", tt.url, err, tt.want)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Errorf("ValidateBaseURL(%q) error %q repeats a secret", tt.url, err)
+		}
+		if _, ok := errors.AsType[*BaseURLError](err); !ok {
+			t.Errorf("ValidateBaseURL(%q) error is %T, want *BaseURLError", tt.url, err)
+		}
+		if errors.Unwrap(err) != nil {
+			t.Errorf("ValidateBaseURL(%q) error wraps %v", tt.url, errors.Unwrap(err))
 		}
 	}
 }

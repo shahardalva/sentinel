@@ -2,7 +2,7 @@
 
 **A security gateway for LLM applications and AI agents.**
 
-Sentinel is a reverse proxy that sits between your application and an LLM provider. Clients point their existing SDK at Sentinel instead of the provider. Sentinel authenticates them, forwards the request with its own upstream credentials, relays the response (including streams) as it arrives, and records a structured log line with per-stage timings for every request.
+Sentinel is a reverse proxy that sits between your application and an LLM provider. It speaks the Anthropic Messages API and the OpenAI Chat Completions API, so it fronts Anthropic, OpenAI, and OpenAI-compatible servers such as Ollama. Clients point their existing SDK at Sentinel instead of the provider. Sentinel authenticates them, forwards the request with its own upstream credentials, relays the response (including streams) as it arrives, and records a structured log line with per-stage timings for every request.
 
 The goal is a single control point for LLM traffic: who is calling, what is being sent, and what an agent is allowed to do. Detection of prompt injection and sensitive data, policy enforcement, and an audit trail are being built on top of this core.
 
@@ -50,10 +50,16 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 ## What works today
 
+**Protocols**
+- Anthropic Messages API on `POST /v1/messages`, and the OpenAI Chat Completions API on `POST /v1/chat/completions`. `SENTINEL_UPSTREAMS` picks which are served; a route exists only for an enabled upstream.
+- The OpenAI side works with OpenAI itself or any server that speaks its protocol (`OPENAI_BASE_URL`), such as Ollama or vLLM.
+- Both routes share the client keys, the rate limiter and one concurrency cap. Each answers the gateway's own errors in its protocol's shape.
+
 **Security**
 - Per-client gateway keys, accepted as `x-api-key` or `Authorization: Bearer`. Keys are compared as SHA-256 digests in constant time.
 - The upstream provider key never leaves the gateway. Client credential headers are stripped before the request is forwarded.
-- Upstream response headers pass through an allowlist. Organization IDs, cookies and CDN headers are dropped.
+- On the OpenAI route no client header is forwarded at all. `OpenAI-Organization` and `OpenAI-Project` choose who is billed, so a client never gets to set them; `OpenAI-Beta` and the SDKs' `X-Stainless-*` headers are dropped too.
+- Upstream response headers pass through an allowlist. Organization and project IDs, cookies and CDN headers are dropped.
 - Per-key rate limiting in Redis: a token bucket per client key, answered with `429` and `Retry-After` before the body is read. Redis stores only a SHA-256 digest of each key.
 - Early rejections (401, 413, 415, 429, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
 - `anthropic-version` must be a real `YYYY-MM-DD` date. `anthropic-beta` values with control characters are rejected.
@@ -78,7 +84,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 **Engineering**
 - One third-party dependency, `go-redis`, for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)). Everything else is the standard library.
-- Provider-agnostic core. The handler knows nothing about Anthropic; provider-specific behavior lives behind a `Provider` interface.
+- Provider-agnostic core. The handler knows nothing about Anthropic or OpenAI; provider-specific behavior lives behind a `Provider` interface. Adding the OpenAI provider changed no file in the core.
 - Tests cover the behavior above and pass under the race detector. Rate-limit tests run against an in-process Redis (`miniredis`), so CI needs no Redis server.
 
 ## Quick start
@@ -86,7 +92,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 ### Requirements
 
 - Go 1.27 or later
-- An Anthropic API key (not needed for the mock upstream)
+- An Anthropic API key, an OpenAI API key, or a local OpenAI-compatible server such as Ollama (none needed for the mock upstream)
 - For the Docker setup: Docker with Compose v2.24 or later, and `make`
 
 ### Run with Docker Compose
@@ -101,9 +107,9 @@ make logs
 make down
 ```
 
-`.env.example` ships with empty keys. Choose your own client key for `SENTINEL_API_KEYS` (the gateway refuses to start without one), and set `ANTHROPIC_API_KEY` only if you will run `make up-real`. Clients then send that key as `x-api-key`.
+`.env.example` ships with empty keys. Choose your own client key for `SENTINEL_API_KEYS` (the gateway refuses to start without one), and set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` only if you will run `make up-real`. Clients then send that key as `x-api-key` or `Authorization: Bearer`.
 
-`make up` points the gateway at `https://mockupstream:9090` and trusts the dev CA from `./certs`. It first runs `make certs`, which writes the certificates (valid for 30 days) when they are missing or expire within 7 days, and recreates the containers so they load the current ones. It replaces `ANTHROPIC_API_KEY` with a dummy, so your real key never reaches the mock. `make up-real` starts the gateway against the real Anthropic API with the keys from `.env`.
+`make up` serves both protocols, with both upstreams pointed at the mock (`https://mockupstream:9090` and `https://mockupstream:9090/v1`), and trusts the dev CA from `./certs`. It first runs `make certs`, which writes the certificates (valid for 30 days) when they are missing or expire within 7 days, and recreates the containers so they load the current ones. It replaces `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` with dummies, so your real keys never reach the mock. `make up-real` starts the gateway against the real APIs with the keys from `.env`; it serves the upstreams in `SENTINEL_UPSTREAMS` from `.env`, Anthropic only by default.
 
 The images are built from the `Dockerfile` on a distroless base and run as a non-root user. Without `make`:
 
@@ -112,7 +118,7 @@ docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock u
 docker compose up -d --build                                                                  # real
 ```
 
-Run `make` to list the targets with a line on each. `make bench-gateway` load-tests a separate `gateway-bench` service that is fixed to the mock upstream and holds no real key, and refuses to run if that gateway's upstream is anything else, so a load test never reaches the real API.
+Run `make` to list the targets with a line on each. `make bench-gateway` load-tests a separate `gateway-bench` service that is fixed to the mock upstream and holds no real key, and refuses to run unless both of that gateway's upstreams are the mock, so a load test never reaches a real API.
 
 ### Run the gateway
 
@@ -172,23 +178,68 @@ message = client.messages.create(
 print(message.content[0].text)
 ```
 
+### Use it with the OpenAI SDK
+
+Start the gateway with the openai upstream enabled (alone, or next to Anthropic with `SENTINEL_UPSTREAMS=anthropic,openai`):
+
+```bash
+export SENTINEL_UPSTREAMS=openai
+export OPENAI_API_KEY="sk-..."                      # the gateway's upstream key
+export SENTINEL_API_KEYS="$(openssl rand -hex 32)"  # a client key you choose
+go run ./cmd/gateway
+```
+
+Then point the OpenAI SDK at the gateway. The base URL includes `/v1`, as the SDK expects:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="<your client key>")
+completion = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(completion.choices[0].message.content)
+```
+
+The SDK sends the client key as `Authorization: Bearer`. The gateway swaps it for its own `OPENAI_API_KEY`. `stream=True` works the same way.
+
+### Use a local model with Ollama
+
+Run the gateway on the host, next to Ollama, and point the openai upstream at Ollama's OpenAI-compatible API. Plain `http` is allowed because the host is loopback. Ollama ignores the upstream key, but the gateway requires one:
+
+```bash
+SENTINEL_UPSTREAMS=openai \
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
+OPENAI_API_KEY=ollama \
+SENTINEL_API_KEYS="$(openssl rand -hex 32)" \
+go run ./cmd/gateway
+```
+
+Clients then use the OpenAI SDK as above, with a model Ollama has pulled, such as `model="llama3.2"`. Inside the compose stack the gateway can't reach the host's loopback, and plain `http` is refused for any other host, so this recipe is for a gateway on the host.
+
 ## Configuration
 
 All configuration comes from environment variables. Secrets are never read from files in the repository.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | Yes | | The gateway's own key for the Anthropic API. Clients never see it. |
-| `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys. The gateway refuses to start without at least one. |
+| `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: `anthropic` (`POST /v1/messages`), `openai` (`POST /v1/chat/completions`), or both. An unknown name, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its base URL. |
+| `ANTHROPIC_API_KEY` | When `anthropic` is listed | | The gateway's own key for the Anthropic API. Clients never see it. |
+| `OPENAI_API_KEY` | When `openai` is listed | | The gateway's own key for the OpenAI-compatible API. Clients never see it. |
+| `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys, shared by every route. The gateway refuses to start without at least one. |
 | `SENTINEL_ADDR` | No | `127.0.0.1:8081` | Listen address. Loopback only by default. |
-| `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Upstream override. Must be `https`, except for a loopback host. |
-| `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
-| `SENTINEL_UPSTREAM_CA_FILE` | No | | PEM file of extra CA certificates to trust for the upstream connection, added to the system trust store. For a private or dev CA (see `cmd/devcerts`). Every PEM block must be a valid certificate; the gateway refuses to start if the file is missing, holds none, or holds anything else. The CAs are trusted for whatever host `ANTHROPIC_BASE_URL` names, including the default; the gateway logs a warning in that case, since anyone holding the CA's key could then impersonate the Anthropic API. Does not relax the `https` rule. |
+| `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Anthropic upstream override. Must be `https`, except for a loopback host. |
+| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-compatible upstream, including `/v1` as in the OpenAI SDKs' own variable; the gateway appends `/chat/completions`. Must be `https`, except for a loopback host. |
+| `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream, across all routes. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
+| `SENTINEL_UPSTREAM_CA_FILE` | No | | PEM file of extra CA certificates to trust for the upstream connections, added to the system trust store. For a private or dev CA (see `cmd/devcerts`). Applies to every enabled upstream. Every PEM block must be a valid certificate; the gateway refuses to start if the file is missing, holds none, or holds anything else. The CAs are trusted for whatever hosts the base URLs name, including the defaults; the gateway logs a warning for each enabled upstream left on its public default (`api.anthropic.com`, `api.openai.com`), since anyone holding the CA's key could then impersonate that API. Does not relax the `https` rule. |
 | `SENTINEL_REDIS_URL` | No | | Redis for per-key rate limiting, as `redis://[:password@]host:port/db` or `rediss://` for TLS. Unset turns rate limiting off, and the gateway logs that at startup. A malformed URL stops startup. An unreachable Redis at startup is only a warning. |
 | `SENTINEL_RATE_LIMIT_RPM` | No | `60` | Requests per minute per client key. Also the burst: a full bucket holds a minute's worth. Must be a positive integer. |
 | `SENTINEL_RATE_LIMIT_FAIL_MODE` | No | `open` | What happens when Redis can't answer within 50 ms. `open` lets the request through and logs a `WARN`, at most once per 10 seconds. `closed` answers `503`. After 5 failures in a row, a circuit breaker skips Redis for 5 seconds and applies the fail mode at once, then lets one request try Redis again. See [ADR 0002](docs/adr/0002-rate-limiting.md). |
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and a dummy `ANTHROPIC_API_KEY`. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
+An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
+
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored). Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` values. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves both protocols from the mock, and `make bench-gateway` refuses to run unless both of its base URLs are the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -220,24 +271,32 @@ The logged timings map to these stages: `rate_limit_us` for the Redis call, `rea
 
 ## Error responses
 
-Errors use the same JSON shape as the Anthropic API, so existing SDKs parse them unchanged:
+The shape of an error the gateway itself answers with follows the route's protocol, so each SDK parses it unchanged. On `/v1/messages` it is the Anthropic API's shape:
 
 ```json
 {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
 ```
 
-| Status | `error.type` | When |
-| --- | --- | --- |
-| 400 | `invalid_request_error` | Body can't be read, or a provider header is invalid |
-| 401 | `authentication_error` | Missing or unknown gateway key |
-| 408 | `timeout_error` | Request body not received in time |
-| 413 | `request_too_large` | Body larger than the limit, declared or actual |
-| 415 | `invalid_request_error` | Request has a `Content-Encoding` |
-| 429 | `rate_limit_error` | The client key is over its rate limit. `Retry-After` says when a token is back |
-| 502 | `api_error` | Provider unreachable, or it rejected the gateway's own credentials |
-| 503 | `overloaded_error` | Gateway at capacity. Includes `Retry-After` |
-| 503 | `api_error` | Redis unavailable with `SENTINEL_RATE_LIMIT_FAIL_MODE=closed`. Includes `Retry-After` |
-| 504 | `timeout_error` | Provider didn't respond in time |
+On `/v1/chat/completions` it is the OpenAI API's shape:
+
+```json
+{"error": {"message": "invalid x-api-key", "type": "invalid_request_error", "param": null, "code": "invalid_api_key"}}
+```
+
+| Status | Anthropic `error.type` | OpenAI `error.type` / `error.code` | When |
+| --- | --- | --- | --- |
+| 400 | `invalid_request_error` | `invalid_request_error` / `null` | Body can't be read, or a provider header is invalid |
+| 401 | `authentication_error` | `invalid_request_error` / `invalid_api_key` | Missing or unknown gateway key |
+| 408 | `timeout_error` | `timeout_error` / `null` | Request body not received in time |
+| 413 | `request_too_large` | `invalid_request_error` / `request_too_large` | Body larger than the limit, declared or actual |
+| 415 | `invalid_request_error` | `invalid_request_error` / `null` | Request has a `Content-Encoding` |
+| 429 | `rate_limit_error` | `requests` / `rate_limit_exceeded` | The client key is over its rate limit. `Retry-After` says when a token is back |
+| 502 | `api_error` | `server_error` / `null` | Provider unreachable, or it rejected the gateway's own credentials |
+| 503 | `overloaded_error` | `server_error` / `overloaded` | Gateway at capacity. Includes `Retry-After` |
+| 503 | `api_error` | `server_error` / `null` | Redis unavailable with `SENTINEL_RATE_LIMIT_FAIL_MODE=closed`. Includes `Retry-After` |
+| 504 | `timeout_error` | `timeout_error` / `null` | Provider didn't respond in time |
+
+OpenAI SDKs pick their exception class from the HTTP status (`RateLimitError` for a `429`, for example), so the OpenAI type and code strings are informative. They follow OpenAI's documented error shape, but not every value has been checked against OpenAI's live responses.
 
 A provider `401` or `403` is reported as `502 upstream authentication failed`, not passed through. Clients never authenticate to the provider, so passing it on would make a revoked gateway key look like a problem with the client's key.
 
@@ -288,7 +347,7 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 
 **Fail open on a Redis outage, by default.** If Redis can't answer within 50 ms, the request goes through and the gateway logs a warning. An outage then loses rate limiting rather than all traffic. `SENTINEL_RATE_LIMIT_FAIL_MODE=closed` reverses that choice.
 
-**A provider-agnostic core.** The handler talks to a `Provider` interface that returns a small `Response` struct. Header filtering, request IDs and version validation live in the Anthropic provider. Three seams keep the core free of any one protocol, so a second protocol or upstream adds code beside it rather than inside it:
+**A provider-agnostic core.** The handler talks to a `Provider` interface that returns a small `Response` struct. Header filtering, request IDs and version validation live in the providers. The OpenAI provider was added on these seams without changing a file in `internal/proxy`. Three seams keep the core free of any one protocol, so a second protocol or upstream adds code beside it rather than inside it:
 
 - **Shared admission.** The concurrency cap is a `proxy.Admission` created once in `cmd/gateway` and handed to every handler. Each new route or upstream draws on the same slots, so the memory bound in [ADR 0001](docs/adr/0001-concurrency-cap.md) stays one bound rather than one per route.
 - **Protocol-owned errors.** The core knows error kinds (invalid request, authentication, rate limit, too large, timeout, overloaded, upstream failure), not error shapes. Every error the gateway itself answers with, including the `401` from `RequireKey`, is rendered by the route's `ErrorFormatter`, so clients of each protocol get errors their SDK can parse. The Anthropic provider maps the kinds to Anthropic's error types.
@@ -309,7 +368,7 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 ```
 sentinel/
 ├── cmd/gateway/              # entry point: config, server, graceful shutdown
-├── cmd/mockupstream/         # fake Messages API for load tests, http or https
+├── cmd/mockupstream/         # fake Messages and Chat Completions APIs for load tests, http or https
 ├── cmd/devcerts/             # writes a dev CA and server certificate to ./certs
 ├── internal/devcert/         # certificate generation used by devcerts and tests
 ├── internal/ratelimit/       # per-key rate limiting
@@ -322,6 +381,7 @@ sentinel/
 │   └── handler.go            #   rate limit, intake, admission, forwarding, stream relay, logging
 ├── internal/provider/
 │   ├── anthropic/            # Anthropic Messages API provider and its error shape
+│   ├── openai/               # OpenAI-compatible Chat Completions provider and its error shape
 │   └── upstream/             # shared upstream plumbing: base URL rule, TLS client, header checks
 ├── bench/                    # k6 load test and results
 ├── docs/
@@ -360,11 +420,21 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, and the circuit breaker opening, probing and closing
 - the upstream rejecting the gateway's key
 - response header filtering and `anthropic-version` validation
+- the OpenAI route end to end: only the gateway's bearer key and `Content-Type` reach the upstream, never a client's `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` or `X-Stainless-*`; streamed chunks and `data: [DONE]` arriving as sent; and the exact OpenAI-shaped bodies of the gateway's `401`, `429`, `502` and `503`
+- `SENTINEL_UPSTREAMS` parsing, a route existing only for an enabled upstream, and one shared concurrency cap: a request held on `/v1/messages` makes `/v1/chat/completions` answer `503`
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
 
 ## Known limitations
 
-- Only `POST /v1/messages` is proxied. Other Anthropic endpoints return `404`.
+- Only `POST /v1/messages` is proxied on the Anthropic side. Other Anthropic endpoints return `404`.
+- Only `POST /v1/chat/completions` is proxied on the OpenAI side. The Responses API, embeddings, models and other endpoints return `404`.
+- One OpenAI-compatible upstream at a time: `OPENAI_BASE_URL` names a single server, so OpenAI and Ollama can't be served side by side until named upstreams land.
+- The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
+- Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.
+- Upstream error bodies are passed through as-is, so they may name the gateway's upstream account (its organization or project IDs), even though those response headers are dropped. Tracked as an issue.
+- Request body fields that choose billing or retention, such as OpenAI's `service_tier` and `store`, reach the upstream unchanged until the policy stage lands.
+- `X-Ratelimit-*` response headers show the shared upstream account's quota, not the client's own, until per-key limits exist.
+- Tools whose vendor routes model traffic through its own servers (Cursor, for example) can't be pointed at a gateway on loopback, and only the parts of a tool that honor a custom base URL pass through the gateway at all.
 - Rate limits are per request, not per token, and every key gets the same limit. Without `SENTINEL_REDIS_URL` there is no limit, and one valid key can use the whole concurrency budget.
 - `anthropic-beta` values are forwarded without an allowlist. Restricting beta features belongs to the planned policy stage.
 - The logged `model` field is best effort: it comes from a separate JSON parse and is not authoritative.
@@ -384,7 +454,7 @@ Where the project is heading. Not yet built; the diagram at the top of this READ
 | Phase | Scope |
 | --- | --- |
 | **1. Core proxy** | Anthropic provider, auth, streaming, timeouts, resource limits, structured logging. **Done.** |
-| **2. Platform** | Docker Compose with Postgres and Redis, CI, per-key rate limits, OpenAI provider, k6 load tests with published p50/p99 overhead |
+| **2. Platform** | Docker Compose with Postgres and Redis, CI, per-key rate limits, OpenAI provider (**done**: OpenAI-compatible Chat Completions), k6 load tests with published p50/p99 overhead |
 | **3. Detection** | Secret detection in the gateway, a Python detector service over gRPC for PII and prompt injection, a public evaluation set with precision and recall |
 | **4. Agents** | MCP proxy with tool pinning, tool allowlists and scopes per tenant |
 | **5. Audit pipeline** | Kafka event stream, workers for LLM-as-judge and alerts, ClickHouse audit log with a hash chain, dashboard |
