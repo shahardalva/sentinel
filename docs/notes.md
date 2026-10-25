@@ -2,6 +2,55 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-25: provider hardening
+
+### Done
+- Provider contract (#5): a nil error from Forward means a non-nil
+  Response with a non-nil Body and a status from 200 to 599. The Handler
+  checks it and answers a breach with 502 "upstream unavailable", logged
+  with phase upstream, closing a Body it got. No panic.
+- RequestError.Status: zero means 400, other 4xx values are honored,
+  anything else becomes 400.
+- The Handler strips hop-by-hop response headers (and any header named in
+  Connection) itself, whatever the provider's allowlist lets through.
+- Upstream error bodies (#33): each provider reads a non-2xx body up to
+  64 KiB and re-encodes its own error shape with the message's account
+  identifiers redacted (org-..., proj_..., UUIDs); request IDs stay.
+  Anything else is replaced with the gateway's "upstream error" at the
+  same status. 2xx bodies are never read. Shared ReadErrorBody and
+  RedactAccountIDs in internal/provider/upstream.
+- upstream.NewClient no longer panics when http.DefaultTransport has been
+  replaced (from #6); it falls back to a fresh transport with Go's
+  documented defaults.
+
+### Decided
+- Sanitizing stays in the providers, not the core: only a provider knows
+  its error shape, and replacing every upstream error with a generic one
+  would hide messages developers need.
+- Re-encode rather than edit in place: unknown fields are dropped, so an
+  identifier in a field nobody looked at can't slip through. OpenAI's
+  param and code are kept, and a numeric code from a compatible server
+  too.
+- 401/403 bodies are sanitized as well, though the core replaces them;
+  the provider rule is simply "every non-2xx body".
+- A failed read of an error body (connection reset, timeout) is a Forward
+  error, so the client gets the core's 502 or 504, not a made-up body at
+  the upstream's status.
+- A RequestError can't become a 5xx: a provider rejecting the client's
+  request must not look like a gateway failure to SDK retry logic or to
+  the log level.
+
+### Learned
+- encoding/json escapes <, > and & by default, so a re-encoded message
+  like "max_tokens: 100000 > 64000" changed bytes; the re-encoder turns
+  that off.
+
+### Next
+- Sanitize error events inside an SSE stream after a 200 (documented as a
+  known limitation).
+- The other nits in #6: timer Stop races, flushing only for
+  text/event-stream, the query string, sampling the auth WARN.
+
 ## 2026-10-24: named upstreams
 
 ### Done

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // BaseURLError is a base URL that ValidateBaseURL rejected. Its message
@@ -82,7 +83,7 @@ func NewClient(cfg ClientConfig) (*http.Client, error) {
 	if cfg.MaxIdleConns <= 0 {
 		return nil, errors.New("MaxIdleConns must be positive")
 	}
-	t := http.DefaultTransport.(*http.Transport).Clone()
+	t := baseTransport()
 	// All traffic goes to one host. The default keeps only 2 idle
 	// connections per host, so under load most requests would pay for a
 	// fresh TLS handshake.
@@ -94,6 +95,28 @@ func NewClient(cfg ClientConfig) (*http.Client, error) {
 	}
 	t.TLSClientConfig = tlsCfg
 	return &http.Client{Transport: t, CheckRedirect: refuseRedirect}, nil
+}
+
+// baseTransport returns a copy of http.DefaultTransport to build on. Code
+// that replaces http.DefaultTransport with another RoundTripper (a tracing
+// wrapper, say) would make an unchecked assertion panic; then it returns a
+// fresh transport with the defaults Go documents for DefaultTransport.
+func baseTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // StripURL returns err, an error from http.Client.Do, without the request

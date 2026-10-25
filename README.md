@@ -60,7 +60,8 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 - The upstream provider key never leaves the gateway. Client credential headers are stripped before the request is forwarded.
 - The gateway never follows an upstream redirect. On a redirect to another host Go's HTTP client keeps every header except `Authorization`, so following one would hand the gateway's `x-api-key` to whatever host the upstream named. A redirect is answered with `502` and logged as `upstream redirect refused`.
 - On the OpenAI route no client header is forwarded at all. `OpenAI-Organization` and `OpenAI-Project` choose who is billed, so a client never gets to set them; `OpenAI-Beta` and the SDKs' `X-Stainless-*` headers are dropped too.
-- Upstream response headers pass through an allowlist. Organization and project IDs, cookies and CDN headers are dropped.
+- Upstream response headers pass through an allowlist. Organization and project IDs, cookies and CDN headers are dropped. Hop-by-hop headers are stripped again in the core, whatever a provider passes on.
+- Upstream error bodies pass through with account identifiers redacted (OpenAI organization and project IDs, and any UUID); one the provider can't parse is replaced. See [Error responses](#error-responses).
 - Per-key rate limiting in Redis: a token bucket per client key, answered with `429` and `Retry-After` before the body is read. Redis stores only a SHA-256 digest of each key.
 - Early rejections (400 for an unclean path, 401, 413, 415, 429, 503, 404/405) close the connection with a bounded read deadline, so a client can't hold a connection open by stalling mid-body.
 - `anthropic-version` must be a real `YYYY-MM-DD` date. `anthropic-beta` values with control characters are rejected.
@@ -361,7 +362,7 @@ On `/v1/chat/completions` it is the OpenAI API's shape:
 | 413 | `request_too_large` | `invalid_request_error` / `request_too_large` | Body larger than the limit, declared or actual |
 | 415 | `invalid_request_error` | `invalid_request_error` / `null` | Request has a `Content-Encoding` |
 | 429 | `rate_limit_error` | `requests` / `rate_limit_exceeded` | The client key is over its rate limit. `Retry-After` says when a token is back |
-| 502 | `api_error` | `server_error` / `null` | Provider unreachable, it rejected the gateway's own credentials, or it answered with a redirect |
+| 502 | `api_error` | `server_error` / `null` | Provider unreachable, it rejected the gateway's own credentials, it answered with a redirect, or the provider code broke its contract (no response, no body, or a status outside 200-599) |
 | 503 | `overloaded_error` | `server_error` / `overloaded` | Gateway at capacity. Includes `Retry-After` |
 | 503 | `api_error` | `server_error` / `null` | Redis unavailable with `SENTINEL_RATE_LIMIT_FAIL_MODE=closed`. Includes `Retry-After` |
 | 504 | `timeout_error` | `timeout_error` / `null` | Provider didn't respond in time |
@@ -369,6 +370,8 @@ On `/v1/chat/completions` it is the OpenAI API's shape:
 OpenAI SDKs pick their exception class from the HTTP status (`RateLimitError` for a `429`, for example), so the OpenAI type and code strings are informative. They follow OpenAI's documented error shape, but not every value has been checked against OpenAI's live responses.
 
 A provider `401` or `403` is reported as `502 upstream authentication failed`, not passed through. Clients never authenticate to the provider, so passing it on would make a revoked gateway key look like a problem with the client's key.
+
+Any other provider error keeps its status, its headers from the allowlist (`Retry-After` included) and its meaning, so a developer still sees messages such as an invalid `max_tokens`. The body is read up to 64 KiB and re-encoded in the protocol's error shape with the same error type (and, for OpenAI, `param` and `code`), its message with account identifiers redacted: OpenAI organization IDs become `org-[redacted]`, project IDs `proj_[redacted]`, and any UUID, which is how Anthropic names organizations, `[redacted]`. Request IDs (`req_...`) are kept, and fields other than these are dropped. A body that isn't the protocol's error shape (an HTML page from a load balancer, say), or is over 64 KiB, is replaced with the gateway's own error at the same status: `api_error` (Anthropic) or `server_error` (OpenAI), message `upstream error`. A successful body is never read or changed, so streams stay incremental.
 
 If the client disconnects, the upstream request is cancelled and the log records status `499`. A stream that fails after the `200` has been sent can't change its status; the failure is logged at `ERROR` with `phase: stream`.
 
@@ -435,7 +438,7 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 
 **Close the connection on early rejects.** Go's server drains up to 256 KiB of an unread body, with no deadline, before it sends a response. With no global read timeout, a client could send headers, stall, and never receive its `401`. Rejections set `Connection: close` and a short read deadline. A test reproduces the stall over a raw TCP connection.
 
-**Distinguish client errors from upstream errors.** A provider can reject a request with a `RequestError`, which becomes a `400`. Everything else from upstream is a `502` or `504`. The status code tells the client whose problem it is.
+**Distinguish client errors from upstream errors.** A provider can reject a request with a `RequestError`, which becomes a `400`, or another `4xx` it names; a status outside `400`-`499` still becomes `400`, so a provider can't turn a client error into a `5xx`. Failures reaching the upstream are a `502` or `504`. The status code tells the client whose problem it is.
 
 ## Project layout
 
@@ -496,6 +499,8 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, and the circuit breaker opening, probing and closing
 - the upstream rejecting the gateway's key
 - response header filtering and `anthropic-version` validation
+- a stub provider that breaks its contract (no response, no body, an invalid status) answered with `502`, its body closed; `RequestError` statuses outside `4xx` becoming `400`; and hop-by-hop headers, including ones named in `Connection`, stripped whatever the provider returns
+- upstream error bodies on both protocols: a `429` naming an organization, project and UUID comes out redacted with its type, code, status and `Retry-After` intact; an HTML `500`, an oversized body and other shapes are replaced; a useful `400` passes unchanged; a `2xx` stream is passed on as it arrives, byte for byte
 - the OpenAI route end to end: only the gateway's bearer key and `Content-Type` reach the upstream, never a client's `OpenAI-Organization`, `OpenAI-Project`, `OpenAI-Beta` or `X-Stainless-*`; streamed chunks and `data: [DONE]` arriving as sent; and the exact OpenAI-shaped bodies of the gateway's `401`, `429`, `502` and `503`
 - `SENTINEL_UPSTREAMS` parsing, a route existing only for an enabled upstream, and one shared concurrency cap: a request held on `/v1/messages` makes `/v1/chat/completions` answer `503`
 - named upstreams: the naming rule, missing or invalid protocol, base URL and key, `SENTINEL_UPSTREAM_OPENAI_*` rejected, unlisted upstreams warned about and not used, and no key or URL secret in any error or log line; two upstreams of one protocol, each on its own test server with its own key, where each prefix reaches only its server and neither key reaches the other; unprefixed routes only for the built-ins, `404` with `Connection: close` for an unknown prefix, and one concurrency cap across prefixes
@@ -512,7 +517,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - Upstreams are picked by path prefix only. There is no routing by model and no fallback between upstreams, and the rate limit is per client key, not per upstream.
 - The `401` message says `invalid x-api-key` on both routes, even when the client sent its key as `Authorization: Bearer`.
 - Azure OpenAI, Amazon Bedrock and Google Vertex AI need their own authentication schemes and are not supported.
-- Upstream error bodies are passed through as-is, so they may name the gateway's upstream account (its organization or project IDs), even though those response headers are dropped. Tracked as an issue.
+- An error event inside an SSE stream, after the `200` has been sent, is passed through as-is, so it is not redacted like an error body. Account identifiers are recognized by pattern only (OpenAI organization and project IDs, UUIDs); another provider's account ID in another form passes.
 - Request body fields that choose billing or retention, such as OpenAI's `service_tier` and `store`, reach the upstream unchanged until the policy stage lands.
 - `X-Ratelimit-*` response headers show the shared upstream account's quota, not the client's own, until per-key limits exist.
 - Tools whose vendor routes model traffic through its own servers (Cursor, for example) can't be pointed at a gateway on loopback, and only the parts of a tool that honor a custom base URL pass through the gateway at all.

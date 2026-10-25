@@ -198,8 +198,9 @@ func TestForward_Response(t *testing.T) {
 			t.Errorf("header %s = %q, want %q", k, resp.Header[k], v)
 		}
 	}
-	if b, _ := io.ReadAll(resp.Body); string(b) != "body" {
-		t.Errorf("body = %q", b)
+	// Not an OpenAI error, so replaced; see errorbody_test.go.
+	if b, _ := io.ReadAll(resp.Body); !strings.Contains(string(b), "upstream error") {
+		t.Errorf("body = %q, want the gateway's replacement", b)
 	}
 }
 

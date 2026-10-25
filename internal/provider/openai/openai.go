@@ -7,7 +7,9 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -133,7 +135,9 @@ func FormatError(_ int, kind proxy.ErrorKind, msg string) (string, []byte) {
 // is forwarded: credentials always come from the gateway's config, and
 // OpenAI-Organization and OpenAI-Project would let a client pick whose
 // account is billed. OpenAI-Beta and the SDKs' X-Stainless-* telemetry go
-// the same way. Only allowlisted response headers are returned.
+// the same way. Only allowlisted response headers are returned, and a non-2xx
+// body is replaced by sanitizeError's; a 2xx body is untouched, so a stream
+// stays incremental.
 func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Response, error) {
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(req.Body))
 	if err != nil {
@@ -152,12 +156,96 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 			header[k] = vv
 		}
 	}
+	body := resp.Body
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		b, err := sanitizeError(resp.StatusCode, resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("openai: read error body: %w", err)
+		}
+		header.Set("Content-Type", "application/json")
+		body = io.NopCloser(bytes.NewReader(b))
+	}
 	return &proxy.Response{
 		Status:    resp.StatusCode,
 		Header:    header,
-		Body:      resp.Body,
+		Body:      body,
 		RequestID: resp.Header.Get("X-Request-Id"),
 	}, nil
+}
+
+// sanitizeError reads and closes a non-2xx body, and returns the body the
+// client gets instead. An OpenAI error is re-encoded with the same type,
+// param and code, and account identifiers redacted (see
+// upstream.RedactAccountIDs); other fields are dropped. Anything else, or a
+// body over upstream.MaxErrorBody, becomes the gateway's own server_error,
+// "upstream error". The error is a failed read.
+func sanitizeError(status int, body io.ReadCloser) ([]byte, error) {
+	b, err := upstream.ReadErrorBody(body)
+	if err != nil && !errors.Is(err, upstream.ErrErrorBodyTooLarge) {
+		return nil, err
+	}
+	if err == nil {
+		if out, ok := redactError(b); ok {
+			return out, nil
+		}
+	}
+	_, out := FormatError(status, proxy.ErrAPI, "upstream error")
+	return out, nil
+}
+
+// upstreamError is OpenAI's error shape. Compatible servers vary: code may
+// be a number, and param or code may be missing.
+type upstreamError struct {
+	Error *struct {
+		Message *string `json:"message"`
+		Type    string  `json:"type"`
+		Param   any     `json:"param"`
+		Code    any     `json:"code"`
+	} `json:"error"`
+}
+
+// redactedError is errorBody with param and code of any JSON scalar type.
+type redactedError struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Param   any    `json:"param"`
+		Code    any    `json:"code"`
+	} `json:"error"`
+}
+
+// redactError re-encodes b, if it is an OpenAI error, with identifiers
+// redacted. It needs an error object with a string message.
+func redactError(b []byte) ([]byte, bool) {
+	var e upstreamError
+	if json.Unmarshal(b, &e) != nil || e.Error == nil || e.Error.Message == nil {
+		return nil, false
+	}
+	var out redactedError
+	out.Error.Message = upstream.RedactAccountIDs(*e.Error.Message)
+	out.Error.Type = upstream.RedactAccountIDs(e.Error.Type)
+	out.Error.Param = redactScalar(e.Error.Param)
+	out.Error.Code = redactScalar(e.Error.Code)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// Messages like "max_tokens: 100000 > 64000" stay as the upstream wrote
+	// them; the body is JSON, never HTML.
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(out)
+	return buf.Bytes(), true
+}
+
+// redactScalar keeps a JSON string (redacted), number or null, and turns
+// anything else (an object or array, which no client expects there) into
+// null.
+func redactScalar(v any) any {
+	switch v := v.(type) {
+	case string:
+		return upstream.RedactAccountIDs(v)
+	case float64:
+		return v
+	}
+	return nil
 }
 
 // allowResponseHeader reports whether an upstream response header may reach

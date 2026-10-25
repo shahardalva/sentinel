@@ -28,7 +28,10 @@ type Provider interface {
 	ErrorFormatter
 	Name() string
 	// Forward sends req upstream. It returns a *RequestError to reject the
-	// client's request without contacting upstream.
+	// client's request without contacting upstream. A nil error means a
+	// non-nil *Response with a non-nil Body and a Status from 200 to 599,
+	// which the caller closes; a Handler answers a Provider that breaks this
+	// with a 502.
 	Forward(ctx context.Context, req *Request) (*Response, error)
 }
 
@@ -42,7 +45,8 @@ type Request struct {
 type Response struct {
 	Status int
 	// Header holds only headers safe to send to the client; the Provider has
-	// already dropped hop-by-hop and internal ones.
+	// already dropped hop-by-hop and internal ones. The Handler strips
+	// hop-by-hop headers again as a backstop.
 	Header http.Header
 	Body   io.ReadCloser
 	// RequestID is the upstream's ID for this request, for the log. May be empty.
@@ -68,12 +72,25 @@ type RateLimit struct {
 }
 
 // RequestError rejects a client request as invalid. The handler answers it
-// with a 400 carrying Message, so Message must be safe to show the client.
+// with Status carrying Message, so Message must be safe to show the client.
 type RequestError struct {
 	Message string
+	// Status is the 4xx status to answer with. Zero means 400.
+	Status int
 }
 
 func (e *RequestError) Error() string { return e.Message }
+
+// status returns the status to answer e with. Anything outside 400-499
+// becomes 400: a RequestError is the client's fault, and a provider must not
+// turn it into a 5xx (logged as a gateway failure, and retried by SDKs) or a
+// success.
+func (e *RequestError) status() int {
+	if e.Status < 400 || e.Status > 499 {
+		return http.StatusBadRequest
+	}
+	return e.Status
+}
 
 const (
 	// A non-streaming request sends no headers until generation finishes, so
@@ -109,6 +126,7 @@ var (
 	errUpstreamAuth    = errors.New("upstream rejected the gateway's credentials")
 	errContentEncoding = errors.New("unsupported content-encoding")
 	errRateLimited     = errors.New("client over its rate limit")
+	errBadResponse     = errors.New("provider broke its contract")
 )
 
 // limiterWarnInterval spaces out the warnings logged while the rate limiter
@@ -367,7 +385,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqErr, invalid := errors.AsType[*RequestError](err)
 		switch {
 		case invalid:
-			status = http.StatusBadRequest
+			status = reqErr.status()
 			writeError(w, h.provider, status, ErrInvalidRequest, reqErr.Message)
 		case r.Context().Err() != nil:
 			status = 499 // client closed request; nobody to answer
@@ -379,6 +397,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadGateway
 			writeError(w, h.provider, status, ErrAPI, "upstream unavailable")
 		}
+		return
+	}
+	if err := checkResponse(resp); err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		failure = err
+		status = http.StatusBadGateway
+		writeError(w, h.provider, status, ErrAPI, "upstream unavailable")
 		return
 	}
 	defer resp.Body.Close()
@@ -393,9 +420,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, h.provider, status, ErrAPI, "upstream authentication failed")
 		return
 	}
-	for k, vv := range resp.Header {
-		w.Header()[k] = append(w.Header()[k], vv...)
-	}
+	copyEndToEnd(w.Header(), resp.Header)
 	w.Header().Set("X-Request-Id", reqID) // always the gateway's own
 	status = resp.Status
 	w.WriteHeader(status)
@@ -413,6 +438,66 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	streamDur = time.Since(streamStart)
+}
+
+// checkResponse reports whether a Provider kept its contract for a nil
+// error: a non-nil Response with a non-nil Body and a status the Handler can
+// send as a final response. WriteHeader panics below 100 and would send a
+// 1xx as an informational response.
+func checkResponse(resp *Response) error {
+	switch {
+	case resp == nil:
+		return fmt.Errorf("%w: nil response", errBadResponse)
+	case resp.Body == nil:
+		return fmt.Errorf("%w: nil body", errBadResponse)
+	case resp.Status < 200 || resp.Status > 599:
+		return fmt.Errorf("%w: status %d", errBadResponse, resp.Status)
+	}
+	return nil
+}
+
+// hopByHop are Connection and the connection-specific headers RFC 9110
+// section 7.6.1 names (Proxy-Connection, Keep-Alive, TE, Transfer-Encoding,
+// Upgrade), plus Trailer, Proxy-Authenticate and Proxy-Authorization, which
+// RFC 2616 listed as hop-by-hop and httputil.ReverseProxy still strips. They
+// describe one connection, not the response, so they never pass a proxy.
+var hopByHop = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Connection":    true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+}
+
+// copyEndToEnd appends src's headers to dst, leaving out hop-by-hop headers
+// and any header src's Connection value names. Providers allowlist their
+// response headers already; this is the backstop for one that doesn't.
+// Names are compared canonicalized, since a Provider may build its Header
+// by hand.
+func copyEndToEnd(dst, src http.Header) {
+	named := map[string]bool{}
+	for k, vv := range src {
+		if http.CanonicalHeaderKey(k) != "Connection" {
+			continue
+		}
+		for _, v := range vv {
+			for f := range strings.SplitSeq(v, ",") {
+				if f = strings.TrimSpace(f); f != "" {
+					named[http.CanonicalHeaderKey(f)] = true
+				}
+			}
+		}
+	}
+	for k, vv := range src {
+		if ck := http.CanonicalHeaderKey(k); hopByHop[ck] || named[ck] {
+			continue
+		}
+		dst[k] = append(dst[k], vv...)
+	}
 }
 
 // warnLimiterDown logs that the rate limiter failed and the request was let

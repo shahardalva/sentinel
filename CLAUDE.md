@@ -9,6 +9,10 @@ tool policies, and writes an audit log.
 - Upstreams: two protocols, Anthropic and OpenAI-compatible
   (internal/provider/openai), behind a Provider interface; any number of
   named upstreams per protocol (docs/adr/0003-named-upstreams.md)
+- Providers own their non-2xx bodies: each re-encodes its protocol's error
+  shape with account IDs redacted, or replaces the body, using
+  internal/provider/upstream (ReadErrorBody, RedactAccountIDs). 2xx bodies
+  are never read. The core strips hop-by-hop headers as a backstop.
 - Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
   Python detector service over gRPC
 
