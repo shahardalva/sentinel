@@ -471,7 +471,8 @@ sentinel/
 ├── .env.example              # required environment variables, no secrets
 ├── CLAUDE.md                 # conventions and git workflow for Claude Code
 ├── go.mod
-└── LICENSE
+├── LICENSE
+└── NOTICE
 ```
 
 ## Testing
@@ -542,4 +543,4 @@ Where the project is heading. Not yet built; the diagram at the top of this READ
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Copyright 2026 Shahar Dalva. Licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
