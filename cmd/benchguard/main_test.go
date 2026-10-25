@@ -16,6 +16,12 @@ func enabled(name, baseURL string) string {
 
 const listening = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"listening","addr":"0.0.0.0:8081"}`
 
+// The metrics listener's startup lines, logged before "listening".
+const (
+	metricsListening = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"metrics listening","addr":"[::]:9464","path":"/metrics"}`
+	metricsDisabled  = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"metrics disabled: SENTINEL_METRICS_ADDR is off"}`
+)
+
 func TestCheck(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -33,6 +39,17 @@ func TestCheck(t *testing.T) {
 				listening,
 			},
 		},
+		{
+			name: "with the metrics listener",
+			lines: []string{
+				enabled("anthropic", mock),
+				enabled("openai", mock),
+				`{"level":"INFO","msg":"rate limiting enabled","redis":"redis:6379"}`,
+				metricsListening,
+				listening,
+			},
+		},
+		{name: "metrics off", lines: []string{enabled("anthropic", mock), metricsDisabled, listening}},
 		{name: "escaped slashes still the mock", lines: []string{enabled("openai", `https:\/\/mockupstream:9090`), listening}},
 
 		// Not the mock, or not exactly.
@@ -65,6 +82,9 @@ func TestCheck(t *testing.T) {
 
 		// Missing lines.
 		{name: "no upstream lines", lines: []string{listening}, wantErr: `no "upstream enabled" line`},
+		// "metrics listening" is not the API's "listening".
+		{name: "only the metrics listener", lines: []string{enabled("anthropic", mock), metricsListening}, wantErr: `did not log "listening"`},
+		{name: "metrics line among public upstreams", lines: []string{enabled("openai", "https://api.openai.com"), metricsListening, listening}, wantErr: `upstream "openai" is not on the mock`},
 		{name: "never listening", lines: []string{enabled("anthropic", mock), `{"level":"ERROR","msg":"gateway exited","error":"OPENAI_API_KEY is not set"}`}, wantErr: `did not log "listening"`},
 		{name: "empty log", wantErr: `did not log "listening"`},
 	}

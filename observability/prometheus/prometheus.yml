@@ -1,0 +1,18 @@
+# Prometheus for the local compose stack. It scrapes the gateways' metrics
+# listeners (SENTINEL_METRICS_ADDR=0.0.0.0:9464 in the containers) on the
+# compose network; port 9464 is never published on the host.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: sentinel
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:9464"]
+        labels:
+          service: gateway
+      # In the bench profile: DOWN unless make bench-gateway is running.
+      - targets: ["gateway-bench:9464"]
+        labels:
+          service: gateway-bench

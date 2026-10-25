@@ -85,10 +85,10 @@ func TestCopyFlush_AttributesFailures(t *testing.T) {
 
 func TestLogLevel_Stream(t *testing.T) {
 	failure := errors.New("boom")
-	if got := logLevel(http.StatusOK, phaseStream, failure, false); got != slog.LevelError {
+	if got := logLevel(http.StatusOK, PhaseStream, failure, false); got != slog.LevelError {
 		t.Errorf("upstream-side stream failure: level = %v, want ERROR", got)
 	}
-	if got := logLevel(http.StatusOK, phaseStream, failure, true); got != slog.LevelWarn {
+	if got := logLevel(http.StatusOK, PhaseStream, failure, true); got != slog.LevelWarn {
 		t.Errorf("client-side stream failure: level = %v, want WARN", got)
 	}
 }

@@ -51,6 +51,13 @@ func (b *breaker) allow(now time.Time) (call, probe bool) {
 	}
 }
 
+// isOpen reports whether the breaker is open, probing included.
+func (b *breaker) isOpen() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failures >= BreakerThreshold
+}
+
 // release ends a probe that told nothing, because its caller gave up, so the
 // next request can probe instead.
 func (b *breaker) release() {

@@ -30,10 +30,10 @@ run: ## Run the gateway on the host (needs the env vars from CLAUDE.md)
 	go run ./cmd/gateway
 
 # --force-recreate so mockupstream and the gateway pick up renewed certs.
-up: certs ## Start gateway, mockupstream and redis; the gateway uses the mock over HTTPS
+up: certs ## Start gateway, mockupstream, redis, Prometheus and Grafana (127.0.0.1:3000); the gateway uses the mock over HTTPS
 	$(COMPOSE_MOCK) up -d --build --force-recreate
 
-up-real: ## Start gateway and redis; the gateway uses the real Anthropic API
+up-real: ## Start gateway, redis, Prometheus and Grafana; the gateway uses the real APIs in SENTINEL_UPSTREAMS
 	$(COMPOSE) up -d --build
 
 down: ## Stop and remove all compose services
@@ -47,11 +47,13 @@ bench: ## Load test mockupstream directly with k6 (after make up); BENCH_API, DU
 
 # Runs against gateway-bench, which always points at the mock and has no
 # real upstream key, never the gateway from make up-real. Before k6 starts,
-# the check waits up to about 15s for gateway-bench to log "listening", then
-# cmd/benchguard reads its startup log and refuses to run unless it enabled
-# at least one upstream and every "upstream enabled" line has exactly one
-# base_url, equal to $(MOCK_URL) (the gateway logs only scheme://host:port),
-# naming the upstream at fault otherwise. A line it can't read refuses too.
+# the check waits up to about 15s for gateway-bench to log "listening" (the
+# API port; the metrics listener binds first and logs "metrics listening",
+# which the grep doesn't match), then cmd/benchguard reads its startup log
+# and refuses to run unless it enabled at least one upstream and every
+# "upstream enabled" line has exactly one base_url, equal to $(MOCK_URL)
+# (the gateway logs only scheme://host:port), naming the upstream at fault
+# otherwise. A line it can't read refuses too.
 #
 # It checks the configuration the gateway resolved, not the variables it was
 # given. A check of env vars has to know every upstream in advance, and an
