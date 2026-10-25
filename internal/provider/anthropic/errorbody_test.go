@@ -1,12 +1,14 @@
 package anthropic
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
@@ -187,5 +189,41 @@ func TestForward_SuccessBodyUntouched(t *testing.T) {
 	// Byte for byte, identifiers included: a 2xx body is never rewritten.
 	if string(got)+string(rest) != first+second {
 		t.Errorf("body = %q, want %q", string(got)+string(rest), first+second)
+	}
+}
+
+func TestForward_InformationalStatus(t *testing.T) {
+	// Answers 101 and holds the connection: the body is then the raw
+	// connection, which cancelling the request would not close.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, bw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		bw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n")
+		bw.Flush()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		io.Copy(io.Discard, conn)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := mustNew(t, Config{BaseURL: srv.URL}).Forward(ctx, &proxy.Request{Header: http.Header{}})
+		if err == nil {
+			resp.Body.Close()
+		}
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.HasPrefix(err.Error(), "anthropic: upstream sent an informational status") {
+			t.Errorf("err = %v, want the informational status error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Forward still running 3s after its deadline")
 	}
 }

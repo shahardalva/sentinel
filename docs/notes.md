@@ -22,6 +22,17 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - upstream.NewClient no longer panics when http.DefaultTransport has been
   replaced (from #6); it falls back to a fresh transport with Go's
   documented defaults.
+- Review fixes: an upstream 1xx (Go hands back a 101) is a Forward error,
+  502, with no body read. ReadErrorBody takes the context, closes the body
+  when it ends (context.AfterFunc), and has its own 10 s deadline, a 502
+  logged as "upstream error body not received in time" instead of the
+  header timeout's 504. The Handler accepts only 2xx, 4xx and 5xx; a 300,
+  a 304 or a 3xx without Location is a 502. copyEndToEnd writes canonical
+  keys, so a provider's x-request-id can't sit beside the gateway's.
+  RequestError's 401, 407, 429 and 499 become 400. Redaction is
+  case-insensitive, catches IDs after "_" or a digit, and covers sk-...,
+  wrkspc_..., apikey_... and 32-hex UUIDs. OpenAI's numeric code keeps
+  its digits (json.Number).
 
 ### Decided
 - Sanitizing stays in the providers, not the core: only a provider knows
@@ -33,9 +44,9 @@ Newest entries first. Short: what was done, what was decided, what's next.
   too.
 - 401/403 bodies are sanitized as well, though the core replaces them;
   the provider rule is simply "every non-2xx body".
-- A failed read of an error body (connection reset, timeout) is a Forward
-  error, so the client gets the core's 502 or 504, not a made-up body at
-  the upstream's status.
+- A failed read of an error body (connection reset, its own timeout) is a
+  Forward error, so the client gets the core's 502 (499 if it left), not a
+  made-up body at the upstream's status.
 - A RequestError can't become a 5xx: a provider rejecting the client's
   request must not look like a gateway failure to SDK retry logic or to
   the log level.
@@ -44,10 +55,18 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - encoding/json escapes <, > and & by default, so a re-encoded message
   like "max_tokens: 100000 > 64000" changed bytes; the re-encoder turns
   that off.
+- A 101 response turns the body into the raw connection, and cancelling
+  the request no longer stops a read on it: the first error-body reader
+  hung forever on one. Every stage that reads from the network needs its
+  own deadline, enforced by closing what it reads from, not only a
+  context.
 
 ### Next
 - Sanitize error events inside an SSE stream after a 200 (documented as a
   known limitation).
+- Show the operator the sanitized upstream reason when the gateway's own
+  key is rejected (401/403). The core drops that body today; it needs a
+  Response field for the provider to pass the reason in.
 - The other nits in #6: timer Stop races, flushing only for
   text/event-stream, the query string, sampling the auth WARN.
 

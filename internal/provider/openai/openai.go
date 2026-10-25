@@ -156,9 +156,16 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 			header[k] = vv
 		}
 	}
+	// Go hands back a 101 Switching Protocols, whose body is the raw
+	// connection: nothing a client can use, and a read the request's
+	// context can't stop. No other 1xx reaches here.
+	if resp.StatusCode < 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("openai: upstream sent an informational status (%d)", resp.StatusCode)
+	}
 	body := resp.Body
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		b, err := sanitizeError(resp.StatusCode, resp.Body)
+	if resp.StatusCode > 299 {
+		b, err := sanitizeError(ctx, resp.StatusCode, resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("openai: read error body: %w", err)
 		}
@@ -178,9 +185,9 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 // param and code, and account identifiers redacted (see
 // upstream.RedactAccountIDs); other fields are dropped. Anything else, or a
 // body over upstream.MaxErrorBody, becomes the gateway's own server_error,
-// "upstream error". The error is a failed read.
-func sanitizeError(status int, body io.ReadCloser) ([]byte, error) {
-	b, err := upstream.ReadErrorBody(body)
+// "upstream error". The error is a read that failed or ran out of time.
+func sanitizeError(ctx context.Context, status int, body io.ReadCloser) ([]byte, error) {
+	b, err := upstream.ReadErrorBody(ctx, body)
 	if err != nil && !errors.Is(err, upstream.ErrErrorBodyTooLarge) {
 		return nil, err
 	}
@@ -197,14 +204,15 @@ func sanitizeError(status int, body io.ReadCloser) ([]byte, error) {
 // be a number, and param or code may be missing.
 type upstreamError struct {
 	Error *struct {
-		Message *string `json:"message"`
-		Type    string  `json:"type"`
-		Param   any     `json:"param"`
-		Code    any     `json:"code"`
+		Message *string         `json:"message"`
+		Type    string          `json:"type"`
+		Param   json.RawMessage `json:"param"`
+		Code    json.RawMessage `json:"code"`
 	} `json:"error"`
 }
 
-// redactedError is errorBody with param and code of any JSON scalar type.
+// redactedError is FormatError's shape, but param and code may each be a
+// JSON string, number or null.
 type redactedError struct {
 	Error struct {
 		Message string `json:"message"`
@@ -237,12 +245,21 @@ func redactError(b []byte) ([]byte, bool) {
 
 // redactScalar keeps a JSON string (redacted), number or null, and turns
 // anything else (an object or array, which no client expects there) into
-// null.
-func redactScalar(v any) any {
+// null. A number stays a json.Number, so a large code keeps its digits.
+func redactScalar(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return nil
+	}
 	switch v := v.(type) {
 	case string:
 		return upstream.RedactAccountIDs(v)
-	case float64:
+	case json.Number:
 		return v
 	}
 	return nil

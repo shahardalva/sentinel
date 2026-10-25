@@ -148,9 +148,16 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 			header[k] = vv
 		}
 	}
+	// Go hands back a 101 Switching Protocols, whose body is the raw
+	// connection: nothing a client can use, and a read the request's
+	// context can't stop. No other 1xx reaches here.
+	if resp.StatusCode < 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("anthropic: upstream sent an informational status (%d)", resp.StatusCode)
+	}
 	body := resp.Body
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		b, err := sanitizeError(resp.StatusCode, resp.Body)
+	if resp.StatusCode > 299 {
+		b, err := sanitizeError(ctx, resp.StatusCode, resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("anthropic: read error body: %w", err)
 		}
@@ -171,9 +178,9 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 // upstream.RedactAccountIDs); fields other than the error's type and
 // message and the request_id are dropped. Anything else, or a body over
 // upstream.MaxErrorBody, becomes the gateway's own api_error, "upstream
-// error". The error is a failed read.
-func sanitizeError(status int, body io.ReadCloser) ([]byte, error) {
-	b, err := upstream.ReadErrorBody(body)
+// error". The error is a read that failed or ran out of time.
+func sanitizeError(ctx context.Context, status int, body io.ReadCloser) ([]byte, error) {
+	b, err := upstream.ReadErrorBody(ctx, body)
 	if err != nil && !errors.Is(err, upstream.ErrErrorBodyTooLarge) {
 		return nil, err
 	}

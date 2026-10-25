@@ -1,11 +1,13 @@
 package openai
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
@@ -79,6 +81,18 @@ func TestForward_PassesUsefulErrorMessage(t *testing.T) {
 			name: "numeric code",
 			body: `{"error":{"message":"model \"llama9\" not found","type":"not_found_error","code":404}}`,
 			want: `{"error":{"message":"model \"llama9\" not found","type":"not_found_error","param":null,"code":404}}`,
+		},
+		{
+			// Beyond float64's exact range: the digits must survive.
+			name: "large numeric code",
+			body: `{"error":{"message":"quota exceeded","type":"quota","param":null,"code":12345678901234567}}`,
+			want: `{"error":{"message":"quota exceeded","type":"quota","param":null,"code":12345678901234567}}`,
+		},
+		{
+			// Neither a string, number nor null: no client expects it.
+			name: "object code",
+			body: `{"error":{"message":"bad","type":"invalid_request_error","param":["a"],"code":{"x":1}}}`,
+			want: `{"error":{"message":"bad","type":"invalid_request_error","param":null,"code":null}}`,
 		},
 	}
 	for _, tt := range tests {
@@ -176,5 +190,41 @@ func TestForward_SuccessBodyUntouched(t *testing.T) {
 	// Byte for byte, identifiers included: a 2xx body is never rewritten.
 	if string(got)+string(rest) != first+second {
 		t.Errorf("body = %q, want %q", string(got)+string(rest), first+second)
+	}
+}
+
+func TestForward_InformationalStatus(t *testing.T) {
+	// Answers 101 and holds the connection: the body is then the raw
+	// connection, which cancelling the request would not close.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, bw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		bw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n")
+		bw.Flush()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		io.Copy(io.Discard, conn)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := mustNew(t, Config{BaseURL: srv.URL}).Forward(ctx, &proxy.Request{Header: http.Header{}})
+		if err == nil {
+			resp.Body.Close()
+		}
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.HasPrefix(err.Error(), "openai: upstream sent an informational status") {
+			t.Errorf("err = %v, want the informational status error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Forward still running 3s after its deadline")
 	}
 }

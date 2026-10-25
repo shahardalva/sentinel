@@ -29,7 +29,7 @@ type Provider interface {
 	Name() string
 	// Forward sends req upstream. It returns a *RequestError to reject the
 	// client's request without contacting upstream. A nil error means a
-	// non-nil *Response with a non-nil Body and a Status from 200 to 599,
+	// non-nil *Response with a non-nil Body and a 2xx, 4xx or 5xx Status,
 	// which the caller closes; a Handler answers a Provider that breaks this
 	// with a 502.
 	Forward(ctx context.Context, req *Request) (*Response, error)
@@ -75,7 +75,8 @@ type RateLimit struct {
 // with Status carrying Message, so Message must be safe to show the client.
 type RequestError struct {
 	Message string
-	// Status is the 4xx status to answer with. Zero means 400.
+	// Status is the 4xx status to answer with. Zero means 400; see status
+	// for the ones that also become 400.
 	Status int
 }
 
@@ -84,8 +85,23 @@ func (e *RequestError) Error() string { return e.Message }
 // status returns the status to answer e with. Anything outside 400-499
 // becomes 400: a RequestError is the client's fault, and a provider must not
 // turn it into a 5xx (logged as a gateway failure, and retried by SDKs) or a
-// success.
+// success. Some 4xx mislead and become 400 too.
 func (e *RequestError) status() int {
+	switch e.Status {
+	case http.StatusUnauthorized:
+		// Says the client's gateway key is wrong; RequireKey owns that.
+		return http.StatusBadRequest
+	case http.StatusProxyAuthRequired:
+		// Asks the client to authenticate to a proxy it never configured.
+		return http.StatusBadRequest
+	case http.StatusTooManyRequests:
+		// SDKs retry it, so a rejected request would be sent again and
+		// again; and it reads as the rate limiter's answer.
+		return http.StatusBadRequest
+	case 499:
+		// The gateway's own log code for a client that went away.
+		return http.StatusBadRequest
+	}
 	if e.Status < 400 || e.Status > 499 {
 		return http.StatusBadRequest
 	}
@@ -441,16 +457,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkResponse reports whether a Provider kept its contract for a nil
-// error: a non-nil Response with a non-nil Body and a status the Handler can
-// send as a final response. WriteHeader panics below 100 and would send a
-// 1xx as an informational response.
+// error: a non-nil Response with a non-nil Body and a 2xx, 4xx or 5xx
+// status. WriteHeader panics below 100 and would send a 1xx as an
+// informational response. A 3xx is never an answer to pass on: upstream
+// clients refuse redirects, so one that gets here has no Location, or is a
+// 300 or 304, which a client can't act on (a 304 can't even carry the body).
 func checkResponse(resp *Response) error {
 	switch {
 	case resp == nil:
 		return fmt.Errorf("%w: nil response", errBadResponse)
 	case resp.Body == nil:
 		return fmt.Errorf("%w: nil body", errBadResponse)
-	case resp.Status < 200 || resp.Status > 599:
+	case resp.Status < 200 || resp.Status > 599 || (resp.Status >= 300 && resp.Status < 400):
 		return fmt.Errorf("%w: status %d", errBadResponse, resp.Status)
 	}
 	return nil
@@ -476,8 +494,9 @@ var hopByHop = map[string]bool{
 // copyEndToEnd appends src's headers to dst, leaving out hop-by-hop headers
 // and any header src's Connection value names. Providers allowlist their
 // response headers already; this is the backstop for one that doesn't.
-// Names are compared canonicalized, since a Provider may build its Header
-// by hand.
+// Names are canonicalized, since a Provider may build its Header by hand,
+// and written to dst canonical too: a provider's "x-request-id" must not
+// end up beside the gateway's X-Request-Id.
 func copyEndToEnd(dst, src http.Header) {
 	named := map[string]bool{}
 	for k, vv := range src {
@@ -493,10 +512,11 @@ func copyEndToEnd(dst, src http.Header) {
 		}
 	}
 	for k, vv := range src {
-		if ck := http.CanonicalHeaderKey(k); hopByHop[ck] || named[ck] {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] || named[ck] {
 			continue
 		}
-		dst[k] = append(dst[k], vv...)
+		dst[ck] = append(dst[ck], vv...)
 	}
 }
 
