@@ -18,7 +18,7 @@ const listening = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"listenin
 
 // The metrics listener's startup lines, logged before "listening".
 const (
-	metricsListening = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"metrics listening","addr":"[::]:9091","path":"/metrics"}`
+	metricsListening = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"metrics listening","addr":"[::]:9464","path":"/metrics"}`
 	metricsDisabled  = `{"time":"2026-10-24T10:00:00Z","level":"INFO","msg":"metrics disabled: SENTINEL_METRICS_ADDR is off"}`
 )
 

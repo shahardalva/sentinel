@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -263,6 +264,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ran                         Stages           // for the Recorder
 	)
 	defer func() {
+		// A panic (a provider bug) unwinds through here before net/http
+		// recovers it. Record it as the server failure it is, then let it
+		// go on with its own value. The stack is taken now, while it still
+		// shows where the panic happened; the re-panic's won't.
+		recovered := recover()
+		var stack []byte
+		if recovered != nil {
+			stack = debug.Stack()
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			failure = fmt.Errorf("panic: %v", recovered)
+		}
 		total := time.Since(start)
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
@@ -292,6 +306,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if failure != nil {
 			attrs = append(attrs, slog.String("error", failure.Error()), slog.String("phase", phase))
 		}
+		if stack != nil {
+			attrs = append(attrs, slog.String("stack", string(stack)))
+		}
 		_, clientFailed := errors.AsType[*clientWriteError](failure)
 		clientGone := clientFailed || r.Context().Err() != nil
 		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, clientGone), "request", attrs...)
@@ -313,6 +330,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				info.Phase = phase
 			}
 			h.recorder.RecordRequest(r.Context(), info)
+		}
+		if recovered != nil {
+			panic(recovered)
 		}
 	}()
 

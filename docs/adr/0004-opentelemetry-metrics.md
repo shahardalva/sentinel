@@ -45,7 +45,7 @@ All of these are maintained by the OpenTelemetry and Prometheus projects (CNCF) 
 
 ### Dependency inversion: the Recorder seam
 
-`internal/proxy` defines a `Recorder` interface and a `RequestInfo` struct and never imports OpenTelemetry. The Handler calls `RecordRequest` once per request, from the same deferred block that writes the log line, with values it already had: upstream, protocol, status, the failure phase, the rate-limit outcome, which stages ran, and their durations. `Auth` (behind `RequireKey`) calls `RecordAuthRejection` once per rejected key. `Options.Recorder` nil means no metrics and no cost beyond a nil check.
+`internal/proxy` defines a `Recorder` interface and a `RequestInfo` struct and never imports OpenTelemetry. The Handler calls `RecordRequest` once per request, from the same deferred block that writes the log line, with values it already had: upstream, protocol, status, the failure phase, the rate-limit outcome, which stages ran, and their durations. `Auth`, built once by `NewAuth(keys, logger, rec)` and shared by every route, calls `RecordAuthRejection` once per rejected key; `RequireKey`, the one-route form, passes no Recorder. `Options.Recorder` nil means no metrics and no cost beyond a nil check. A panic in a provider unwinds through the same deferred block: it is logged and recorded as a failure (status 500 if nothing was sent yet, with the stack in the log line), then re-raised with its own value so `net/http` handles it as before.
 
 `internal/telemetry` implements the interface with OpenTelemetry, and `cmd/gateway` wires it in. A test fake implements it in the proxy's tests. The core's tests, its log line and its wire behavior don't change with the metrics backend.
 
@@ -53,13 +53,13 @@ All of these are maintained by the OpenTelemetry and Prometheus projects (CNCF) 
 
 ### A separate listener, on loopback
 
-Metrics are served on their own listener, `SENTINEL_METRICS_ADDR`, default `127.0.0.1:9091`, with only `GET /metrics`. They are never on the API port:
+Metrics are served on their own listener, `SENTINEL_METRICS_ADDR`, default `127.0.0.1:9464`, with only `GET /metrics`. 9464 is the conventional port for an OpenTelemetry Prometheus exporter; the first draft used 9091, which is the Prometheus Pushgateway's default, so a host running one would have refused to start the gateway. They are never on the API port:
 
 - The API port faces clients, maybe the internet. Metrics are for the operator: they show traffic per upstream, error rates and capacity, which is reconnaissance for an attacker.
 - The API port has no whole-request timeouts (streams run for minutes). The metrics server has short read and write timeouts, and the handler admits at most four scrapes at once.
 - A metrics route on the API mux would need its own auth story. A loopback listener needs none, and exposing it is an explicit choice, as with `SENTINEL_ADDR`.
 
-`off` disables metrics: no listener, no Recorder. The address must be `host:port` with a numeric port, and not the API's port. The metrics listener binds before the API's and logs `metrics listening`, never `listening`, which `make bench-gateway` waits for.
+`off` disables metrics: no listener, no Recorder. The address must be `host:port` with a numeric port, and not the API's port on any host: `0.0.0.0`, `[::]` and `127.0.0.1` overlap in practice. Ports compare as numbers, so `08081` is `8081`, and a named API port such as `:http` is resolved first. Port 0 (any free port) is exempt. A metrics bind failure stops startup; once running, a metrics server that stops serving is logged at `ERROR` and the API keeps serving, since losing monitoring must not become an outage. The metrics listener binds before the API's and logs `metrics listening`, never `listening`, which `make bench-gateway` waits for.
 
 ### The cardinality rule
 
@@ -80,7 +80,7 @@ Attribute sets are built once at startup, per upstream, status class and phase, 
 | `sentinel.ratelimit.decisions` | `sentinel_ratelimit_decisions_total` | counter | outcome |
 | `sentinel.auth.rejections` | `sentinel_auth_rejections_total` | counter | |
 | `sentinel.admission.in_use`, `.limit` | `sentinel_admission_in_use`, `_limit` | gauge | |
-| `sentinel.ratelimit.breaker.open` | `sentinel_ratelimit_breaker_open` | gauge, 0 or 1 | |
+| `sentinel.ratelimit.breaker.open` | `sentinel_ratelimit_breaker_open` | gauge, 0 or 1 (stays 1 on an idle gateway after Redis recovers, until a request probes) | |
 
 The exporter's translation is pinned (`UnderscoreEscapingWithSuffixes`): dots become underscores, `s` becomes `_seconds`, counters get `_total`. The dashboard queries the Prometheus names, and a test scrapes the exporter and checks every name and label value the dashboard uses.
 
@@ -97,6 +97,6 @@ Overhead is total minus read body, upstream time to first byte and stream, recor
 - 19 more modules linked into the gateway on Linux, and a 3.4 MiB larger binary. Each new release of OpenTelemetry or client_golang is another update to review. The README's dependencies badge says so.
 - A second port to think about when deploying. It is loopback by default and never published by compose.
 - `sentinel.requests` counts requests that passed authentication; 401s are counted by `sentinel.auth.rejections`, and unrouted requests (404, an unclean path's 400) by neither.
-- The `unauthorized` WARN from `RequireKey` is now rate-limited like the fail-open warning, at most once every 10 s with a `suppressed` count, since the counter carries the rate. This closes the log-flood item of #6.
+- The `unauthorized` WARN is now rate-limited across all routes like the fail-open warning, at most once every 10 s with a `suppressed` count, since the counter carries the rate. This closes the log-flood item of #6.
 - No traces yet. They will reuse this SDK: a tracer provider in `internal/telemetry`, spans around the same stages, and exemplars linking histogram buckets to traces.
 - No Go runtime metrics (goroutines, GC, memory). The OpenTelemetry runtime instrumentation is a separate contrib module and can come with traces.

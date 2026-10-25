@@ -21,12 +21,12 @@ Newest entries first. Short: what was done, what was decided, what's next.
   admission in use and limit, breaker open. Attribute sets precomputed
   per upstream, status class and phase; recording a request is 0 allocs,
   about 1.5 µs.
-- SENTINEL_METRICS_ADDR, default 127.0.0.1:9091, GET /metrics only, on its
+- SENTINEL_METRICS_ADDR, default 127.0.0.1:9464, GET /metrics only, on its
   own listener; "off" disables. Binds before the API and logs "metrics
   listening"; shuts down after it. run() split into loadConfig and
   serve(ctx, logger, cfg), so tests start both listeners on port 0.
-- Compose: prom/prometheus:v3.15.1 scraping gateway:9091 and
-  gateway-bench:9091; grafana/grafana:13.2.4 on 127.0.0.1:3000 with
+- Compose: prom/prometheus:v3.15.1 scraping gateway:9464 and
+  gateway-bench:9464; grafana/grafana:13.2.4 on 127.0.0.1:3000 with
   anonymous Viewer, login form and basic auth off, a provisioned data
   source and dashboard (observability/). Both read_only, cap_drop ALL,
   no-new-privileges.
@@ -36,6 +36,16 @@ Newest entries first. Short: what was done, what was decided, what's next.
   keys and models adding no series; the dashboard's names and label values
   present in a real scrape; the metrics listener, 404 for /metrics on the
   API port, off, and bad or taken addresses; benchguard with the new lines.
+- Smoke test (make up, k6 at 1000 req/s): k6, Prometheus and the log all
+  counted 47959 requests, 47811 2xx and 148 503 at admission. Every
+  Grafana panel failed: "datasource prometheus was not found".
+- Review fixes: a provider panic is recorded and logged as a failure (500
+  unless a status was sent, with the stack), then re-raised. A metrics
+  Serve error is logged and the API keeps serving. Default port 9464
+  (9091 is the Pushgateway's). Metrics and API ports compare as numbers on
+  any host. logThrottle measures from a monotonic base. Grafana: no
+  runtime plugin installs or updates, no initial admin, no Gravatar, no
+  external snapshots; Prometheus keeps at most 1 GB.
 
 ### Decided
 - OTel over client_golang alone or hand-written exposition: one
@@ -52,6 +62,15 @@ Newest entries first. Short: what was done, what was decided, what's next.
   decision was made and no fail mode applied.
 
 ### Learned
+- Grafana 13.2 ships the Prometheus data source as a plugin, not core: a
+  copy bundled in the image (data/plugins-bundled) plus a background
+  "preinstall" that updates it from grafana.com at startup. With a
+  read-only root the update removed the plugin and couldn't write the new
+  one. plugins.preinstall_disabled turns the whole preinstall off; the
+  bundled copy still loads, since paths.bundled_plugins is always on the
+  plugin path (pkg/setting/setting.go, v13.2.4).
+- Re-panicking from a deferred recover loses the panic site in net/http's
+  log, so the handler logs debug.Stack() before re-panicking.
 - Windows' monotonic clock is coarse enough that a fast stage measures 0,
   so RequestInfo says which stages ran (Ran) instead of relying on
   durations above zero.
@@ -63,6 +82,8 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - Traces on the same SDK, with exemplars linking duration buckets to them.
 - Go runtime metrics (contrib runtime instrumentation).
 - Measure the recording cost under load in make bench-gateway.
+- A client that disconnects while uploading its body is logged and
+  recorded as 400 read_body, not 499. Tell it apart from a malformed body.
 
 ## 2026-10-25: provider hardening
 

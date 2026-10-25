@@ -84,7 +84,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 - One JSON log line per request with the gateway's `request_id`, the provider's `upstream_request_id`, and timings for each stage.
 - On failure, the log records the phase where it happened and the cause. Client-side problems log at `WARN`, server and upstream problems at `ERROR`.
 - Every response carries an `X-Request-Id` header that matches the log line.
-- OpenTelemetry metrics on a separate loopback listener (`GET /metrics` on `127.0.0.1:9091`): requests, latency, the gateway's own overhead, per-stage durations, rate-limit outcomes, auth rejections, concurrency and the Redis breaker. Labels come only from closed sets. The compose stack adds Prometheus and a provisioned Grafana dashboard. See [Observability](#observability).
+- OpenTelemetry metrics on a separate loopback listener (`GET /metrics` on `127.0.0.1:9464`): requests, latency, the gateway's own overhead, per-stage durations, rate-limit outcomes, auth rejections, concurrency and the Redis breaker. Labels come only from closed sets. The compose stack adds Prometheus and a provisioned Grafana dashboard. See [Observability](#observability).
 
 **Engineering**
 - Two third-party dependencies with a reason each: `go-redis` for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)), and OpenTelemetry with its Prometheus exporter for metrics ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)), which brings `prometheus/client_golang` with it. The core in `internal/proxy` imports neither.
@@ -261,7 +261,7 @@ All configuration comes from environment variables. Secrets are never read from 
 | `OPENAI_API_KEY` | When `openai` is listed | | The gateway's own key for the OpenAI-compatible API. Clients never see it. |
 | `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys, shared by every route. The gateway refuses to start without at least one. |
 | `SENTINEL_ADDR` | No | `127.0.0.1:8081` | Listen address. Loopback only by default. |
-| `SENTINEL_METRICS_ADDR` | No | `127.0.0.1:9091` | Listen address for metrics, which serves only `GET /metrics`, on its own listener, never on the API port. Loopback only by default. `off` turns metrics off entirely. Must be `host:port` with a numeric port other than `SENTINEL_ADDR`'s; the gateway refuses to start otherwise, or if the address can't be bound. See [Observability](#observability). |
+| `SENTINEL_METRICS_ADDR` | No | `127.0.0.1:9464` | Listen address for metrics, which serves only `GET /metrics`, on its own listener, never on the API port. Loopback only by default. `off` turns metrics off entirely. Must be `host:port` with a numeric port other than `SENTINEL_ADDR`'s, on any host (ports compare as numbers; port 0, any free port, is exempt); the gateway refuses to start otherwise, or if the address can't be bound. Once running, a metrics server that fails is logged at `ERROR` and the API keeps serving. See [Observability](#observability). |
 | `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Anthropic upstream override. Must be `https`, except for a loopback host. |
 | `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-compatible upstream, including `/v1` as in the OpenAI SDKs' own variable; the gateway appends `/chat/completions`. Must be `https`, except for a loopback host. |
 | `SENTINEL_MAX_CONCURRENT` | No | `128` | Cap on requests in flight upstream, across all routes. Must be a positive integer. See [ADR 0001](docs/adr/0001-concurrency-cap.md). |
@@ -272,7 +272,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9091` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9464` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -407,14 +407,15 @@ Logs are JSON on stdout, one line per request:
 - `upstream_request_id` is the provider's ID for the same request, for support cases with the provider.
 - `latency_ms` minus `read_body_ms`, `upstream_ttfb_ms` and `stream_ms` is the time the gateway itself added. In this example it is about 1 ms. That is a single local request, not a benchmark; see [Performance](#performance) for load-test numbers.
 - With rate limiting on, `rate_limit_us` is how long the Redis call took, and `rate_limit_remaining` how many requests the key has left right now. `rate_limit_remaining` is missing when Redis couldn't answer.
+- A panic in a provider is logged at `ERROR` with status `500` (or the status already sent, for a broken stream), `error: panic: ...`, the `phase` and a `stack`, then re-raised so Go's server drops the connection as before.
 - Failed requests add `error` and `phase` (`rate_limit`, `read_body`, `admit`, `upstream` or `stream`). An upstream `error` names the cause without the request URL, such as `openai: forward: Post: dial tcp 10.0.0.5:443: connect: connection refused`, since a base URL's path may hold a token.
 
 ## Observability
 
-The gateway exports OpenTelemetry metrics in the Prometheus text format on a listener of its own, `SENTINEL_METRICS_ADDR` (default `127.0.0.1:9091`), which serves only `GET /metrics`. The API port never serves metrics: they show traffic per upstream and how close the gateway is to its limits, which is for the operator, not for clients. At startup the gateway logs `metrics listening` with the bound address, before the API's `listening` line. `SENTINEL_METRICS_ADDR=off` turns metrics off: no listener, and nothing recorded.
+The gateway exports OpenTelemetry metrics in the Prometheus text format on a listener of its own, `SENTINEL_METRICS_ADDR` (default `127.0.0.1:9464`), which serves only `GET /metrics`. The API port never serves metrics: they show traffic per upstream and how close the gateway is to its limits, which is for the operator, not for clients. At startup the gateway logs `metrics listening` with the bound address, before the API's `listening` line. `SENTINEL_METRICS_ADDR=off` turns metrics off: no listener, and nothing recorded. A metrics address that can't be bound stops startup; a metrics server that fails later is logged at `ERROR` (`metrics server stopped`) and the API keeps serving, since losing monitoring must not become an outage.
 
 ```bash
-curl -s http://127.0.0.1:9091/metrics | grep '^sentinel_'
+curl -s http://127.0.0.1:9464/metrics | grep '^sentinel_'
 ```
 
 | Prometheus name | Kind | Labels | What |
@@ -426,7 +427,7 @@ curl -s http://127.0.0.1:9091/metrics | grep '^sentinel_'
 | `sentinel_ratelimit_decisions_total` | counter | `outcome` | One per request: `allowed`, `limited` (429), `fail_open`, `fail_closed` (503) or `not_checked`. |
 | `sentinel_auth_rejections_total` | counter | | Requests rejected with `401`. |
 | `sentinel_admission_in_use`, `sentinel_admission_limit` | gauge | | Concurrency slots taken, and `SENTINEL_MAX_CONCURRENT`. |
-| `sentinel_ratelimit_breaker_open` | gauge | | `1` while the Redis circuit breaker is open. Absent with rate limiting off. |
+| `sentinel_ratelimit_breaker_open` | gauge | | `1` while the Redis circuit breaker is open. Only a request's probe closes it, so on an idle gateway it stays `1` after Redis recovers, until the next request. Absent with rate limiting off. |
 
 The OpenTelemetry names are dotted (`sentinel.request.duration`); the exporter turns dots into underscores and adds the unit and `_total` suffixes. Every series also carries `otel_scope_name`, and `target_info` names the service.
 
@@ -436,7 +437,7 @@ The `unauthorized` `WARN` that a rejected key produces is logged at most once ev
 
 ### Prometheus and Grafana
 
-`make up` and `make up-real` also start Prometheus and Grafana. Prometheus scrapes `gateway:9091` and `gateway-bench:9091` every 5 seconds on the compose network and is not published on the host. Grafana is on [http://127.0.0.1:3000](http://127.0.0.1:3000) only, with anonymous `Viewer` access for local development: the login form and basic auth are off, and no admin password is set in any file. Its Prometheus data source and the **Sentinel gateway** dashboard are provisioned from `observability/`, and the dashboard is the home page:
+`make up` and `make up-real` also start Prometheus and Grafana. Prometheus scrapes `gateway:9464` and `gateway-bench:9464` every 5 seconds on the compose network and is not published on the host. Grafana is on [http://127.0.0.1:3000](http://127.0.0.1:3000) only, with anonymous `Viewer` access for local development: no admin account is created, the login form and basic auth are off, and no password is set in any file. Grafana installs and updates no plugins at runtime: the image's own copies, the Prometheus data source among them, are what runs, and its usage reporting, update checks, news feed, Gravatar and external snapshots are off. A `grafana-data` volume created by an earlier version of this stack still holds the default `admin` account; remove that volume once (`make down`, then `docker volume rm` the `grafana-data` volume) to drop it. Its Prometheus data source and the **Sentinel gateway** dashboard are provisioned from `observability/`, and the dashboard is the home page:
 
 - requests per second and error rate by upstream
 - p50, p95 and p99 request duration
@@ -559,7 +560,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - the bench guard: anything but exactly `https://mockupstream:9090` (a path, another port, a look-alike host) is refused, as are duplicate or differently-cased `base_url` keys and unreadable lines
 - refused upstream redirects (both protocols: the redirect target never sees a request) and unclean paths answered `400` over a raw connection instead of hanging
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
-- metrics: each path (success, a stream, `413` declared and read, `429`, `503` at capacity and fail closed, fail open, `502`, `504`, and a `401`) recorded exactly once with its status, phase, rate-limit outcome and stages; the instruments, values and attributes through a manual reader; the overhead arithmetic; 1,000 requests with distinct models and client keys, accepted and rejected, adding no series; every metric name and label value the Grafana dashboard queries present in a real scrape; `/metrics` answering on its own listener and `404` on the API port, nothing served with `off`, and a bad or taken address stopping startup; the `unauthorized` `WARN` rate-limited across routes with a `suppressed` count; and the bench guard reading a log that includes the metrics listener's lines
+- metrics: each path (success, a stream and a stream broken after its `200`, `400`, `408`, `413` declared and read, `415`, `429`, `499` at the rate limiter and waiting for upstream, `503` at capacity and fail closed, fail open, `502` for an unreachable upstream, its rejected key and a broken contract, an upstream `5xx` passed through, `504`, a provider panic, and a `401`) recorded exactly once with its status, phase, rate-limit outcome and stages; the instruments, values and attributes through a manual reader; the overhead arithmetic; 1,000 requests with distinct models and client keys, accepted and rejected, adding no series; every metric name and label value the Grafana dashboard queries present in a real scrape; `/metrics` answering on its own listener and `404` on the API port, nothing served with `off`, and a bad or taken address stopping startup, a metrics server failure leaving the API serving, and an API bind failure closing the metrics listener; the `unauthorized` `WARN` rate-limited across routes with a `suppressed` count, and the throttle's counts adding up under 32 concurrent goroutines; and the bench guard reading a log that includes the metrics listener's lines
 
 ## Known limitations
 
@@ -578,6 +579,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - The logged `model` field is best effort: it comes from a separate JSON parse and is not authoritative.
 - Query strings are not forwarded upstream.
 - Streaming has not been load-tested yet.
+- The Grafana in compose is for local development. Its anonymous `Viewer` can run any PromQL against Prometheus, not only the dashboard's queries; the data is metrics only. Grafana doesn't check the `Host` header, so it has no protection against DNS rebinding beyond listening on loopback (tracked in #20). The Prometheus and Grafana images are pinned by tag, not by digest (tracked in #19).
 - No traces yet: metrics and the log line are all there is. Traces are planned on the same OpenTelemetry SDK ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)). There are no Go runtime metrics (goroutines, memory, GC) either.
 
 The ones marked "Tracked as an issue" have a fix planned; the rest are deliberate scope limits for now.

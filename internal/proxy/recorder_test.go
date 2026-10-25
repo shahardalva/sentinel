@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
@@ -53,16 +56,48 @@ func (f *fakeRecorder) only(t *testing.T) proxy.RequestInfo {
 // Handler and the Auth in front of it.
 func recordedGateway(t *testing.T, upstreamURL string, opts proxy.Options, rec *fakeRecorder) (http.Handler, *bytes.Buffer) {
 	t.Helper()
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	p, err := anthropic.New(anthropic.Config{APIKey: upstreamKey, BaseURL: upstreamURL})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return recordedGatewayFor(p, opts, rec)
+}
+
+// recordedGatewayFor is recordedGateway in front of any Provider.
+func recordedGatewayFor(p proxy.Provider, opts proxy.Options, rec *fakeRecorder) (http.Handler, *bytes.Buffer) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	opts.Recorder = rec
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/messages", proxy.NewAuth([]string{gatewayKey}, logger, rec).Require(p, proxy.NewHandler(p, logger, opts)))
 	return mux, &logs
+}
+
+// statusUpstream answers every request with status and an Anthropic error
+// body.
+func statusUpstream(t *testing.T, status int) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"upstream says no"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// hangingUpstream never answers, until the test ends.
+func hangingUpstream(t *testing.T) string {
+	t.Helper()
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-done:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(done); srv.Close() })
+	return srv.URL
 }
 
 func okUpstream(t *testing.T) *httptest.Server {
@@ -87,7 +122,13 @@ func TestRecorder_EachPathRecordsOnce(t *testing.T) {
 		// unknownLength sends the body chunked, so only reading it can
 		// find it too large.
 		unknownLength bool
-		want          proxy.RequestInfo // durations aren't compared
+		provider      proxy.Provider    // instead of Anthropic on upstream
+		body          io.Reader         // instead of reqBody
+		header        map[string]string // added to the request
+		// cancelAfter cancels the request's context after this long, as a
+		// client going away; negative means before the request starts.
+		cancelAfter time.Duration
+		want        proxy.RequestInfo // durations aren't compared
 	}{
 		{
 			name:     "success",
@@ -174,26 +215,136 @@ func TestRecorder_EachPathRecordsOnce(t *testing.T) {
 			want: proxy.RequestInfo{Status: 504, Failed: true, Phase: proxy.PhaseUpstream, RateLimit: proxy.RateLimitAllowed,
 				Ran: allStages &^ proxy.StageStream},
 		},
+		{
+			name:     "400 unreadable body",
+			upstream: func(*testing.T) string { return unusedUpstream },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			body:     iotest.ErrReader(errors.New("connection reset")),
+			want: proxy.RequestInfo{Status: 400, Failed: true, Phase: proxy.PhaseReadBody, RateLimit: proxy.RateLimitAllowed,
+				Ran: proxy.StageRateLimit | proxy.StageReadBody},
+		},
+		{
+			name:     "408 body too slow",
+			upstream: func(*testing.T) string { return unusedUpstream },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			body:     iotest.ErrReader(os.ErrDeadlineExceeded), // what the read deadline produces
+			want: proxy.RequestInfo{Status: 408, Failed: true, Phase: proxy.PhaseReadBody, RateLimit: proxy.RateLimitAllowed,
+				Ran: proxy.StageRateLimit | proxy.StageReadBody},
+		},
+		{
+			// Rejected before the rate limit check.
+			name:     "415",
+			upstream: func(*testing.T) string { return unusedUpstream },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			header:   map[string]string{"Content-Encoding": "gzip"},
+			want:     proxy.RequestInfo{Status: 415, Failed: true, Phase: proxy.PhaseReadBody, RateLimit: proxy.RateLimitNotChecked},
+		},
+		{
+			// The limiter reports the client's own cancellation: no decision.
+			name:        "499 during the rate limit check",
+			upstream:    func(*testing.T) string { return unusedUpstream },
+			opts:        func() proxy.Options { return proxy.Options{RateLimiter: wireLimiter{err: context.Canceled}} },
+			cancelAfter: -1,
+			want: proxy.RequestInfo{Status: 499, Failed: true, Phase: proxy.PhaseRateLimit, RateLimit: proxy.RateLimitNotChecked,
+				Ran: proxy.StageRateLimit},
+		},
+		{
+			name:        "499 waiting for upstream",
+			upstream:    func(t *testing.T) string { return hangingUpstream(t) },
+			opts:        func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			cancelAfter: 30 * time.Millisecond,
+			want: proxy.RequestInfo{Status: 499, Failed: true, Phase: proxy.PhaseUpstream, RateLimit: proxy.RateLimitAllowed,
+				Ran: allStages &^ proxy.StageStream},
+		},
+		{
+			// The 200 is sent; the failure keeps it, with phase stream.
+			name: "stream broken after its 200",
+			upstream: func(t *testing.T) string {
+				srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					io.WriteString(w, "event: ping\ndata: {}\n\n")
+					w.(http.Flusher).Flush()
+					panic(http.ErrAbortHandler) // drops the connection mid-stream
+				}))
+				srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+				srv.Start()
+				t.Cleanup(srv.Close)
+				return srv.URL
+			},
+			opts: func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			want: proxy.RequestInfo{Status: 200, Failed: true, Phase: proxy.PhaseStream, RateLimit: proxy.RateLimitAllowed, Ran: allStages},
+		},
+		{
+			name:     "502 upstream rejects the gateway's key (401)",
+			upstream: func(t *testing.T) string { return statusUpstream(t, http.StatusUnauthorized) },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			want: proxy.RequestInfo{Status: 502, Failed: true, Phase: proxy.PhaseUpstream, RateLimit: proxy.RateLimitAllowed,
+				Ran: allStages &^ proxy.StageStream},
+		},
+		{
+			name:     "502 upstream forbids the gateway's key (403)",
+			upstream: func(t *testing.T) string { return statusUpstream(t, http.StatusForbidden) },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			want: proxy.RequestInfo{Status: 502, Failed: true, Phase: proxy.PhaseUpstream, RateLimit: proxy.RateLimitAllowed,
+				Ran: allStages &^ proxy.StageStream},
+		},
+		{
+			name: "502 provider breaks its contract",
+			provider: stubProvider{resp: &proxy.Response{
+				Status: http.StatusNotModified, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")),
+			}},
+			opts: func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			want: proxy.RequestInfo{Status: 502, Failed: true, Phase: proxy.PhaseUpstream, RateLimit: proxy.RateLimitAllowed,
+				Ran: allStages &^ proxy.StageStream},
+		},
+		{
+			// The upstream's own error, relayed: not a gateway failure.
+			name:     "upstream 5xx passed through",
+			upstream: func(t *testing.T) string { return statusUpstream(t, http.StatusInternalServerError) },
+			opts:     func() proxy.Options { return proxy.Options{RateLimiter: allowAll} },
+			want:     proxy.RequestInfo{Status: 500, RateLimit: proxy.RateLimitAllowed, Ran: allStages},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rec := &fakeRecorder{}
-			gw, _ := recordedGateway(t, tt.upstream(t), tt.opts(), rec)
+			var gw http.Handler
+			want := tt.want
+			if tt.provider != nil {
+				gw, _ = recordedGatewayFor(tt.provider, tt.opts(), rec)
+				want.Upstream, want.Protocol = "stub", "stub"
+			} else {
+				gw, _ = recordedGateway(t, tt.upstream(t), tt.opts(), rec)
+				want.Upstream, want.Protocol = "anthropic", "anthropic"
+			}
 			var r io.Reader = strings.NewReader(reqBody)
+			if tt.body != nil {
+				r = tt.body
+			}
 			if tt.unknownLength {
 				r = io.MultiReader(r) // hides the length from NewRequest
 			}
-			req := httptest.NewRequest(http.MethodPost, "/v1/messages", r)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			switch {
+			case tt.cancelAfter < 0:
+				cancel()
+			case tt.cancelAfter > 0:
+				time.AfterFunc(tt.cancelAfter, cancel)
+			}
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", r)
 			req.Header.Set("X-Api-Key", gatewayKey)
+			for k, v := range tt.header {
+				req.Header.Set(k, v)
+			}
 			w := httptest.NewRecorder()
 			gw.ServeHTTP(w, req)
-			if w.Code != tt.want.Status {
+			// A 499 sends nothing; the recorder keeps its default.
+			if tt.want.Status != 499 && w.Code != tt.want.Status {
 				t.Fatalf("status %d, want %d: %s", w.Code, tt.want.Status, w.Body)
 			}
 
 			got := rec.only(t)
-			want := tt.want
-			want.Upstream, want.Protocol = "anthropic", "anthropic"
 			durations := got
 			got.RateLimitDuration, got.ReadBody, got.UpstreamTTFB, got.Stream, got.Total = 0, 0, 0, 0, 0
 			if got != want {

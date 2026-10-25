@@ -36,8 +36,9 @@ const (
 	shutdownTimeout = 30 * time.Second
 	defaultRateRPM  = 60
 	// Loopback only, and never the API port: metrics are for the operator,
-	// not for clients.
-	defaultMetricsAddr = "127.0.0.1:9091"
+	// not for clients. 9464 is the conventional port of OpenTelemetry's
+	// Prometheus exporter; 9091 would clash with the Pushgateway's.
+	defaultMetricsAddr = "127.0.0.1:9464"
 	metricsOff         = "off"
 	// A scrape takes milliseconds; nothing on the metrics port streams.
 	metricsShutdownTimeout = 5 * time.Second
@@ -325,9 +326,10 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
-	errCh := make(chan error, 2)
 	// The metrics listener binds first, so "listening", which make
-	// bench-gateway waits for, still means the whole gateway is up.
+	// bench-gateway waits for, still means the whole gateway is up. A bind
+	// failure stops startup; once serving, a metrics failure only loses
+	// metrics: it is logged and the API keeps serving.
 	var metricsSrv *http.Server
 	if metrics != nil {
 		mln, err := listenMetrics(logger, cfg.metricsAddr)
@@ -335,7 +337,11 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 			return fmt.Errorf("SENTINEL_METRICS_ADDR: %w", err)
 		}
 		metricsSrv = newMetricsServer(metrics.Handler(), logger)
-		go func() { errCh <- metricsSrv.Serve(mln) }()
+		go func() {
+			if err := metricsSrv.Serve(mln); !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics server stopped; the API keeps serving without metrics", "error", err)
+			}
+		}()
 		defer metricsSrv.Close()
 	}
 
@@ -343,6 +349,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if err != nil {
 		return err
 	}
+	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
 	select {
@@ -382,11 +389,15 @@ func listen(logger *slog.Logger, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+// listenTCP is net.Listen for the metrics listener; a var so tests can make
+// that listener fail.
+var listenTCP = net.Listen
+
 // listenMetrics binds the metrics address and only then logs "metrics
 // listening". It never logs "listening", which make bench-gateway takes to
 // mean the API port is open.
 func listenMetrics(logger *slog.Logger, addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenTCP("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -642,7 +653,12 @@ func parseKeys(s string) []string {
 
 // parseMetricsAddr reads SENTINEL_METRICS_ADDR. Empty means
 // defaultMetricsAddr, and "off" means no metrics, returned as "". Anything
-// else must be host:port with a numeric port, and not apiAddr's port.
+// else must be host:port with a numeric port, and that port must not be
+// apiAddr's, whatever either host: 0.0.0.0, [::] and 127.0.0.1 overlap in
+// practice, and a client resolving localhost to ::1 would otherwise reach
+// metrics on the API's port. Ports compare as numbers, so 08081 is 8081,
+// and a named API port such as :http is resolved first. Port 0 (any free
+// port) is exempt.
 func parseMetricsAddr(s, apiAddr string) (string, error) {
 	switch s = strings.TrimSpace(s); s {
 	case "":
@@ -656,10 +672,13 @@ func parseMetricsAddr(s, apiAddr string) (string, error) {
 	}
 	n, err := strconv.ParseUint(port, 10, 16)
 	if err != nil {
-		return "", fmt.Errorf("%q has no valid port", s)
+		return "", fmt.Errorf("%q has no numeric port", s)
 	}
-	if _, apiPort, err := net.SplitHostPort(apiAddr); err == nil && n != 0 && port == apiPort {
-		return "", fmt.Errorf("%q has SENTINEL_ADDR's port; metrics never share the API's listener", s)
+	// An API address that doesn't parse fails at its own bind.
+	if _, apiPort, err := net.SplitHostPort(apiAddr); err == nil && n != 0 {
+		if api, err := net.LookupPort("tcp", apiPort); err == nil && uint64(api) == n {
+			return "", fmt.Errorf("%q has SENTINEL_ADDR's port %d; metrics never share the API's port", s, n)
+		}
 	}
 	return s, nil
 }

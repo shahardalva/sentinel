@@ -105,11 +105,14 @@ tool policies, and writes an audit log.
 - SENTINEL_ADDR (optional): listen address, default 127.0.0.1:8081
   (loopback only). Set it explicitly to expose the gateway on a network.
 - SENTINEL_METRICS_ADDR (optional): metrics listener, default
-  127.0.0.1:9091, serving only GET /metrics, never on the API port. "off"
+  127.0.0.1:9464, serving only GET /metrics, never on the API port. "off"
   disables metrics (no listener, no Recorder). Must be host:port with a
-  numeric port other than SENTINEL_ADDR's, else startup stops; so does a
-  failed bind. Binds before the API listener and logs "metrics listening";
-  shut down after the API. The "unauthorized" WARN is rate-limited (one per
+  numeric port other than SENTINEL_ADDR's on any host (compared as
+  numbers; port 0 exempt), else startup stops; so does a failed bind.
+  Binds before the API listener and logs "metrics listening"; shut down
+  after the API. A metrics Serve error later is logged at ERROR and the
+  API keeps serving; API errors stay fatal. A provider panic is logged and
+  recorded as a failure (500 unless a status was sent), then re-raised. The "unauthorized" WARN is rate-limited (one per
   10s, with a suppressed count) across all routes via one proxy.Auth.
 - ANTHROPIC_BASE_URL (optional): upstream override, default https://api.anthropic.com.
   Must be https (plain http only for a loopback host); the gateway refuses
@@ -155,10 +158,13 @@ OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_* and SENTINEL_API_KEYS from .env
 SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
 port on 127.0.0.1 only. The gateway and gateway-bench get
-SENTINEL_METRICS_ADDR=0.0.0.0:9091, unpublished; Prometheus (pinned image,
+SENTINEL_METRICS_ADDR=0.0.0.0:9464, unpublished; Prometheus (pinned image,
 not published) scrapes both, so gateway-bench shows DOWN outside a bench.
-Grafana (pinned image) is on 127.0.0.1:3000 with no admin password in any
-file (login form and basic auth off). The dashboard queries the Prometheus
+Grafana (pinned image) is on 127.0.0.1:3000 with no admin account
+(GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION), login form and basic auth
+off, and no runtime plugin installs or updates (GF_PLUGINS_PREINSTALL_*):
+with a read-only root, an update replacing the bundled Prometheus plugin
+left Grafana without one. The dashboard queries the Prometheus
 names (sentinel_requests_total, ..._seconds_bucket); a test in
 internal/telemetry checks them against a real scrape. gateway-bench uses Redis database 1 with
 SENTINEL_RATE_LIMIT_RPM=1000000, so the bench includes the Redis call but

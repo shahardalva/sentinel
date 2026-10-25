@@ -14,8 +14,9 @@ type Recorder interface {
 	// RecordRequest is called once per request a Handler serves, after its
 	// log line is written.
 	RecordRequest(ctx context.Context, info RequestInfo)
-	// RecordAuthRejection is called once per request RequireKey rejects.
-	// Nothing about the presented key is passed on.
+	// RecordAuthRejection is called once per request rejected by an Auth
+	// given this Recorder (NewAuth(keys, logger, rec).Require). RequireKey
+	// passes none. Nothing about the presented key is passed on.
 	RecordAuthRejection(ctx context.Context)
 }
 
@@ -92,20 +93,31 @@ func (o RateLimitOutcome) String() string {
 	return "unknown"
 }
 
+// throttleBase is the origin of logThrottle's clock. Offsets from it use
+// Go's monotonic reading, so a wall-clock step back (NTP, a resumed VM)
+// can't hold a throttle shut until the wall clock catches up.
+var throttleBase = time.Now()
+
 // logThrottle lets a repeated log line through at most once per interval
 // and counts the ones it holds back, so a flood (a Redis outage, a client
-// hammering with bad keys) can't fill the log.
+// hammering with bad keys) can't fill the log. Each line let through
+// reports the count held back since the previous one; the count after the
+// last line of a flood is never logged, so a metric, not the log, carries
+// totals.
 type logThrottle struct {
-	last    atomic.Int64 // UnixNano of the last line let through
+	// last is the offset from throttleBase of the last line let through,
+	// plus one, so that the zero value means none yet.
+	last    atomic.Int64
 	skipped atomic.Int64
 }
 
-// allow reports whether to log now, and if so how many lines were held
-// back since the last one.
+// allow reports whether to log at now, and if so how many lines were held
+// back since the last one. now must not be before throttleBase; callers
+// pass time.Now(), tests a time derived from throttleBase.
 func (t *logThrottle) allow(now time.Time, interval time.Duration) (ok bool, suppressed int64) {
-	n := now.UnixNano()
+	n := int64(now.Sub(throttleBase)) + 1
 	last := t.last.Load()
-	if n-last < int64(interval) || !t.last.CompareAndSwap(last, n) {
+	if (last != 0 && n-last < int64(interval)) || !t.last.CompareAndSwap(last, n) {
 		t.skipped.Add(1)
 		return false, 0
 	}

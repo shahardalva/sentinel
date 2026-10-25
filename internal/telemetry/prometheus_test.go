@@ -107,9 +107,32 @@ func dashboardExprs(t *testing.T) []string {
 
 var (
 	sentinelMetric = regexp.MustCompile(`\bsentinel_[a-z0-9_]+\b`)
-	// label="value", but not != or =~.
-	equalsMatcher = regexp.MustCompile(`([a-z_]+)="([^"]*)"`)
+	// A label matcher of any kind: =, !=, =~ or !~.
+	labelMatcher = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)\s*"([^"]*)"`)
+	// The labels of a by (...) or without (...) clause.
+	groupingClause = regexp.MustCompile(`\b(?:by|without)\s*\(([^)]*)\)`)
+	// A label inside a series line's braces.
+	seriesLabel = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)="`)
 )
+
+// labelNames returns every label name on a sentinel_ series.
+func labelNames(exposition string) map[string]bool {
+	labels := map[string]bool{}
+	for line := range strings.SplitSeq(exposition, "\n") {
+		open, close := strings.IndexByte(line, '{'), strings.LastIndexByte(line, '}')
+		if !strings.HasPrefix(line, "sentinel_") || open < 0 || close < open {
+			continue
+		}
+		for _, m := range seriesLabel.FindAllStringSubmatch(line[open:close], -1) {
+			labels[m[1]] = true
+		}
+	}
+	return labels
+}
+
+// fromScrapeConfig are labels Prometheus adds when it scrapes (see
+// observability/prometheus/prometheus.yml), so no exposition has them.
+var fromScrapeConfig = map[string]bool{"service": true, "job": true, "instance": true}
 
 // The dashboard queries the Prometheus names (dots to underscores, a unit
 // suffix, _total, _bucket), not the OpenTelemetry ones. Every name it uses,
@@ -128,6 +151,7 @@ func TestDashboard_QueriesExportedNames(t *testing.T) {
 		}
 	}
 
+	labels := labelNames(exposition)
 	used := 0
 	for _, expr := range dashboardExprs(t) {
 		for _, name := range sentinelMetric.FindAllString(expr, -1) {
@@ -136,13 +160,25 @@ func TestDashboard_QueriesExportedNames(t *testing.T) {
 				t.Errorf("dashboard queries %s, which the exporter doesn't serve: %s", name, expr)
 			}
 		}
-		for _, m := range equalsMatcher.FindAllStringSubmatch(expr, -1) {
-			// service is added by Prometheus's scrape config.
-			if m[1] == "service" || strings.Contains(expr, m[1]+`!="`+m[2]+`"`) {
+		for _, m := range labelMatcher.FindAllStringSubmatch(expr, -1) {
+			name, op, value := m[1], m[2], m[3]
+			if fromScrapeConfig[name] {
 				continue
 			}
-			if !strings.Contains(exposition, m[0]) {
+			if !labels[name] {
+				t.Errorf("dashboard matches on label %s (%s), which no scraped series has: %s", name, m[0], expr)
+				continue
+			}
+			// An exact value must be one the gateway produces.
+			if op == "=" && value != "" && !strings.Contains(exposition, name+`="`+value+`"`) {
 				t.Errorf("dashboard matches %s, which no scraped series has: %s", m[0], expr)
+			}
+		}
+		for _, m := range groupingClause.FindAllStringSubmatch(expr, -1) {
+			for name := range strings.SplitSeq(m[1], ",") {
+				if name = strings.TrimSpace(name); name != "" && !fromScrapeConfig[name] && !labels[name] {
+					t.Errorf("dashboard groups by label %s, which no scraped series has: %s", name, expr)
+				}
 			}
 		}
 	}

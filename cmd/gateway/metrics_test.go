@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -17,30 +18,46 @@ import (
 func TestParseMetricsAddr(t *testing.T) {
 	const api = "127.0.0.1:8081"
 	tests := []struct {
-		in, want string
-		wantErr  bool
+		in, api, want string // api defaults to the const
+		wantErr       bool
 	}{
 		{in: "", want: defaultMetricsAddr},
 		{in: "off", want: ""},
 		{in: " off ", want: ""},
-		{in: "127.0.0.1:9091", want: "127.0.0.1:9091"},
-		{in: "0.0.0.0:9091", want: "0.0.0.0:9091"},
+		{in: "127.0.0.1:9464", want: "127.0.0.1:9464"},
+		{in: "0.0.0.0:9464", want: "0.0.0.0:9464"},
 		{in: ":9100", want: ":9100"},
-		{in: "[::1]:9091", want: "[::1]:9091"},
+		{in: "[::1]:9464", want: "[::1]:9464"},
+		// Port 0 is any free port, never a clash.
 		{in: "127.0.0.1:0", want: "127.0.0.1:0"},
+		{in: "127.0.0.1:0", api: "127.0.0.1:0", want: "127.0.0.1:0"},
 		{in: "OFF", wantErr: true},
 		{in: "false", wantErr: true},
 		{in: "localhost", wantErr: true},
 		{in: "127.0.0.1:metrics", wantErr: true},
+		{in: ":http", wantErr: true}, // must be numeric
 		{in: "127.0.0.1:70000", wantErr: true},
-		{in: "http://127.0.0.1:9091", wantErr: true},
-		{in: "127.0.0.1:8081", wantErr: true}, // the API's port
+		{in: "http://127.0.0.1:9464", wantErr: true},
+		// The API's port, on any host and in any spelling.
+		{in: "127.0.0.1:8081", wantErr: true},
 		{in: "0.0.0.0:8081", wantErr: true},
+		{in: "127.0.0.1:08081", wantErr: true},
+		{in: "[::1]:8081", api: "0.0.0.0:8081", wantErr: true},
+		{in: "[::]:8081", api: "127.0.0.1:8081", wantErr: true},
+		{in: "127.0.0.2:8081", wantErr: true},
+		{in: "127.0.0.1:80", api: ":http", wantErr: true},
+		{in: "127.0.0.1:8081", api: ":08081", wantErr: true},
+		// An API address that doesn't parse is left to its own bind.
+		{in: "127.0.0.1:8081", api: "garbage", want: "127.0.0.1:8081"},
 	}
 	for _, tt := range tests {
-		got, err := parseMetricsAddr(tt.in, api)
+		a := tt.api
+		if a == "" {
+			a = api
+		}
+		got, err := parseMetricsAddr(tt.in, a)
 		if (err != nil) != tt.wantErr || got != tt.want {
-			t.Errorf("parseMetricsAddr(%q) = %q, %v; want %q, error %v", tt.in, got, err, tt.want, tt.wantErr)
+			t.Errorf("parseMetricsAddr(%q, %q) = %q, %v; want %q, error %v", tt.in, a, got, err, tt.want, tt.wantErr)
 		}
 	}
 }
@@ -55,8 +72,8 @@ func TestLoadConfig_MetricsAddr(t *testing.T) {
 		return m
 	}
 	cfg, err := loadConfig(env(base))
-	if err != nil || cfg.metricsAddr != "127.0.0.1:9091" {
-		t.Errorf("default: metricsAddr %q, %v; want 127.0.0.1:9091", cfg.metricsAddr, err)
+	if err != nil || cfg.metricsAddr != "127.0.0.1:9464" {
+		t.Errorf("default: metricsAddr %q, %v; want 127.0.0.1:9464", cfg.metricsAddr, err)
 	}
 	if cfg, err := loadConfig(env(with("off"))); err != nil || cfg.metricsAddr != "" {
 		t.Errorf("off: metricsAddr %q, %v; want empty", cfg.metricsAddr, err)
@@ -327,5 +344,97 @@ func TestServe_MetricsBindFailureStopsStartup(t *testing.T) {
 		if m := line["msg"]; m == "listening" || m == "metrics listening" {
 			t.Errorf("logged %q though the metrics bind failed", m)
 		}
+	}
+}
+
+// failingListener is a bound listener whose Accept fails at once, as a
+// broken socket would.
+type failingListener struct {
+	net.Listener
+	err error
+}
+
+func (l failingListener) Accept() (net.Conn, error) { return nil, l.err }
+
+// A metrics server that stops serving is logged, and the API is untouched.
+func TestServe_MetricsServeErrorKeepsAPI(t *testing.T) {
+	errAccept := errors.New("accept: broken socket")
+	defer func(f func(string, string) (net.Listener, error)) { listenTCP = f }(listenTCP)
+	listenTCP = func(network, addr string) (net.Listener, error) {
+		ln, err := net.Listen(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return failingListener{ln, errAccept}, nil
+	}
+	r := startServe(t, nil)
+
+	var logged map[string]any
+	for deadline := time.Now().Add(5 * time.Second); logged == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		for _, line := range r.logs.lines(t) {
+			if line["msg"] == "metrics server stopped; the API keeps serving without metrics" {
+				logged = line
+			}
+		}
+	}
+	if logged == nil {
+		t.Fatal("metrics server failure not logged")
+	}
+	if e, _ := logged["error"].(string); logged["level"] != "ERROR" || !strings.Contains(e, errAccept.Error()) {
+		t.Errorf("logged %v, want ERROR with the accept error", logged)
+	}
+	select {
+	case err := <-r.done:
+		t.Fatalf("serve returned %v after a metrics failure, want it still serving", err)
+	default:
+	}
+	if code, _ := get(t, http.MethodPost, "http://"+r.api+"/v1/messages", http.Header{"X-Api-Key": {"wrong"}}); code != http.StatusUnauthorized {
+		t.Errorf("API after the metrics failure: %d, want 401", code)
+	}
+}
+
+// An API bind failure after the metrics listener is up stops startup and
+// closes the metrics listener.
+func TestServe_APIBindFailureClosesMetrics(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	cfg, err := loadConfig(env(map[string]string{
+		"ANTHROPIC_API_KEY":     "sk",
+		"SENTINEL_API_KEYS":     "k",
+		"SENTINEL_ADDR":         taken.Addr().String(),
+		"SENTINEL_METRICS_ADDR": "127.0.0.1:0",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	done := make(chan error, 1)
+	go func() { done <- serve(context.Background(), slog.New(slog.NewJSONHandler(logs, nil)), cfg) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve = nil with the API address taken, want an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve kept running with its API address taken")
+	}
+	var metricsAddr string
+	for _, line := range logs.lines(t) {
+		switch line["msg"] {
+		case "metrics listening":
+			metricsAddr, _ = line["addr"].(string)
+		case "listening":
+			t.Error(`logged "listening" though the API bind failed`)
+		}
+	}
+	if metricsAddr == "" {
+		t.Fatal("the metrics listener never came up")
+	}
+	if conn, err := net.DialTimeout("tcp", metricsAddr, time.Second); err == nil {
+		conn.Close()
+		t.Error("metrics listener still accepting after startup failed")
 	}
 }

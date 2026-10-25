@@ -55,7 +55,7 @@ services:
       SENTINEL_REDIS_URL: redis://redis:6379/0
       # Metrics on all interfaces inside the container, for Prometheus on
       # the compose network. Not published on the host.
-      SENTINEL_METRICS_ADDR: 0.0.0.0:9091
+      SENTINEL_METRICS_ADDR: 0.0.0.0:9464
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:
@@ -138,7 +138,7 @@ services:
       # Database 1, apart from the gateway's buckets in database 0.
       SENTINEL_REDIS_URL: redis://redis:6379/1
       SENTINEL_RATE_LIMIT_RPM: "1000000"
-      SENTINEL_METRICS_ADDR: 0.0.0.0:9091
+      SENTINEL_METRICS_ADDR: 0.0.0.0:9464
     volumes:
       - *ca
     depends_on:
@@ -157,7 +157,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Scrapes gateway:9091 and gateway-bench:9091 on the compose network
+  # Scrapes gateway:9464 and gateway-bench:9464 on the compose network
   # (observability/prometheus/prometheus.yml). Not published on the host;
   # Grafana is the way in. Runs as nobody and writes only its data volume.
   prometheus:
@@ -167,6 +167,7 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
     volumes:
       - type: bind
         source: ./observability/prometheus/prometheus.yml
@@ -178,9 +179,10 @@ services:
     restart: unless-stopped
 
   # Local dev only: anyone who can reach 127.0.0.1:3000 sees the dashboards
-  # as an anonymous Viewer. The login form and basic auth are off, so the
-  # built-in admin account can't be used, and no password is set anywhere.
-  # The data source and the dashboard are provisioned from ./observability.
+  # as an anonymous Viewer. No admin account is created, and the login form
+  # and basic auth are off, so there is no password anywhere. The data
+  # source and the dashboard are provisioned from ./observability.
+  # Settings: https://grafana.com/docs/grafana/v13.2/setup-grafana/configure-grafana/
   grafana:
     image: grafana/grafana:13.2.4
     <<: *hardening
@@ -191,12 +193,32 @@ services:
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_AUTH_BASIC_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # Applies to an empty grafana-data volume; an existing one keeps the
+      # admin it already has until the volume is removed.
+      GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: "true"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/sentinel.json
-      # Nothing leaves the machine.
+      # No code fetched at runtime. By default Grafana downloads and updates
+      # its "preinstalled" plugins (the Prometheus data source among them)
+      # from grafana.com in the background. A pinned image must run the
+      # plugins it shipped with; the read-only root exposed this when an
+      # update tried to replace the bundled Prometheus plugin and left none.
+      # The image's copies in data/plugins-bundled still load.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      # The embedded signing key verifies plugins; don't download a new one.
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      # With these, every outbound feature the 13.2 configuration reference
+      # lists is off: usage stats, update checks, the news feed, Gravatar,
+      # external snapshots, plugin installs and key downloads. Not verified
+      # by watching traffic. The UI still links to grafana.com docs, which
+      # the browser follows only if clicked.
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
       # Console only: the root filesystem is read-only.
       GF_LOG_MODE: console
     tmpfs:

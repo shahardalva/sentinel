@@ -244,7 +244,7 @@ func newMetrics(cfg Config, reader sdkmetric.Reader) (*Metrics, error) {
 	}
 	if open := cfg.BreakerOpen; open != nil {
 		_, err = meter.Int64ObservableGauge("sentinel.ratelimit.breaker.open",
-			metric.WithDescription("1 while the Redis circuit breaker is open, else 0."),
+			metric.WithDescription("1 while the Redis circuit breaker is open, else 0. Only a request's probe closes it, so it stays 1 on an idle gateway after Redis recovers."),
 			metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 				var v int64
 				if open() {
@@ -273,6 +273,11 @@ func newMetrics(cfg Config, reader sdkmetric.Reader) (*Metrics, error) {
 	return m, nil
 }
 
+// newRouteAttrs builds the attribute sets for one upstream. The full slice
+// expressions (s[:len(s):len(s)]) are load-bearing: attribute.NewSet sorts
+// its argument in place, and appending to a slice with spare capacity
+// would let one set's sort, or the next append, rewrite another's
+// attributes. Capping the capacity makes every append copy.
 func newRouteAttrs(upstream, protocol string) *routeAttrs {
 	ra := &routeAttrs{}
 	base := []attribute.KeyValue{keyUpstream.String(upstream), keyProtocol.String(protocol)}
