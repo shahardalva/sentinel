@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func mustClient(t *testing.T, cfg ClientConfig) *http.Client {
@@ -153,6 +154,51 @@ func TestNewClient_ConnectionPool(t *testing.T) {
 	if tr == http.DefaultTransport {
 		t.Error("shares http.DefaultTransport; must be a clone")
 	}
+}
+
+// roundTripperFunc is a RoundTripper that isn't an *http.Transport.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Not parallel: it swaps the process-wide http.DefaultTransport.
+func TestNewClient_ReplacedDefaultTransport(t *testing.T) {
+	old := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = old })
+	http.DefaultTransport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("replaced transport used")
+	})
+
+	c, err := NewClient(ClientConfig{MaxIdleConns: 300})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want a fresh *http.Transport", c.Transport)
+	}
+	// Go's documented DefaultTransport settings, except the pool, which
+	// NewClient sets, and TLS, which it adds.
+	if tr.Proxy == nil || tr.DialContext == nil || !tr.ForceAttemptHTTP2 ||
+		tr.IdleConnTimeout != 90*time.Second || tr.TLSHandshakeTimeout != 10*time.Second ||
+		tr.ExpectContinueTimeout != time.Second {
+		t.Errorf("transport lacks DefaultTransport's defaults: %+v", tr)
+	}
+	if tr.MaxIdleConns != 300 || tr.MaxIdleConnsPerHost != 300 {
+		t.Errorf("idle conns = %d per host, %d total; want 300", tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		t.Errorf("TLSClientConfig = %+v, want MinVersion >= TLS 1.2", tr.TLSClientConfig)
+	}
+
+	// And it works, without going through the replaced transport.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	resp.Body.Close()
 }
 
 func TestNewClient_RequiresPoolSize(t *testing.T) {
