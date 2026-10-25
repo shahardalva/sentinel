@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -108,7 +110,9 @@ func FormatError(_ int, kind proxy.ErrorKind, msg string) (string, []byte) {
 
 // Forward sends the body to the Messages API. Only anthropic-version and
 // anthropic-beta are taken from the client; credentials always come from the
-// gateway's config. Only allowlisted response headers are returned.
+// gateway's config. Only allowlisted response headers are returned, and a
+// non-2xx body is replaced by sanitizeError's; a 2xx body is untouched, so a
+// stream stays incremental.
 func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Response, error) {
 	version := req.Header.Get("Anthropic-Version")
 	if version == "" {
@@ -144,12 +148,85 @@ func (p *Provider) Forward(ctx context.Context, req *proxy.Request) (*proxy.Resp
 			header[k] = vv
 		}
 	}
+	// Go hands back a 101 Switching Protocols, whose body is the raw
+	// connection: nothing a client can use, and a read the request's
+	// context can't stop. No other 1xx reaches here.
+	if resp.StatusCode < 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("anthropic: upstream sent an informational status (%d)", resp.StatusCode)
+	}
+	body := resp.Body
+	if resp.StatusCode > 299 {
+		b, err := sanitizeError(ctx, resp.StatusCode, resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: read error body: %w", err)
+		}
+		header.Set("Content-Type", "application/json")
+		body = io.NopCloser(bytes.NewReader(b))
+	}
 	return &proxy.Response{
 		Status:    resp.StatusCode,
 		Header:    header,
-		Body:      resp.Body,
+		Body:      body,
 		RequestID: resp.Header.Get("Request-Id"),
 	}, nil
+}
+
+// sanitizeError reads and closes a non-2xx body, and returns the body the
+// client gets instead. A Messages API error is re-encoded with the same
+// error type and its message's account identifiers redacted (see
+// upstream.RedactAccountIDs); fields other than the error's type and
+// message and the request_id are dropped. Anything else, or a body over
+// upstream.MaxErrorBody, becomes the gateway's own api_error, "upstream
+// error". The error is a read that failed or ran out of time.
+func sanitizeError(ctx context.Context, status int, body io.ReadCloser) ([]byte, error) {
+	b, err := upstream.ReadErrorBody(ctx, body)
+	if err != nil && !errors.Is(err, upstream.ErrErrorBodyTooLarge) {
+		return nil, err
+	}
+	if err == nil {
+		if out, ok := redactError(b); ok {
+			return out, nil
+		}
+	}
+	_, out := FormatError(status, proxy.ErrAPI, "upstream error")
+	return out, nil
+}
+
+// upstreamError is the Messages API's error shape.
+type upstreamError struct {
+	Type  string `json:"type"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+	RequestID string `json:"request_id"`
+}
+
+// redactError re-encodes b, if it is a Messages API error, in FormatError's
+// form with identifiers redacted.
+func redactError(b []byte) ([]byte, bool) {
+	var e upstreamError
+	if json.Unmarshal(b, &e) != nil || e.Type != "error" || e.Error == nil || e.Error.Type == "" {
+		return nil, false
+	}
+	out := map[string]any{
+		"type": "error",
+		"error": map[string]string{
+			"type":    upstream.RedactAccountIDs(e.Error.Type),
+			"message": upstream.RedactAccountIDs(e.Error.Message),
+		},
+	}
+	if e.RequestID != "" {
+		out["request_id"] = upstream.RedactAccountIDs(e.RequestID)
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// Messages like "max_tokens: 100000 > 64000" stay as the upstream wrote
+	// them; the body is JSON, never HTML.
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(out)
+	return buf.Bytes(), true
 }
 
 // validVersion reports whether v is an API version date like 2023-06-01.

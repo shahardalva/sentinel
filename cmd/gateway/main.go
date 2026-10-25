@@ -28,12 +28,20 @@ import (
 	"github.com/shahardalva/sentinel/internal/provider/upstream"
 	"github.com/shahardalva/sentinel/internal/proxy"
 	"github.com/shahardalva/sentinel/internal/ratelimit"
+	"github.com/shahardalva/sentinel/internal/telemetry"
 )
 
 const (
 	defaultAddr     = "127.0.0.1:8081" // loopback only; set SENTINEL_ADDR to expose
 	shutdownTimeout = 30 * time.Second
 	defaultRateRPM  = 60
+	// Loopback only, and never the API port: metrics are for the operator,
+	// not for clients. 9464 is the conventional port of OpenTelemetry's
+	// Prometheus exporter; 9091 would clash with the Pushgateway's.
+	defaultMetricsAddr = "127.0.0.1:9464"
+	metricsOff         = "off"
+	// A scrape takes milliseconds; nothing on the metrics port streams.
+	metricsShutdownTimeout = 5 * time.Second
 )
 
 func main() {
@@ -136,6 +144,7 @@ type enabledUpstream struct {
 type config struct {
 	clientKeys    []string
 	addr          string
+	metricsAddr   string // empty when SENTINEL_METRICS_ADDR is "off"
 	maxConcurrent int
 	caFile        string // SENTINEL_UPSTREAM_CA_FILE; empty if unset
 	extraCAs      []*x509.Certificate
@@ -193,6 +202,10 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 	if addr == "" {
 		addr = defaultAddr
 	}
+	metricsAddr, err := parseMetricsAddr(getenv("SENTINEL_METRICS_ADDR"), addr)
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_METRICS_ADDR: %w", err)
+	}
 	maxConcurrent, err := parseMaxConcurrent(getenv("SENTINEL_MAX_CONCURRENT"))
 	if err != nil {
 		return config{}, fmt.Errorf("SENTINEL_MAX_CONCURRENT: %w", err)
@@ -239,6 +252,7 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 	return config{
 		clientKeys:     clientKeys,
 		addr:           addr,
+		metricsAddr:    metricsAddr,
 		maxConcurrent:  maxConcurrent,
 		caFile:         caFile,
 		extraCAs:       extraCAs,
@@ -257,12 +271,21 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serve(ctx, logger, cfg)
+}
+
+// serve runs the gateway for cfg until ctx is done, then shuts it down.
+func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 	logUpstreams(logger, cfg)
 	if cfg.caFile != "" {
 		logCAs(logger, cfg.caFile, cfg.extraCAs, cfg.upstreams)
 	}
 
-	var opts proxy.Options
+	// Created here rather than in newMux, so the metrics can watch it.
+	opts := proxy.Options{Admission: proxy.NewAdmission(cfg.maxConcurrent)}
+	var breakerOpen func() bool
 	if cfg.redis == nil {
 		logger.Info("rate limiting disabled: SENTINEL_REDIS_URL is not set")
 	} else {
@@ -274,7 +297,20 @@ func run(logger *slog.Logger) error {
 		}
 		opts.RateLimiter = limiter
 		opts.RateLimitFailClosed = cfg.rateFailClosed
+		breakerOpen = limiter.BreakerOpen
 		logRateLimit(logger, cfg)
+	}
+
+	var metrics *telemetry.Metrics
+	if cfg.metricsAddr == "" {
+		logger.Info("metrics disabled: SENTINEL_METRICS_ADDR is off")
+	} else {
+		var err error
+		if metrics, err = newMetrics(cfg, opts.Admission, breakerOpen); err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		defer metrics.Shutdown(context.Background())
+		opts.Recorder = metrics
 	}
 
 	mux := newMux(cfg, logger, opts)
@@ -290,19 +326,35 @@ func run(logger *slog.Logger) error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
+	// The metrics listener binds first, so "listening", which make
+	// bench-gateway waits for, still means the whole gateway is up. A bind
+	// failure stops startup; once serving, a metrics failure only loses
+	// metrics: it is logged and the API keeps serving.
+	var metricsSrv *http.Server
+	if metrics != nil {
+		mln, err := listenMetrics(logger, cfg.metricsAddr)
+		if err != nil {
+			return fmt.Errorf("SENTINEL_METRICS_ADDR: %w", err)
+		}
+		metricsSrv = newMetricsServer(metrics.Handler(), logger)
+		go func() {
+			if err := metricsSrv.Serve(mln); !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics server stopped; the API keeps serving without metrics", "error", err)
+			}
+		}()
+		defer metricsSrv.Close()
+	}
+
 	ln, err := listen(logger, cfg.addr)
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
 	select {
 	case err := <-errCh:
+		_ = srv.Close()
 		return err
 	case <-ctx.Done():
 	}
@@ -315,6 +367,13 @@ func run(logger *slog.Logger) error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("grace period expired; closing open connections", "error", err)
 		_ = srv.Close()
+	}
+	// After the API, so a scrape during the grace period still answers.
+	// The deferred Close cuts whatever outlives this.
+	if metricsSrv != nil {
+		mctx, mcancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+		defer mcancel()
+		_ = metricsSrv.Shutdown(mctx)
 	}
 	return nil
 }
@@ -330,9 +389,53 @@ func listen(logger *slog.Logger, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+// listenTCP is net.Listen for the metrics listener; a var so tests can make
+// that listener fail.
+var listenTCP = net.Listen
+
+// listenMetrics binds the metrics address and only then logs "metrics
+// listening". It never logs "listening", which make bench-gateway takes to
+// mean the API port is open.
+func listenMetrics(logger *slog.Logger, addr string) (net.Listener, error) {
+	ln, err := listenTCP("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("metrics listening", "addr", ln.Addr().String(), "path", "/metrics")
+	return ln, nil
+}
+
+// newMetrics returns the gateway's metrics, labelled with the enabled
+// upstreams, watching admission and, when rate limiting is on, the Redis
+// breaker.
+func newMetrics(cfg config, admission *proxy.Admission, breakerOpen func() bool) (*telemetry.Metrics, error) {
+	tc := telemetry.Config{Admission: admission, BreakerOpen: breakerOpen}
+	for _, u := range cfg.upstreams {
+		tc.Upstreams = append(tc.Upstreams, telemetry.Upstream{Name: u.spec.name, Protocol: u.provider.Name()})
+	}
+	return telemetry.New(tc)
+}
+
+// newMetricsServer serves metrics on GET /metrics and nothing else. Unlike
+// the API server it has whole-request timeouts: a scrape is short.
+func newMetricsServer(metrics http.Handler, logger *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics)
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
+}
+
 // newMux registers the routes of every enabled upstream (see
-// upstreamSpec.routes), each behind the same client keys. Every handler
-// gets the same opts, so they share its rate limiter, and one Admission:
+// upstreamSpec.routes), each behind the same client keys and one
+// proxy.Auth, which reports rejections to opts.Recorder. Every handler gets
+// the same opts, so they share its rate limiter and Recorder, and one
+// Admission:
 // when opts has none, newMux creates it with cfg.maxConcurrent slots. One
 // cap for the whole gateway means every route and upstream draws on the
 // same slots, so the memory bound in ADR 0001 holds however many there are.
@@ -340,11 +443,12 @@ func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux 
 	if opts.Admission == nil {
 		opts.Admission = proxy.NewAdmission(cfg.maxConcurrent)
 	}
+	auth := proxy.NewAuth(cfg.clientKeys, logger, opts.Recorder)
 	mux := http.NewServeMux()
 	for _, u := range cfg.upstreams {
 		o := opts
 		o.Upstream = u.spec.name
-		h := proxy.RequireKey(cfg.clientKeys, u.provider, logger, proxy.NewHandler(u.provider, logger, o))
+		h := auth.Require(u.provider, proxy.NewHandler(u.provider, logger, o))
 		for _, route := range u.spec.routes() {
 			mux.Handle(route, h)
 		}
@@ -545,6 +649,38 @@ func parseKeys(s string) []string {
 		}
 	}
 	return keys
+}
+
+// parseMetricsAddr reads SENTINEL_METRICS_ADDR. Empty means
+// defaultMetricsAddr, and "off" means no metrics, returned as "". Anything
+// else must be host:port with a numeric port, and that port must not be
+// apiAddr's, whatever either host: 0.0.0.0, [::] and 127.0.0.1 overlap in
+// practice, and a client resolving localhost to ::1 would otherwise reach
+// metrics on the API's port. Ports compare as numbers, so 08081 is 8081,
+// and a named API port such as :http is resolved first. Port 0 (any free
+// port) is exempt.
+func parseMetricsAddr(s, apiAddr string) (string, error) {
+	switch s = strings.TrimSpace(s); s {
+	case "":
+		s = defaultMetricsAddr
+	case metricsOff:
+		return "", nil
+	}
+	_, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", fmt.Errorf("%q is neither host:port nor %q", s, metricsOff)
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return "", fmt.Errorf("%q has no numeric port", s)
+	}
+	// An API address that doesn't parse fails at its own bind.
+	if _, apiPort, err := net.SplitHostPort(apiAddr); err == nil && n != 0 {
+		if api, err := net.LookupPort("tcp", apiPort); err == nil && uint64(api) == n {
+			return "", fmt.Errorf("%q has SENTINEL_ADDR's port %d; metrics never share the API's port", s, n)
+		}
+	}
+	return s, nil
 }
 
 // parseMaxConcurrent reads the concurrency cap. Empty means

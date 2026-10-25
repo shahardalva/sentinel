@@ -29,6 +29,13 @@ func (a *Admission) TryAcquire() bool {
 	}
 }
 
+// InUse returns how many slots are taken right now, for a gauge. It may be
+// stale by the time the caller reads it.
+func (a *Admission) InUse() int { return len(a.slots) }
+
+// Limit returns the number of slots.
+func (a *Admission) Limit() int { return cap(a.slots) }
+
 // Release frees a slot taken by a successful TryAcquire. It panics if no
 // slot is held, rather than blocking; an unmatched Release while other
 // requests hold slots can't be detected, and would free one of theirs.

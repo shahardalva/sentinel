@@ -110,7 +110,14 @@ func TestBreaker_ProbeAfterCooldownCloses(t *testing.T) {
 	l, logs := breakerLimiter(t, "redis://"+mr.Addr())
 	addr := mr.Addr()
 	mr.Close()
-	failN(t, l, ratelimit.BreakerThreshold)
+	failN(t, l, ratelimit.BreakerThreshold-1)
+	if l.BreakerOpen() {
+		t.Fatalf("BreakerOpen after %d failures = true, want false", ratelimit.BreakerThreshold-1)
+	}
+	failN(t, l, 1)
+	if !l.BreakerOpen() {
+		t.Fatal("BreakerOpen after the threshold = false, want true")
+	}
 	if _, err := l.Allow(context.Background(), "client"); !errors.Is(err, ratelimit.ErrCircuitOpen) {
 		t.Fatalf("err = %v, want ErrCircuitOpen", err)
 	}
@@ -128,6 +135,9 @@ func TestBreaker_ProbeAfterCooldownCloses(t *testing.T) {
 	}
 	if _, err := l.Allow(context.Background(), "client"); err != nil {
 		t.Errorf("after a good probe: err = %v, want the breaker closed", err)
+	}
+	if l.BreakerOpen() {
+		t.Error("BreakerOpen after a good probe = true, want false")
 	}
 	if !strings.Contains(logs.String(), "redis circuit closed") {
 		t.Errorf("close not logged:\n%s", logs)

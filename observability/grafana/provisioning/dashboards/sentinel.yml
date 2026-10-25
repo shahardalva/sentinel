@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: sentinel
+    folder: Sentinel
+    type: file
+    disableDeletion: true
+    # The JSON in the repository is the source of truth.
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

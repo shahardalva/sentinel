@@ -47,6 +47,10 @@ Small negative values are measurement noise, not a gateway that speeds requests 
 
 **The concurrency cap leaves little headroom at 1000 req/s.** With about 100 requests in flight on average and a cap of 128, a short machine stall lets in-flight requests pile up past the cap, and the gateway sheds them with a fast 503. The gateway log confirms exactly 67 responses with status 503, matching the 67 failed requests k6 reported. This is the cap working as designed; the open question is whether 128 is the right default for this rate and latency.
 
+### Metrics cross-check, 2026-10-25
+
+A smoke test of the metrics branch (`make up`, then k6 at 1000 req/s through the gateway, with Prometheus and Grafana running on the same machine) was not a new measurement, but the counts agreed exactly: k6, Prometheus (`sentinel_requests_total`) and the gateway log each saw 47,959 requests, 47,811 answered `2xx` and 148 shed with `503` at admission (`phase="admit"`). Shedding at this rate matches run 2 above, with two more services competing for the machine.
+
 ## Raw percentiles
 
 `http_req_duration` for successful responses, in ms.

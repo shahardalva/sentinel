@@ -191,6 +191,11 @@ func (l *Limiter) Allow(ctx context.Context, client string) (proxy.RateLimit, er
 	return res, err
 }
 
+// BreakerOpen reports whether the circuit breaker is open, so Redis is
+// being skipped and the fail mode applied, for a gauge. It stays true
+// while a probe is in flight, until the probe succeeds.
+func (l *Limiter) BreakerOpen() bool { return l.breaker.isOpen() }
+
 func (l *Limiter) run(ctx context.Context, client string) (proxy.RateLimit, error) {
 	res, err := bucketScript.Run(ctx, l.client, []string{keyPrefix + client}, l.capacity, l.period).Int64Slice()
 	if err != nil {

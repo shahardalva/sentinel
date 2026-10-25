@@ -114,7 +114,9 @@ func TestHandler_PassesResponseThrough(t *testing.T) {
 		header map[string]string
 	}{
 		{"success", http.StatusOK, `{"id":"msg_1","type":"message"}`, map[string]string{"Request-Id": "req_up_1"}},
-		{"upstream error", http.StatusTooManyRequests, `{"type":"error","error":{"type":"rate_limit_error"}}`, map[string]string{"Retry-After": "7"}},
+		// A Messages API error with no account identifiers, already in the
+		// form the provider re-encodes it to, so it comes out byte for byte.
+		{"upstream error", http.StatusTooManyRequests, `{"error":{"message":"Number of request tokens has exceeded your per-minute rate limit","type":"rate_limit_error"},"type":"error"}` + "\n", map[string]string{"Retry-After": "7"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -826,6 +828,273 @@ func TestHandler_ProviderRejectsRequest(t *testing.T) {
 	}
 	if line["level"] != "WARN" {
 		t.Errorf("log level = %v, want WARN", line["level"])
+	}
+}
+
+// trackedBody records whether it was closed.
+type trackedBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *trackedBody) Close() error { b.closed.Store(true); return nil }
+
+func TestHandler_ProviderBreaksContract(t *testing.T) {
+	body := func() *trackedBody { return &trackedBody{Reader: strings.NewReader("ok")} }
+	tests := []struct {
+		name    string
+		resp    *proxy.Response
+		body    *trackedBody // resp.Body, if it is one
+		wantErr string
+	}{
+		{name: "nil response", wantErr: "nil response"},
+		{name: "nil body", resp: &proxy.Response{Status: http.StatusOK, Header: http.Header{}}, wantErr: "nil body"},
+		{name: "zero status", resp: &proxy.Response{}, body: body(), wantErr: "status 0"},
+		{name: "informational status", resp: &proxy.Response{Status: http.StatusEarlyHints}, body: body(), wantErr: "status 103"},
+		{name: "status over 599", resp: &proxy.Response{Status: 600}, body: body(), wantErr: "status 600"},
+		// A 3xx is never a final answer to pass on: the upstream client
+		// refuses redirects, so one that gets here has no Location (Go
+		// returns it as is) or is a 300 or 304.
+		{name: "multiple choices", resp: &proxy.Response{Status: http.StatusMultipleChoices}, body: body(), wantErr: "status 300"},
+		{name: "not modified", resp: &proxy.Response{Status: http.StatusNotModified}, body: body(), wantErr: "status 304"},
+		{name: "found without location", resp: &proxy.Response{Status: http.StatusFound}, body: body(), wantErr: "status 302"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := tt.resp
+			if tt.body != nil {
+				resp.Body = tt.body
+			}
+			rec, line := serveStub(t, stubProvider{resp: resp})
+
+			if rec.Code != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", rec.Code)
+			}
+			if typ := errorType(t, rec); typ != "api_error" {
+				t.Errorf("error type = %q, want api_error", typ)
+			}
+			if !strings.Contains(rec.Body.String(), "upstream unavailable") {
+				t.Errorf("body = %q, want upstream unavailable", rec.Body.String())
+			}
+			if line["phase"] != "upstream" || line["level"] != "ERROR" || line["status"] != float64(http.StatusBadGateway) {
+				t.Errorf("log = %v, want ERROR in phase upstream with status 502", line)
+			}
+			if e, _ := line["error"].(string); !strings.Contains(e, tt.wantErr) {
+				t.Errorf("log error = %q, want it to mention %q", e, tt.wantErr)
+			}
+			if tt.body != nil && !tt.body.closed.Load() {
+				t.Error("body of the unusable response not closed")
+			}
+		})
+	}
+}
+
+func TestHandler_RequestErrorStatus(t *testing.T) {
+	tests := []struct {
+		status, want int
+	}{
+		{0, http.StatusBadRequest},
+		{http.StatusBadRequest, http.StatusBadRequest},
+		{http.StatusUnsupportedMediaType, http.StatusUnsupportedMediaType},
+		{http.StatusUnprocessableEntity, http.StatusUnprocessableEntity},
+		// Outside 4xx: a provider can't turn a client error into a
+		// success, a redirect or a 5xx.
+		{-1, http.StatusBadRequest},
+		{http.StatusOK, http.StatusBadRequest},
+		{399, http.StatusBadRequest},
+		{http.StatusInternalServerError, http.StatusBadRequest},
+		{http.StatusServiceUnavailable, http.StatusBadRequest},
+		// 4xx that mislead: a bad gateway key, proxy auth, a retryable
+		// rate limit, the gateway's own client-gone code.
+		{http.StatusUnauthorized, http.StatusBadRequest},
+		{http.StatusProxyAuthRequired, http.StatusBadRequest},
+		{http.StatusTooManyRequests, http.StatusBadRequest},
+		{499, http.StatusBadRequest},
+		{http.StatusNotFound, http.StatusNotFound},
+		{http.StatusRequestEntityTooLarge, http.StatusRequestEntityTooLarge},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
+			rec, line := serveStub(t, stubProvider{err: &proxy.RequestError{Message: "unprocessable", Status: tt.status}})
+
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if typ := errorType(t, rec); typ != "invalid_request_error" {
+				t.Errorf("error type = %q", typ)
+			}
+			if !strings.Contains(rec.Body.String(), "unprocessable") {
+				t.Errorf("body = %q, want the provider's message", rec.Body.String())
+			}
+			if line["status"] != float64(tt.want) || line["level"] != "WARN" {
+				t.Errorf("log = %v, want WARN with status %d", line, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandler_StripsHopByHopHeaders(t *testing.T) {
+	// A provider that passes every upstream header on, under keys built by
+	// hand, so not all of them are canonical.
+	h := http.Header{
+		"Connection":          {"X-Hop-One, keep-alive", "x-hop-two"},
+		"Keep-Alive":          {"timeout=5"},
+		"Proxy-Connection":    {"keep-alive"},
+		"transfer-encoding":   {"chunked"},
+		"Upgrade":             {"h2c"},
+		"Te":                  {"trailers"},
+		"Trailer":             {"X-Checksum"},
+		"Proxy-Authenticate":  {"Basic"},
+		"Proxy-Authorization": {"Basic dXA6c2VjcmV0"},
+		"X-Hop-One":           {"1"},
+		"X-Hop-Two":           {"2"},
+		"Content-Type":        {"application/json"},
+		"X-Kept":              {"yes"},
+	}
+	rec, _ := serveStub(t, stubProvider{resp: &proxy.Response{
+		Status: http.StatusOK,
+		Header: h,
+		Body:   io.NopCloser(strings.NewReader("{}")),
+	}})
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "{}" {
+		t.Fatalf("response = %d %q, want 200 {}", rec.Code, rec.Body.String())
+	}
+	for _, k := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "Upgrade",
+		"Te", "Trailer", "Proxy-Authenticate", "Proxy-Authorization", "X-Hop-One", "X-Hop-Two"} {
+		if v := rec.Header().Values(k); len(v) != 0 {
+			t.Errorf("hop-by-hop header %s forwarded: %q", k, v)
+		}
+	}
+	if _, ok := rec.Header()["transfer-encoding"]; ok {
+		t.Error("non-canonical transfer-encoding forwarded")
+	}
+	for _, k := range []string{"Content-Type", "X-Kept"} {
+		if rec.Header().Get(k) == "" {
+			t.Errorf("end-to-end header %s dropped", k)
+		}
+	}
+}
+
+// switchingUpstream answers every request with 101 Switching Protocols and
+// then holds the connection open, sending nothing, for up to 10s. After a
+// protocol switch the response body is the raw connection, which
+// cancelling the request does not close.
+func switchingUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, bw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		bw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n")
+		bw.Flush()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		io.Copy(io.Discard, conn) // until the gateway lets go, or the deadline
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestGateway_InformationalUpstreamReleasesSlot(t *testing.T) {
+	upstream := switchingUpstream(t)
+	// One slot, so a request that kept it would make the next one a 503.
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{
+		Admission:     proxy.NewAdmission(1),
+		HeaderTimeout: 2 * time.Second,
+	})
+
+	for i := range 2 {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- post(gw, reqBody) }()
+		select {
+		case rec := <-done:
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("request %d: status = %d, want 502", i+1, rec.Code)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("request %d: no answer within 5s; the upstream's 101 holds the request", i+1)
+		}
+	}
+	for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+		var m map[string]any
+		if err := json.Unmarshal(line, &m); err != nil {
+			t.Fatalf("parse log %q: %v", line, err)
+		}
+		if e, _ := m["error"].(string); !strings.Contains(e, "upstream sent an informational status") || m["phase"] != "upstream" {
+			t.Errorf("log = %v, want the informational status error in phase upstream", m)
+		}
+	}
+}
+
+func TestGateway_SlowErrorBody(t *testing.T) {
+	t.Parallel() // about 10s of waiting
+	// A 500 whose body arrives one byte a second, for up to 30s.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.(http.Flusher).Flush()
+		for range 30 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+			}
+			io.WriteString(w, " ")
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	gw, logs := newGateway(t, upstream.URL, proxy.Options{})
+	start := time.Now()
+	rec := post(gw, reqBody)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if typ := errorType(t, rec); typ != "api_error" {
+		t.Errorf("error type = %q, want api_error", typ)
+	}
+	if elapsed < 9*time.Second || elapsed > 13*time.Second {
+		t.Errorf("answered after %v, want about 10s", elapsed)
+	}
+	line := logLine(t, logs)
+	if e, _ := line["error"].(string); !strings.Contains(e, "upstream error body not received in time") {
+		t.Errorf("log error = %q, want the error body timeout", e)
+	}
+	if line["phase"] != "upstream" || line["level"] != "ERROR" {
+		t.Errorf("log = %v, want ERROR in phase upstream", line)
+	}
+}
+
+func TestHandler_ProviderCantAddRequestID(t *testing.T) {
+	// Non-canonical keys, as a provider building its Header by hand might
+	// write them.
+	h := http.Header{"x-request-id": {"spoofed"}, "x-kept": {"yes"}}
+	var logs bytes.Buffer
+	handler := proxy.NewHandler(stubProvider{resp: &proxy.Response{
+		Status: http.StatusOK,
+		Header: h,
+		Body:   io.NopCloser(strings.NewReader("{}")),
+	}}, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{})
+	// Through a real server, so the test sees what goes on the wire, not
+	// just the header map.
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+	resp, err := srv.Client().Post(srv.URL, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if v := resp.Header.Values("X-Request-Id"); len(v) != 1 || v[0] == "spoofed" {
+		t.Errorf("X-Request-Id = %q, want only the gateway's id", v)
+	}
+	if v := resp.Header.Values("X-Kept"); len(v) != 1 || v[0] != "yes" {
+		t.Errorf("X-Kept = %q, want [yes]", v)
 	}
 }
 

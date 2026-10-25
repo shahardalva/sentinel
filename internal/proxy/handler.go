@@ -13,9 +13,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -28,7 +28,10 @@ type Provider interface {
 	ErrorFormatter
 	Name() string
 	// Forward sends req upstream. It returns a *RequestError to reject the
-	// client's request without contacting upstream.
+	// client's request without contacting upstream. A nil error means a
+	// non-nil *Response with a non-nil Body and a 2xx, 4xx or 5xx Status,
+	// which the caller closes; a Handler answers a Provider that breaks this
+	// with a 502.
 	Forward(ctx context.Context, req *Request) (*Response, error)
 }
 
@@ -42,7 +45,8 @@ type Request struct {
 type Response struct {
 	Status int
 	// Header holds only headers safe to send to the client; the Provider has
-	// already dropped hop-by-hop and internal ones.
+	// already dropped hop-by-hop and internal ones. The Handler strips
+	// hop-by-hop headers again as a backstop.
 	Header http.Header
 	Body   io.ReadCloser
 	// RequestID is the upstream's ID for this request, for the log. May be empty.
@@ -68,12 +72,41 @@ type RateLimit struct {
 }
 
 // RequestError rejects a client request as invalid. The handler answers it
-// with a 400 carrying Message, so Message must be safe to show the client.
+// with Status carrying Message, so Message must be safe to show the client.
 type RequestError struct {
 	Message string
+	// Status is the 4xx status to answer with. Zero means 400; see status
+	// for the ones that also become 400.
+	Status int
 }
 
 func (e *RequestError) Error() string { return e.Message }
+
+// status returns the status to answer e with. Anything outside 400-499
+// becomes 400: a RequestError is the client's fault, and a provider must not
+// turn it into a 5xx (logged as a gateway failure, and retried by SDKs) or a
+// success. Some 4xx mislead and become 400 too.
+func (e *RequestError) status() int {
+	switch e.Status {
+	case http.StatusUnauthorized:
+		// Says the client's gateway key is wrong; RequireKey owns that.
+		return http.StatusBadRequest
+	case http.StatusProxyAuthRequired:
+		// Asks the client to authenticate to a proxy it never configured.
+		return http.StatusBadRequest
+	case http.StatusTooManyRequests:
+		// SDKs retry it, so a rejected request would be sent again and
+		// again; and it reads as the rate limiter's answer.
+		return http.StatusBadRequest
+	case 499:
+		// The gateway's own log code for a client that went away.
+		return http.StatusBadRequest
+	}
+	if e.Status < 400 || e.Status > 499 {
+		return http.StatusBadRequest
+	}
+	return e.Status
+}
 
 const (
 	// A non-streaming request sends no headers until generation finishes, so
@@ -109,6 +142,7 @@ var (
 	errUpstreamAuth    = errors.New("upstream rejected the gateway's credentials")
 	errContentEncoding = errors.New("unsupported content-encoding")
 	errRateLimited     = errors.New("client over its rate limit")
+	errBadResponse     = errors.New("provider broke its contract")
 )
 
 // limiterWarnInterval spaces out the warnings logged while the rate limiter
@@ -152,6 +186,9 @@ type Options struct {
 	// log's "upstream" field; "provider" is the protocol's Name(). Empty
 	// means the provider's Name().
 	Upstream string
+	// Recorder, if set, gets a RequestInfo for every request. Nil records
+	// nothing and costs nothing.
+	Recorder Recorder
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
@@ -166,10 +203,8 @@ type Handler struct {
 	admission     *Admission
 	limiter       RateLimiter
 	failClosed    bool
-	// Fail-open warnings: when the last one was logged (UnixNano), and how
-	// many were skipped since.
-	lastLimiterWarn    atomic.Int64
-	skippedLimiterWarn atomic.Int64
+	recorder      Recorder
+	limiterWarn   logThrottle // fail-open warnings
 }
 
 // NewHandler returns a Handler forwarding to p. It panics if opts.Admission
@@ -208,6 +243,7 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 		admission:     opts.Admission,
 		limiter:       opts.RateLimiter,
 		failClosed:    opts.RateLimitFailClosed,
+		recorder:      opts.Recorder,
 	}
 }
 
@@ -219,20 +255,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var (
 		model, upstreamID           string
 		status                      int
-		phase                       = phaseReadBody // the stage reached, or where it failed
+		phase                       = PhaseReadBody // the stage reached, or where it failed
 		limitDur                    time.Duration
 		limit                       *RateLimit // nil unless the limiter decided
 		readDur, ttfbDur, streamDur time.Duration
 		failure                     error
+		outcome                     RateLimitOutcome // for the Recorder
+		ran                         Stages           // for the Recorder
 	)
 	defer func() {
+		// A panic (a provider bug) unwinds through here before net/http
+		// recovers it. Record it as the server failure it is, then let it
+		// go on with its own value. The stack is taken now, while it still
+		// shows where the panic happened; the re-panic's won't.
+		recovered := recover()
+		var stack []byte
+		if recovered != nil {
+			stack = debug.Stack()
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			failure = fmt.Errorf("panic: %v", recovered)
+		}
+		total := time.Since(start)
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
 			slog.String("upstream", h.upstream),
 			slog.String("provider", h.provider.Name()),
 			slog.String("model", model),
 			slog.Int("status", status),
-			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			slog.Int64("latency_ms", total.Milliseconds()),
 		}
 		if h.limiter != nil {
 			// Microseconds: a healthy Redis answers well under a millisecond.
@@ -242,10 +294,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			attrs = append(attrs, slog.Int64("rate_limit_remaining", limit.Remaining))
 		}
 		attrs = append(attrs, slog.Int64("read_body_ms", readDur.Milliseconds()))
-		if phase == phaseUpstream || phase == phaseStream {
+		if phase == PhaseUpstream || phase == PhaseStream {
 			attrs = append(attrs, slog.Int64("upstream_ttfb_ms", ttfbDur.Milliseconds()))
 		}
-		if phase == phaseStream {
+		if phase == PhaseStream {
 			attrs = append(attrs, slog.Int64("stream_ms", streamDur.Milliseconds()))
 		}
 		if upstreamID != "" {
@@ -254,9 +306,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if failure != nil {
 			attrs = append(attrs, slog.String("error", failure.Error()), slog.String("phase", phase))
 		}
+		if stack != nil {
+			attrs = append(attrs, slog.String("stack", string(stack)))
+		}
 		_, clientFailed := errors.AsType[*clientWriteError](failure)
 		clientGone := clientFailed || r.Context().Err() != nil
 		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, clientGone), "request", attrs...)
+		if h.recorder != nil {
+			info := RequestInfo{
+				Upstream:          h.upstream,
+				Protocol:          h.provider.Name(),
+				Status:            status,
+				Failed:            failure != nil,
+				RateLimit:         outcome,
+				Ran:               ran,
+				RateLimitDuration: limitDur,
+				ReadBody:          readDur,
+				UpstreamTTFB:      ttfbDur,
+				Stream:            streamDur,
+				Total:             total,
+			}
+			if info.Failed {
+				info.Phase = phase
+			}
+			h.recorder.RecordRequest(r.Context(), info)
+		}
+		if recovered != nil {
+			panic(recovered)
+		}
 	}()
 
 	// The body is forwarded and inspected as-is, so an encoded one would be
@@ -279,7 +356,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Before the body is read, so a client over its limit costs one Redis
 	// call and no upload.
 	if id := clientID(r.Context()); h.limiter != nil && id != "" {
-		phase = phaseRateLimit
+		phase = PhaseRateLimit
+		ran |= StageRateLimit
 		limitStart := time.Now()
 		lim, err := h.limiter.Allow(r.Context(), id)
 		limitDur = time.Since(limitStart)
@@ -291,14 +369,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = 499 // client closed request
 			return
 		case err != nil && h.failClosed:
+			outcome = RateLimitFailClosed
 			failure = fmt.Errorf("rate limiter unavailable: %w", err)
 			status = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
 			rejectEarly(w, h.provider, status, ErrAPI, "rate limiter unavailable")
 			return
 		case err != nil:
+			outcome = RateLimitFailOpen
 			h.warnLimiterDown(r.Context(), err)
 		case !lim.Allowed:
+			outcome = RateLimitLimited
 			limit = &lim
 			failure = errRateLimited
 			status = http.StatusTooManyRequests
@@ -306,15 +387,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rejectEarly(w, h.provider, status, ErrRateLimit, "rate limit exceeded")
 			return
 		default:
+			outcome = RateLimitAllowed
 			limit = &lim
 		}
-		phase = phaseReadBody
+		phase = PhaseReadBody
 	}
 
 	// The read deadline is per request, not server-wide, and is cleared once
 	// the body is in: a read deadline expiring later, during a long stream,
 	// would be treated as the client going away.
 	rc := http.NewResponseController(w)
+	ran |= StageReadBody
 	readStart := time.Now()
 	_ = rc.SetReadDeadline(readStart.Add(h.bodyTimeout))
 	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength)
@@ -341,7 +424,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The slot is taken only once the body is in, so a slow upload can't hold
 	// one. Shed load rather than queue: a queued request still holds its
 	// connection, and waiting only moves the memory pressure elsewhere.
-	phase = phaseAdmit
+	phase = PhaseAdmit
 	if !h.admission.TryAcquire() {
 		failure = errOverloaded
 		status = http.StatusServiceUnavailable
@@ -356,7 +439,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
 
-	phase = phaseUpstream
+	phase = PhaseUpstream
+	ran |= StageUpstreamTTFB
 	upStart := time.Now()
 	headerTimer := time.AfterFunc(h.headerTimeout, func() { cancel(errHeaderTimeout) })
 	resp, err := h.provider.Forward(ctx, &Request{Body: body, Header: r.Header})
@@ -367,7 +451,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqErr, invalid := errors.AsType[*RequestError](err)
 		switch {
 		case invalid:
-			status = http.StatusBadRequest
+			status = reqErr.status()
 			writeError(w, h.provider, status, ErrInvalidRequest, reqErr.Message)
 		case r.Context().Err() != nil:
 			status = 499 // client closed request; nobody to answer
@@ -379,6 +463,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadGateway
 			writeError(w, h.provider, status, ErrAPI, "upstream unavailable")
 		}
+		return
+	}
+	if err := checkResponse(resp); err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		failure = err
+		status = http.StatusBadGateway
+		writeError(w, h.provider, status, ErrAPI, "upstream unavailable")
 		return
 	}
 	defer resp.Body.Close()
@@ -393,14 +486,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, h.provider, status, ErrAPI, "upstream authentication failed")
 		return
 	}
-	for k, vv := range resp.Header {
-		w.Header()[k] = append(w.Header()[k], vv...)
-	}
+	copyEndToEnd(w.Header(), resp.Header)
 	w.Header().Set("X-Request-Id", reqID) // always the gateway's own
 	status = resp.Status
 	w.WriteHeader(status)
 
-	phase = phaseStream
+	phase = PhaseStream
+	ran |= StageStream
 	streamStart := time.Now()
 	idleTimer := time.AfterFunc(h.idleTimeout, func() { cancel(errIdleTimeout) })
 	idleTimer.Stop()
@@ -415,19 +507,81 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	streamDur = time.Since(streamStart)
 }
 
+// checkResponse reports whether a Provider kept its contract for a nil
+// error: a non-nil Response with a non-nil Body and a 2xx, 4xx or 5xx
+// status. WriteHeader panics below 100 and would send a 1xx as an
+// informational response. A 3xx is never an answer to pass on: upstream
+// clients refuse redirects, so one that gets here has no Location, or is a
+// 300 or 304, which a client can't act on (a 304 can't even carry the body).
+func checkResponse(resp *Response) error {
+	switch {
+	case resp == nil:
+		return fmt.Errorf("%w: nil response", errBadResponse)
+	case resp.Body == nil:
+		return fmt.Errorf("%w: nil body", errBadResponse)
+	case resp.Status < 200 || resp.Status > 599 || (resp.Status >= 300 && resp.Status < 400):
+		return fmt.Errorf("%w: status %d", errBadResponse, resp.Status)
+	}
+	return nil
+}
+
+// hopByHop are Connection and the connection-specific headers RFC 9110
+// section 7.6.1 names (Proxy-Connection, Keep-Alive, TE, Transfer-Encoding,
+// Upgrade), plus Trailer, Proxy-Authenticate and Proxy-Authorization, which
+// RFC 2616 listed as hop-by-hop and httputil.ReverseProxy still strips. They
+// describe one connection, not the response, so they never pass a proxy.
+var hopByHop = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Connection":    true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+}
+
+// copyEndToEnd appends src's headers to dst, leaving out hop-by-hop headers
+// and any header src's Connection value names. Providers allowlist their
+// response headers already; this is the backstop for one that doesn't.
+// Names are canonicalized, since a Provider may build its Header by hand,
+// and written to dst canonical too: a provider's "x-request-id" must not
+// end up beside the gateway's X-Request-Id.
+func copyEndToEnd(dst, src http.Header) {
+	named := map[string]bool{}
+	for k, vv := range src {
+		if http.CanonicalHeaderKey(k) != "Connection" {
+			continue
+		}
+		for _, v := range vv {
+			for f := range strings.SplitSeq(v, ",") {
+				if f = strings.TrimSpace(f); f != "" {
+					named[http.CanonicalHeaderKey(f)] = true
+				}
+			}
+		}
+	}
+	for k, vv := range src {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] || named[ck] {
+			continue
+		}
+		dst[ck] = append(dst[ck], vv...)
+	}
+}
+
 // warnLimiterDown logs that the rate limiter failed and the request was let
 // through, at most once per limiterWarnInterval, with a count of the
 // failures not logged since the last warning.
 func (h *Handler) warnLimiterDown(ctx context.Context, err error) {
-	now := time.Now().UnixNano()
-	last := h.lastLimiterWarn.Load()
-	if now-last < int64(limiterWarnInterval) || !h.lastLimiterWarn.CompareAndSwap(last, now) {
-		h.skippedLimiterWarn.Add(1)
+	ok, suppressed := h.limiterWarn.allow(time.Now(), limiterWarnInterval)
+	if !ok {
 		return
 	}
 	h.logger.LogAttrs(ctx, slog.LevelWarn, "rate limiter unavailable; allowing requests (fail open)",
 		slog.String("error", err.Error()),
-		slog.Int64("suppressed", h.skippedLimiterWarn.Swap(0)),
+		slog.Int64("suppressed", suppressed),
 	)
 }
 
@@ -437,15 +591,6 @@ func retryAfterSeconds(d time.Duration) string {
 	s := int64((d + time.Second - 1) / time.Second)
 	return strconv.FormatInt(max(s, 1), 10)
 }
-
-// Request phases, as logged. A failure's phase says where it happened.
-const (
-	phaseRateLimit = "rate_limit"
-	phaseReadBody  = "read_body"
-	phaseAdmit     = "admit" // waiting for a concurrency slot
-	phaseUpstream  = "upstream"
-	phaseStream    = "stream"
-)
 
 // logLevel picks the level for a request's log line. Server-side and upstream
 // failures are errors, including a stream that breaks after a 2xx was sent.
@@ -459,7 +604,7 @@ func logLevel(status int, phase string, failure error, clientGone bool) slog.Lev
 		return slog.LevelError
 	case failure == nil:
 		return slog.LevelInfo
-	case phase == phaseStream && !clientGone:
+	case phase == PhaseStream && !clientGone:
 		return slog.LevelError
 	default:
 		return slog.LevelWarn

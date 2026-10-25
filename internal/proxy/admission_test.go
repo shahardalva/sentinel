@@ -22,6 +22,25 @@ func TestAdmission(t *testing.T) {
 	}
 }
 
+func TestAdmission_InUseAndLimit(t *testing.T) {
+	a := proxy.NewAdmission(3)
+	check := func(want int) {
+		t.Helper()
+		if a.InUse() != want || a.Limit() != 3 {
+			t.Errorf("InUse, Limit = %d, %d; want %d, 3", a.InUse(), a.Limit(), want)
+		}
+	}
+	check(0)
+	a.TryAcquire()
+	a.TryAcquire()
+	check(2)
+	a.Release()
+	check(1)
+	if l := proxy.NewAdmission(0).Limit(); l != proxy.DefaultMaxConcurrent {
+		t.Errorf("default Limit = %d, want %d", l, proxy.DefaultMaxConcurrent)
+	}
+}
+
 func TestNewAdmission_Default(t *testing.T) {
 	for _, n := range []int{0, -1} {
 		a := proxy.NewAdmission(n)
