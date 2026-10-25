@@ -445,7 +445,8 @@ The `unauthorized` `WARN` that a rejected key produces is logged at most once ev
 - admission in use against the limit
 - `429`, `503` (at capacity, and rate limiter down in fail-closed mode) and `401` rates
 - rate-limit call duration, p50 and p99
-- Redis breaker state, with the fail-open rate
+- Redis breaker state, 0 (closed) or 1 (open)
+- rate limit decisions per second by outcome: allowed, limited, fail_open, fail_closed, not_checked
 
 A **Gateway** selector at the top picks `gateway`, `gateway-bench` or both. `gateway-bench` is in the `bench` profile, so its scrape target shows as `DOWN` in Prometheus unless `make bench-gateway` is running; that is expected.
 
