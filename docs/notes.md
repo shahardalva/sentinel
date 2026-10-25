@@ -2,6 +2,68 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-25: OpenTelemetry metrics
+
+### Done
+- proxy.Recorder: the Handler reports one RequestInfo per request from the
+  deferred block that writes the log line (upstream, protocol, status,
+  failure phase, rate-limit outcome, which stages ran and their
+  durations, total). Options.Recorder nil costs a nil check. The log line
+  and the wire bytes are unchanged; internal/proxy imports no OTel.
+- proxy.Auth, built once by NewAuth and shared by every route (RequireKey
+  stays as the one-route form). It reports each rejection to the Recorder
+  and logs "unauthorized" at most once per 10 s with a suppressed count,
+  through the same throttle as the fail-open warning. From #6.
+- Admission.InUse and Limit, Limiter.BreakerOpen, for observable gauges.
+- internal/telemetry: OTel SDK and the Prometheus exporter on a registry
+  of its own, translation pinned. Requests, request duration, stage
+  duration, gateway overhead, rate-limit decisions, auth rejections,
+  admission in use and limit, breaker open. Attribute sets precomputed
+  per upstream, status class and phase; recording a request is 0 allocs,
+  about 1.5 µs.
+- SENTINEL_METRICS_ADDR, default 127.0.0.1:9091, GET /metrics only, on its
+  own listener; "off" disables. Binds before the API and logs "metrics
+  listening"; shuts down after it. run() split into loadConfig and
+  serve(ctx, logger, cfg), so tests start both listeners on port 0.
+- Compose: prom/prometheus:v3.15.1 scraping gateway:9091 and
+  gateway-bench:9091; grafana/grafana:13.2.4 on 127.0.0.1:3000 with
+  anonymous Viewer, login form and basic auth off, a provisioned data
+  source and dashboard (observability/). Both read_only, cap_drop ALL,
+  no-new-privileges.
+- ADR 0004. Tests: each proxy path recorded once with the right phase,
+  status and outcome; the auth WARN throttled across routes; instruments
+  and attributes through a ManualReader; overhead math; 1,000 distinct
+  keys and models adding no series; the dashboard's names and label values
+  present in a real scrape; the metrics listener, 404 for /metrics on the
+  API port, off, and bad or taken addresses; benchguard with the new lines.
+
+### Decided
+- OTel over client_golang alone or hand-written exposition: one
+  vendor-neutral API, one SDK for traces next, and the exporter can become
+  OTLP without touching a recording call. The Prometheus exporter is built
+  on client_golang, so client_golang is a direct dependency either way.
+- Labels only from closed sets, and anything else becomes "other".
+  RequestInfo doesn't even carry the model or the key.
+- 401s are counted by sentinel.auth.rejections, not sentinel.requests; the
+  Handler never sees them.
+- Overhead is recorded only for forwarded requests; for a 429 it would be
+  the whole request. The Redis call counts as overhead.
+- A client gone during the rate-limit check is outcome not_checked: no
+  decision was made and no fail mode applied.
+
+### Learned
+- Windows' monotonic clock is coarse enough that a fast stage measures 0,
+  so RequestInfo says which stages ran (Ran) instead of relying on
+  durations above zero.
+- Passing a precomputed metric.WithAttributeSet option as a lone variadic
+  argument still allocates the slice, 16 B per call (measured); passing a
+  precomputed []metric.AddOption with ... allocates nothing.
+
+### Next
+- Traces on the same SDK, with exemplars linking duration buckets to them.
+- Go runtime metrics (contrib runtime instrumentation).
+- Measure the recording cost under load in make bench-gateway.
+
 ## 2026-10-25: provider hardening
 
 ### Done

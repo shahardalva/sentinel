@@ -13,13 +13,20 @@ tool policies, and writes an audit log.
   shape with account IDs redacted, or replaces the body, using
   internal/provider/upstream (ReadErrorBody, RedactAccountIDs). 2xx bodies
   are never read. The core strips hop-by-hop headers as a backstop.
+- Metrics: OpenTelemetry in internal/telemetry, exposed with the OTel
+  Prometheus exporter (built on prometheus/client_golang). The core calls a
+  proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401) and
+  never imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only
+  from closed sets: never the client key, its digest, the model or the path.
+  Traces come later on the same SDK.
 - Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
   Python detector service over gRPC
 
 ## Principles
 - The hot path must be fast and measurable. Every stage records its latency.
-- Keep it simple: stdlib first, add a dependency only with a reason. The
-  only one so far is go-redis (docs/adr/0002-rate-limiting.md); miniredis
+- Keep it simple: stdlib first, add a dependency only with a reason. So
+  far: go-redis (docs/adr/0002-rate-limiting.md) and OpenTelemetry with its
+  Prometheus exporter (docs/adr/0004-opentelemetry-metrics.md); miniredis
   is test-only.
 - Every change comes with tests.
 - Never commit secrets. API keys come only from environment variables.
@@ -33,7 +40,8 @@ tool policies, and writes an audit log.
   SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis for rate limiting. The gateway serves both protocols there, with
+  redis for rate limiting, and Prometheus and Grafana (127.0.0.1:3000,
+  anonymous Viewer, provisioned from observability/) for metrics. The gateway serves both protocols there, with
   anthropic, openai and the named upstream mockcompat (openai) all on the
   mock. Runs make certs first, which rewrites ./certs when a
   file is missing or server.pem expires within 7 days, and recreates the
@@ -44,7 +52,9 @@ tool policies, and writes an audit log.
   make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
   the mock for all its upstreams (anthropic, openai, mockcompat) with dummy
   upstream keys. It checks resolved config, not env vars: it waits (about
-  15s) for gateway-bench's "listening" line, then cmd/benchguard refuses
+  15s) for gateway-bench's "listening" line (the metrics listener binds
+  first and logs "metrics listening", which must never match), then
+  cmd/benchguard refuses
   to run unless there is at least one "upstream enabled" line and each has
   exactly one base_url (logged as scheme://host:port), equal to
   https://mockupstream:9090; a line it can't read refuses too. BENCH_API
@@ -94,6 +104,13 @@ tool policies, and writes an audit log.
   or `Authorization: Bearer <key>`; anything else gets a 401.
 - SENTINEL_ADDR (optional): listen address, default 127.0.0.1:8081
   (loopback only). Set it explicitly to expose the gateway on a network.
+- SENTINEL_METRICS_ADDR (optional): metrics listener, default
+  127.0.0.1:9091, serving only GET /metrics, never on the API port. "off"
+  disables metrics (no listener, no Recorder). Must be host:port with a
+  numeric port other than SENTINEL_ADDR's, else startup stops; so does a
+  failed bind. Binds before the API listener and logs "metrics listening";
+  shut down after the API. The "unauthorized" WARN is rate-limited (one per
+  10s, with a suppressed count) across all routes via one proxy.Auth.
 - ANTHROPIC_BASE_URL (optional): upstream override, default https://api.anthropic.com.
   Must be https (plain http only for a loopback host); the gateway refuses
   to start otherwise. Base URL errors name at most the scheme and hostname,
@@ -137,7 +154,13 @@ OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_* and SENTINEL_API_KEYS from .env
 (copy .env.example, which leaves the keys empty; .env is gitignored), and
 SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
-port on 127.0.0.1 only. gateway-bench uses Redis database 1 with
+port on 127.0.0.1 only. The gateway and gateway-bench get
+SENTINEL_METRICS_ADDR=0.0.0.0:9091, unpublished; Prometheus (pinned image,
+not published) scrapes both, so gateway-bench shows DOWN outside a bench.
+Grafana (pinned image) is on 127.0.0.1:3000 with no admin password in any
+file (login form and basic auth off). The dashboard queries the Prometheus
+names (sentinel_requests_total, ..._seconds_bucket); a test in
+internal/telemetry checks them against a real scrape. gateway-bench uses Redis database 1 with
 SENTINEL_RATE_LIMIT_RPM=1000000, so the bench includes the Redis call but
 never gets a 429. The mock override and gateway-bench set
 SENTINEL_UPSTREAMS=anthropic,openai,mockcompat, ANTHROPIC_BASE_URL=

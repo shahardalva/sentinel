@@ -4,6 +4,7 @@
 #   mock upstream:  docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build
 #
 # The mock run needs certificates first: go run ./cmd/devcerts (make certs).
+# Both runs include Prometheus and Grafana (http://127.0.0.1:3000).
 
 x-hardening: &hardening
   read_only: true
@@ -52,6 +53,9 @@ services:
       # Per-key rate limiting. SENTINEL_RATE_LIMIT_RPM and
       # SENTINEL_RATE_LIMIT_FAIL_MODE can be set in .env.
       SENTINEL_REDIS_URL: redis://redis:6379/0
+      # Metrics on all interfaces inside the container, for Prometheus on
+      # the compose network. Not published on the host.
+      SENTINEL_METRICS_ADDR: 0.0.0.0:9091
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:
@@ -134,6 +138,7 @@ services:
       # Database 1, apart from the gateway's buckets in database 0.
       SENTINEL_REDIS_URL: redis://redis:6379/1
       SENTINEL_RATE_LIMIT_RPM: "1000000"
+      SENTINEL_METRICS_ADDR: 0.0.0.0:9091
     volumes:
       - *ca
     depends_on:
@@ -150,6 +155,71 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
+
+  # Scrapes gateway:9091 and gateway-bench:9091 on the compose network
+  # (observability/prometheus/prometheus.yml). Not published on the host;
+  # Grafana is the way in. Runs as nobody and writes only its data volume.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    <<: *hardening
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - type: bind
+        source: ./observability/prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  # Local dev only: anyone who can reach 127.0.0.1:3000 sees the dashboards
+  # as an anonymous Viewer. The login form and basic auth are off, so the
+  # built-in admin account can't be used, and no password is set anywhere.
+  # The data source and the dashboard are provisioned from ./observability.
+  grafana:
+    image: grafana/grafana:13.2.4
+    <<: *hardening
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_HIDE_VERSION: "true"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/sentinel.json
+      # Nothing leaves the machine.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Console only: the root filesystem is read-only.
+      GF_LOG_MODE: console
+    tmpfs:
+      - /tmp
+    volumes:
+      - type: bind
+        source: ./observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/grafana/dashboards
+        target: /etc/grafana/dashboards
+        read_only: true
+        bind:
+          create_host_path: false
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
     restart: unless-stopped
 
   # Load test runner for make bench / make bench-gateway. Verifies the
@@ -175,3 +245,5 @@ services:
 
 volumes:
   mockupstream-key:
+  prometheus-data:
+  grafana-data:

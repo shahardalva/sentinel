@@ -15,7 +15,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -186,6 +185,9 @@ type Options struct {
 	// log's "upstream" field; "provider" is the protocol's Name(). Empty
 	// means the provider's Name().
 	Upstream string
+	// Recorder, if set, gets a RequestInfo for every request. Nil records
+	// nothing and costs nothing.
+	Recorder Recorder
 }
 
 // Handler proxies a request to a Provider and returns its response as-is.
@@ -200,10 +202,8 @@ type Handler struct {
 	admission     *Admission
 	limiter       RateLimiter
 	failClosed    bool
-	// Fail-open warnings: when the last one was logged (UnixNano), and how
-	// many were skipped since.
-	lastLimiterWarn    atomic.Int64
-	skippedLimiterWarn atomic.Int64
+	recorder      Recorder
+	limiterWarn   logThrottle // fail-open warnings
 }
 
 // NewHandler returns a Handler forwarding to p. It panics if opts.Admission
@@ -242,6 +242,7 @@ func NewHandler(p Provider, logger *slog.Logger, opts Options) *Handler {
 		admission:     opts.Admission,
 		limiter:       opts.RateLimiter,
 		failClosed:    opts.RateLimitFailClosed,
+		recorder:      opts.Recorder,
 	}
 }
 
@@ -253,20 +254,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var (
 		model, upstreamID           string
 		status                      int
-		phase                       = phaseReadBody // the stage reached, or where it failed
+		phase                       = PhaseReadBody // the stage reached, or where it failed
 		limitDur                    time.Duration
 		limit                       *RateLimit // nil unless the limiter decided
 		readDur, ttfbDur, streamDur time.Duration
 		failure                     error
+		outcome                     RateLimitOutcome // for the Recorder
+		ran                         Stages           // for the Recorder
 	)
 	defer func() {
+		total := time.Since(start)
 		attrs := []slog.Attr{
 			slog.String("request_id", reqID),
 			slog.String("upstream", h.upstream),
 			slog.String("provider", h.provider.Name()),
 			slog.String("model", model),
 			slog.Int("status", status),
-			slog.Int64("latency_ms", time.Since(start).Milliseconds()),
+			slog.Int64("latency_ms", total.Milliseconds()),
 		}
 		if h.limiter != nil {
 			// Microseconds: a healthy Redis answers well under a millisecond.
@@ -276,10 +280,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			attrs = append(attrs, slog.Int64("rate_limit_remaining", limit.Remaining))
 		}
 		attrs = append(attrs, slog.Int64("read_body_ms", readDur.Milliseconds()))
-		if phase == phaseUpstream || phase == phaseStream {
+		if phase == PhaseUpstream || phase == PhaseStream {
 			attrs = append(attrs, slog.Int64("upstream_ttfb_ms", ttfbDur.Milliseconds()))
 		}
-		if phase == phaseStream {
+		if phase == PhaseStream {
 			attrs = append(attrs, slog.Int64("stream_ms", streamDur.Milliseconds()))
 		}
 		if upstreamID != "" {
@@ -291,6 +295,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, clientFailed := errors.AsType[*clientWriteError](failure)
 		clientGone := clientFailed || r.Context().Err() != nil
 		h.logger.LogAttrs(r.Context(), logLevel(status, phase, failure, clientGone), "request", attrs...)
+		if h.recorder != nil {
+			info := RequestInfo{
+				Upstream:          h.upstream,
+				Protocol:          h.provider.Name(),
+				Status:            status,
+				Failed:            failure != nil,
+				RateLimit:         outcome,
+				Ran:               ran,
+				RateLimitDuration: limitDur,
+				ReadBody:          readDur,
+				UpstreamTTFB:      ttfbDur,
+				Stream:            streamDur,
+				Total:             total,
+			}
+			if info.Failed {
+				info.Phase = phase
+			}
+			h.recorder.RecordRequest(r.Context(), info)
+		}
 	}()
 
 	// The body is forwarded and inspected as-is, so an encoded one would be
@@ -313,7 +336,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Before the body is read, so a client over its limit costs one Redis
 	// call and no upload.
 	if id := clientID(r.Context()); h.limiter != nil && id != "" {
-		phase = phaseRateLimit
+		phase = PhaseRateLimit
+		ran |= StageRateLimit
 		limitStart := time.Now()
 		lim, err := h.limiter.Allow(r.Context(), id)
 		limitDur = time.Since(limitStart)
@@ -325,14 +349,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = 499 // client closed request
 			return
 		case err != nil && h.failClosed:
+			outcome = RateLimitFailClosed
 			failure = fmt.Errorf("rate limiter unavailable: %w", err)
 			status = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
 			rejectEarly(w, h.provider, status, ErrAPI, "rate limiter unavailable")
 			return
 		case err != nil:
+			outcome = RateLimitFailOpen
 			h.warnLimiterDown(r.Context(), err)
 		case !lim.Allowed:
+			outcome = RateLimitLimited
 			limit = &lim
 			failure = errRateLimited
 			status = http.StatusTooManyRequests
@@ -340,15 +367,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rejectEarly(w, h.provider, status, ErrRateLimit, "rate limit exceeded")
 			return
 		default:
+			outcome = RateLimitAllowed
 			limit = &lim
 		}
-		phase = phaseReadBody
+		phase = PhaseReadBody
 	}
 
 	// The read deadline is per request, not server-wide, and is cleared once
 	// the body is in: a read deadline expiring later, during a long stream,
 	// would be treated as the client going away.
 	rc := http.NewResponseController(w)
+	ran |= StageReadBody
 	readStart := time.Now()
 	_ = rc.SetReadDeadline(readStart.Add(h.bodyTimeout))
 	body, err := readBody(http.MaxBytesReader(w, r.Body, h.maxBody), r.ContentLength)
@@ -375,7 +404,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The slot is taken only once the body is in, so a slow upload can't hold
 	// one. Shed load rather than queue: a queued request still holds its
 	// connection, and waiting only moves the memory pressure elsewhere.
-	phase = phaseAdmit
+	phase = PhaseAdmit
 	if !h.admission.TryAcquire() {
 		failure = errOverloaded
 		status = http.StatusServiceUnavailable
@@ -390,7 +419,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
 
-	phase = phaseUpstream
+	phase = PhaseUpstream
+	ran |= StageUpstreamTTFB
 	upStart := time.Now()
 	headerTimer := time.AfterFunc(h.headerTimeout, func() { cancel(errHeaderTimeout) })
 	resp, err := h.provider.Forward(ctx, &Request{Body: body, Header: r.Header})
@@ -441,7 +471,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status = resp.Status
 	w.WriteHeader(status)
 
-	phase = phaseStream
+	phase = PhaseStream
+	ran |= StageStream
 	streamStart := time.Now()
 	idleTimer := time.AfterFunc(h.idleTimeout, func() { cancel(errIdleTimeout) })
 	idleTimer.Stop()
@@ -524,15 +555,13 @@ func copyEndToEnd(dst, src http.Header) {
 // through, at most once per limiterWarnInterval, with a count of the
 // failures not logged since the last warning.
 func (h *Handler) warnLimiterDown(ctx context.Context, err error) {
-	now := time.Now().UnixNano()
-	last := h.lastLimiterWarn.Load()
-	if now-last < int64(limiterWarnInterval) || !h.lastLimiterWarn.CompareAndSwap(last, now) {
-		h.skippedLimiterWarn.Add(1)
+	ok, suppressed := h.limiterWarn.allow(time.Now(), limiterWarnInterval)
+	if !ok {
 		return
 	}
 	h.logger.LogAttrs(ctx, slog.LevelWarn, "rate limiter unavailable; allowing requests (fail open)",
 		slog.String("error", err.Error()),
-		slog.Int64("suppressed", h.skippedLimiterWarn.Swap(0)),
+		slog.Int64("suppressed", suppressed),
 	)
 }
 
@@ -542,15 +571,6 @@ func retryAfterSeconds(d time.Duration) string {
 	s := int64((d + time.Second - 1) / time.Second)
 	return strconv.FormatInt(max(s, 1), 10)
 }
-
-// Request phases, as logged. A failure's phase says where it happened.
-const (
-	phaseRateLimit = "rate_limit"
-	phaseReadBody  = "read_body"
-	phaseAdmit     = "admit" // waiting for a concurrency slot
-	phaseUpstream  = "upstream"
-	phaseStream    = "stream"
-)
 
 // logLevel picks the level for a request's log line. Server-side and upstream
 // failures are errors, including a stream that breaks after a 2xx was sent.
@@ -564,7 +584,7 @@ func logLevel(status int, phase string, failure error, clientGone bool) slog.Lev
 		return slog.LevelError
 	case failure == nil:
 		return slog.LevelInfo
-	case phase == phaseStream && !clientGone:
+	case phase == PhaseStream && !clientGone:
 		return slog.LevelError
 	default:
 		return slog.LevelWarn

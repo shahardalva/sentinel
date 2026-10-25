@@ -16,24 +16,53 @@ import (
 // partial body. A var so tests can shorten it.
 var authReadTimeout = 5 * time.Second
 
-// RequireKey rejects requests that don't present one of keys, either as
-// x-api-key (what the Anthropic SDKs send) or as an Authorization bearer
-// token. With no non-empty keys every request is rejected. The credential
-// headers are removed before next runs, so later stages never see them.
-// They see only a SHA-256 digest of the key, as the client's identity for
-// rate limiting. A rejection is rendered by errs, the route's protocol;
-// RequireKey panics if errs is nil, like http.Handle with a nil handler.
-func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next http.Handler) http.Handler {
-	if errs == nil {
-		panic("proxy: RequireKey needs a non-nil ErrorFormatter")
-	}
-	// Compare SHA-256 digests so every comparison is over the same length and
-	// timing reveals nothing about a key's length or contents.
-	var digests [][sha256.Size]byte
+// authWarnInterval spaces out the "unauthorized" warnings, so a client
+// sending bad keys can't flood the log. A var so tests can shorten it.
+var authWarnInterval = 10 * time.Second
+
+// Auth checks client keys. One Auth is meant to guard every route, so the
+// rate limit on its warnings holds across all of them. Create one with
+// NewAuth.
+type Auth struct {
+	// SHA-256 digests of the keys. Comparing digests means every comparison
+	// is over the same length, and timing reveals nothing about a key's
+	// length or contents.
+	digests  [][sha256.Size]byte
+	logger   *slog.Logger
+	recorder Recorder // may be nil
+	warn     logThrottle
+}
+
+// NewAuth returns an Auth accepting keys; empty keys are dropped, and with
+// none left every request is rejected. rec, if not nil, is told of every
+// rejection.
+func NewAuth(keys []string, logger *slog.Logger, rec Recorder) *Auth {
+	a := &Auth{logger: logger, recorder: rec}
 	for _, k := range keys {
 		if k != "" {
-			digests = append(digests, sha256.Sum256([]byte(k)))
+			a.digests = append(a.digests, sha256.Sum256([]byte(k)))
 		}
+	}
+	return a
+}
+
+// RequireKey rejects requests that don't present one of keys. It is
+// NewAuth(keys, logger, nil).Require(errs, next), for a single route.
+func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next http.Handler) http.Handler {
+	return NewAuth(keys, logger, nil).Require(errs, next)
+}
+
+// Require rejects requests that don't present one of a's keys, either as
+// x-api-key (what the Anthropic SDKs send) or as an Authorization bearer
+// token. The credential headers are removed before next runs, so later
+// stages never see them. They see only a SHA-256 digest of the key, as the
+// client's identity for rate limiting. A rejection is rendered by errs, the
+// route's protocol, and logged at WARN at most once per authWarnInterval,
+// with a count of the ones held back. Require panics if errs is nil, like
+// http.Handle with a nil handler.
+func (a *Auth) Require(errs ErrorFormatter, next http.Handler) http.Handler {
+	if errs == nil {
+		panic("proxy: RequireKey needs a non-nil ErrorFormatter")
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
@@ -42,14 +71,11 @@ func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next ht
 		presented := clientKey(r.Header)
 		got := sha256.Sum256([]byte(presented))
 		match := 0
-		for _, d := range digests {
+		for _, d := range a.digests {
 			match |= subtle.ConstantTimeCompare(got[:], d[:])
 		}
 		if presented == "" || match != 1 {
-			logger.LogAttrs(r.Context(), slog.LevelWarn, "unauthorized",
-				slog.String("path", r.URL.Path),
-				slog.String("remote_addr", r.RemoteAddr),
-			)
+			a.reject(r)
 			rejectEarly(w, errs, http.StatusUnauthorized, ErrAuthentication, "invalid x-api-key")
 			return
 		}
@@ -62,6 +88,22 @@ func RequireKey(keys []string, errs ErrorFormatter, logger *slog.Logger, next ht
 		r.Header.Del("Authorization")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// reject records a rejected request and logs it, if the throttle allows.
+func (a *Auth) reject(r *http.Request) {
+	if a.recorder != nil {
+		a.recorder.RecordAuthRejection(r.Context())
+	}
+	ok, suppressed := a.warn.allow(time.Now(), authWarnInterval)
+	if !ok {
+		return
+	}
+	a.logger.LogAttrs(r.Context(), slog.LevelWarn, "unauthorized",
+		slog.String("path", r.URL.Path),
+		slog.String("remote_addr", r.RemoteAddr),
+		slog.Int64("suppressed", suppressed),
+	)
 }
 
 type clientIDKey struct{}
