@@ -2,6 +2,30 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-25: fail-open windows in a bench
+
+### Done
+- bench/RESULTS.md has a caveat: a make bench-gateway run, watched with
+  the new metrics, had 4,058 of about 47k requests (8.6%) fail_open.
+  gateway-bench logged "redis not reachable at startup" and the breaker
+  opened four times during the 100 and 500 req/s stages. The log's
+  fail-open WARN lines plus their suppressed counts give 4,054; the last
+  batch is never logged. Tracked in #42.
+
+### Learned
+- HTTP statuses don't show a fail-open window: a fail-open request goes
+  ahead and is answered like any other, and while the breaker is open it
+  skips the Redis call. Earlier overhead figures may be optimistic, mostly
+  at 100 req/s.
+- Grafana's runtime plugin preinstall broke the dashboard on a read-only
+  root: its update removed the bundled Prometheus plugin and couldn't
+  write the new one. Preinstall is now off; the image's copy loads.
+
+### Next
+- After every bench, check
+  sentinel_ratelimit_decisions_total{outcome="fail_open"}, not only HTTP
+  statuses. #42 is to make make bench-gateway check it and reject the run.
+
 ## 2026-10-25: OpenTelemetry metrics
 
 ### Done
