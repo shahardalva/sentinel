@@ -109,22 +109,27 @@ func TestLogThrottle_Concurrent(t *testing.T) {
 		t.Errorf("allowed %d of %d; want the throttle to let some through and hold some back", allowed, total)
 	}
 
-	// All at one instant: exactly one gets through.
+	// All at one instant: exactly one gets through, and every other call is
+	// counted once. A loser can Add after it lost the CAS but before the
+	// winner's Swap(0), so the winner may report some of the others rather
+	// than leave them held: split between reported and held, never lost.
 	var once logThrottle
 	var got sync.WaitGroup
-	var through int64
+	var through, onceReported int64
 	at := throttleBase.Add(time.Hour)
 	for range goroutines {
 		got.Go(func() {
-			if ok, _ := once.allow(at, time.Second); ok {
+			if ok, n := once.allow(at, time.Second); ok {
 				mu.Lock()
 				through++
+				onceReported += n
 				mu.Unlock()
 			}
 		})
 	}
 	got.Wait()
-	if through != 1 || once.skipped.Load() != goroutines-1 {
-		t.Errorf("at one instant: %d through, %d held; want 1 and %d", through, once.skipped.Load(), goroutines-1)
+	held = once.skipped.Load()
+	if through != 1 || onceReported+held != goroutines-1 {
+		t.Errorf("at one instant: %d through, %d reported + %d held; want 1 and %d", through, onceReported, held, goroutines-1)
 	}
 }
