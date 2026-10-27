@@ -681,7 +681,7 @@ func TestNewMux_RoutesOnlyEnabledUpstreams(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})
+			mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}, staticKeys(cfg))
 			// Without a key an enabled route answers 401 from RequireKey and
 			// never reaches the upstream; a disabled one is not routed.
 			for _, path := range []string{messages, chat} {
@@ -727,7 +727,7 @@ func TestNewMux_SharedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}))
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}, staticKeys(cfg)))
 	defer srv.Close()
 
 	// Cancelled before srv.Close, which would wait for it.
@@ -1052,7 +1052,7 @@ func TestNewMux_CustomUpstreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{})))
+	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}, staticKeys(cfg))))
 	defer srv.Close()
 
 	send := func(path string) *http.Response {
@@ -1136,7 +1136,7 @@ func TestNewMux_UnprefixedRoutesOnlyForBuiltins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})
+	mux := newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}, staticKeys(cfg))
 	// Without a key a route answers 401 from RequireKey and never reaches
 	// the upstream.
 	routed := []string{
@@ -1187,7 +1187,7 @@ func TestNewMux_SharedAdmissionAcrossPrefixes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}))
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}, staticKeys(cfg)))
 	defer srv.Close()
 
 	// Cancelled before srv.Close, which would wait for it.
@@ -1254,7 +1254,7 @@ func TestNewMux_RefusesUpstreamRedirects(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}))
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}, staticKeys(cfg)))
 	defer srv.Close()
 
 	for _, path := range []string{"/ant/v1/messages", "/oai/v1/chat/completions"} {
@@ -1293,7 +1293,7 @@ func TestGateway_UncleanPathsDoNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{})))
+	srv := httptest.NewServer(closeUnmatched(newMux(cfg, slog.New(slog.DiscardHandler), proxy.Options{}, staticKeys(cfg))))
 	defer srv.Close()
 
 	tests := []struct {
@@ -1456,7 +1456,7 @@ func TestNewMux_ForwardErrorsOmitURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}))
+	srv := httptest.NewServer(newMux(cfg, slog.New(slog.NewJSONHandler(&logs, nil)), proxy.Options{}, staticKeys(cfg)))
 	defer srv.Close()
 
 	tests := []struct{ path, wantErr string }{

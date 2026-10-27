@@ -2,6 +2,55 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-27: gateway wiring (Postgres keys, PR 1d)
+
+### Done
+- loadConfig: SENTINEL_DATABASE_URL (unset/empty: env keys; set: Postgres
+  only, SENTINEL_API_KEYS non-empty is an error; blank is an error),
+  SENTINEL_KEYS_REFRESH (default 30s, >= 1s), SENTINEL_ADMIN_ADDR (default
+  127.0.0.1:9465 with a DB, "off", an error without a DB except "off"),
+  SENTINEL_ADMIN_TOKEN (required while admin is on, ValidateToken).
+  parseMetricsAddr's port rule is now checkOwnPort, shared with admin,
+  which must differ from the API's and the metrics' ports.
+- serve: startKeys (Open 10 s, Migrate + SchemaVersion 30 s,
+  NewRefreshing with the Recorder) before any listener; newMux takes the
+  KeySource. Admin listener between metrics and the API, own http.Server
+  (metrics' timeouts, DisableGeneralOptionsHandler). Shutdown: API, admin,
+  metrics, cancel refresh, wait Done (5 s), close the pool.
+- Compose: postgres in the mock profile (no host port, volume, TCP
+  healthcheck, read_only, cap_drop ALL, no-new-privileges, user postgres,
+  tmpfs for /var/run/postgresql and /tmp, dev-only password). Mock gateway
+  on it with SENTINEL_API_KEYS="", admin on 127.0.0.1:9465, token from .env
+  with ${...:?}. Makefile: a placeholder token for every target but up.
+  CI's compose check: fails without the token, passes with one.
+- Grafana: client keys, refresh age (90 s line), refresh errors.
+- Tests: every config rule, no URL or token in any error; serve on a fake
+  keyStore (issue via admin, 200 after a refresh, 401 after revoke and a
+  refresh; OPTIONS * 401; admin not on the API port; bind and serve
+  failures; startup failures and deadlines; store closed last); real
+  store.Open on bad URLs leaks nothing; the same lifecycle on real
+  Postgres with SENTINEL_TEST_POSTGRES_URL.
+- Binary (linux, -s -w): 13.08 MB -> 17.28 MB (+32%); ADR 0005 has it.
+
+### Decided
+- An admin server failure keeps the API serving, as metrics does: keys
+  loaded keep working and refreshing; only issuing and revoking stops.
+- Migrations run automatically at every start; the role needs CREATE.
+- SENTINEL_KEYS_REFRESH has a 1 s floor (fetch timeout is half of it).
+  SENTINEL_KEYS_REFRESH and SENTINEL_ADMIN_TOKEN without a DB only WARN;
+  SENTINEL_ADMIN_ADDR=off without a DB is accepted.
+- The refresh's context is not the signal's, so keys refresh during the
+  grace period; a signal during the first fetch still stops startup.
+- If the refresh doesn't stop within 5 s, the pool is left open: Close
+  would wait for the stuck fetch's connection.
+
+### Next
+- Run make up and make test-postgres (not run here: no Docker): the
+  postgres service as user postgres on a read-only root is unverified,
+  and so is the Postgres lifecycle test.
+- A separate migrate command and a least-privilege runtime role.
+- Per-operator admin credentials, admin rate limit (ADR 0005 limits).
+
 ## 2026-10-27: admin API package (Postgres keys, PR 1c)
 
 ### Done

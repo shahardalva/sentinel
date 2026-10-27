@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -23,12 +24,14 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/shahardalva/sentinel/internal/admin"
 	"github.com/shahardalva/sentinel/internal/keys"
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/provider/openai"
 	"github.com/shahardalva/sentinel/internal/provider/upstream"
 	"github.com/shahardalva/sentinel/internal/proxy"
 	"github.com/shahardalva/sentinel/internal/ratelimit"
+	"github.com/shahardalva/sentinel/internal/store"
 	"github.com/shahardalva/sentinel/internal/telemetry"
 )
 
@@ -43,6 +46,43 @@ const (
 	metricsOff         = "off"
 	// A scrape takes milliseconds; nothing on the metrics port streams.
 	metricsShutdownTimeout = 5 * time.Second
+	// Loopback only, like metrics, and the port after it. Used only with a
+	// key database: the admin API manages it.
+	defaultAdminAddr = "127.0.0.1:9465"
+	// An admin request is one store call of at most 5 s (admin's own
+	// timeout); nothing on the admin port streams.
+	adminShutdownTimeout = 5 * time.Second
+	// defaultKeysRefresh is how often the key set is fetched from the
+	// database: the revocation latency (ADR 0005). minKeysRefresh keeps
+	// the fetch timeout, half the interval, long enough for a round trip to
+	// a database over a network, and keeps a typo such as 30ms from
+	// querying it 30 times a second per gateway.
+	defaultKeysRefresh = 30 * time.Second
+	minKeysRefresh     = time.Second
+	// keysStopTimeout bounds the wait for the refresh loop at shutdown. A
+	// fetch honors its context, so it returns at once when cancelled.
+	keysStopTimeout = 5 * time.Second
+)
+
+// Startup deadlines for the key database; vars so tests can shorten them.
+//
+// storeOpenTimeout bounds store.Open: a TCP connect, TLS if configured,
+// authentication and a ping. Without it a database behind a firewall that
+// drops packets would hold startup for the OS connect timeout, minutes.
+// 10 s is far beyond a healthy connect, even across regions or to a
+// database just started, and matches the longest default key fetch
+// timeout.
+//
+// storeMigrateTimeout bounds Migrate. The migrations so far are a few
+// CREATE TABLE statements that take milliseconds; most of the time is
+// waiting on the migration lock while other gateways starting at once
+// migrate in turn. 30 s covers that with room to spare. A migration that
+// needs longer (a backfill on a big table) should be run on purpose, not
+// on a gateway's startup, and the deadline rolls it back whole rather
+// than leaving startup hanging.
+var (
+	storeOpenTimeout    = 10 * time.Second
+	storeMigrateTimeout = 30 * time.Second
 )
 
 func main() {
@@ -143,7 +183,20 @@ type enabledUpstream struct {
 
 // config is the gateway's validated startup configuration.
 type config struct {
-	clientKeys    []string
+	// clientKeys are the keys from SENTINEL_API_KEYS; nil when the keys
+	// come from the database.
+	clientKeys []string
+	// databaseURL is SENTINEL_DATABASE_URL, empty when unset. It may hold
+	// a password: never log it or put it in an error.
+	databaseURL string
+	keysRefresh time.Duration // with a database only
+	adminAddr   string        // empty without a database or when "off"
+	// adminToken is SENTINEL_ADMIN_TOKEN, set when adminAddr is. Never log
+	// it.
+	adminToken string
+	// keyWarnings say which variables of the key database or the admin
+	// API are set but not used, and why. Never their values.
+	keyWarnings   []string
 	addr          string
 	metricsAddr   string // empty when SENTINEL_METRICS_ADDR is "off"
 	maxConcurrent int
@@ -195,9 +248,9 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 			ignored = append(ignored, s)
 		}
 	}
-	clientKeys, err := keys.Parse(getenv("SENTINEL_API_KEYS"))
+	kc, err := loadKeyConfig(getenv)
 	if err != nil {
-		return config{}, errors.New("SENTINEL_API_KEYS is not set")
+		return config{}, err
 	}
 	addr := getenv("SENTINEL_ADDR")
 	if addr == "" {
@@ -206,6 +259,9 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 	metricsAddr, err := parseMetricsAddr(getenv("SENTINEL_METRICS_ADDR"), addr)
 	if err != nil {
 		return config{}, fmt.Errorf("SENTINEL_METRICS_ADDR: %w", err)
+	}
+	if err := loadAdminConfig(getenv, &kc, addr, metricsAddr); err != nil {
+		return config{}, err
 	}
 	maxConcurrent, err := parseMaxConcurrent(getenv("SENTINEL_MAX_CONCURRENT"))
 	if err != nil {
@@ -251,7 +307,12 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 	}
 
 	return config{
-		clientKeys:     clientKeys,
+		clientKeys:     kc.clientKeys,
+		databaseURL:    kc.databaseURL,
+		keysRefresh:    kc.keysRefresh,
+		adminAddr:      kc.adminAddr,
+		adminToken:     kc.adminToken,
+		keyWarnings:    kc.keyWarnings,
 		addr:           addr,
 		metricsAddr:    metricsAddr,
 		maxConcurrent:  maxConcurrent,
@@ -314,7 +375,13 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		opts.Recorder = metrics
 	}
 
-	mux := newMux(cfg, logger, opts)
+	src, db, stopKeys, err := startKeys(ctx, logger, cfg, opts.Recorder)
+	if err != nil {
+		return err
+	}
+	defer stopKeys()
+
+	mux := newMux(cfg, logger, opts, src)
 
 	// No ReadTimeout or WriteTimeout: they cap a whole request, and streams
 	// can legitimately run for minutes. The handler sets its own per-request
@@ -346,6 +413,30 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		defer metricsSrv.Close()
 	}
 
+	// After metrics and before the API, for the same reason, and with the
+	// same rule: a bind failure stops startup, a later failure only loses
+	// the admin API. Keys keep refreshing and the API keeps serving; an
+	// operator who can't issue or revoke a key for a while is better off
+	// than every client losing the gateway.
+	var adminSrv *http.Server
+	switch {
+	case db == nil:
+	case cfg.adminAddr == "":
+		logger.Info("admin API disabled: SENTINEL_ADMIN_ADDR is off")
+	default:
+		aln, err := listenAdmin(logger, cfg.adminAddr)
+		if err != nil {
+			return fmt.Errorf("SENTINEL_ADMIN_ADDR: %w", err)
+		}
+		adminSrv = newAdminServer(admin.New(admin.Config{Store: db, Token: cfg.adminToken, Logger: logger}), logger)
+		go func() {
+			if err := adminSrv.Serve(aln); !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("admin server stopped; the API keeps serving without the admin API", "error", err)
+			}
+		}()
+		defer adminSrv.Close()
+	}
+
 	ln, err := listen(logger, cfg.addr)
 	if err != nil {
 		return err
@@ -369,8 +460,14 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		logger.Warn("grace period expired; closing open connections", "error", err)
 		_ = srv.Close()
 	}
-	// After the API, so a scrape during the grace period still answers.
-	// The deferred Close cuts whatever outlives this.
+	// After the API, so a scrape during the grace period still answers,
+	// and the admin API before the key store it uses is closed (the
+	// deferred stopKeys). The deferred Closes cut whatever outlives this.
+	if adminSrv != nil {
+		actx, acancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
+		defer acancel()
+		_ = adminSrv.Shutdown(actx)
+	}
 	if metricsSrv != nil {
 		mctx, mcancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
 		defer mcancel()
@@ -406,6 +503,132 @@ func listenMetrics(logger *slog.Logger, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+// listenAdmin binds the admin address and only then logs "admin
+// listening". Like listenMetrics, it never logs "listening".
+func listenAdmin(logger *slog.Logger, addr string) (net.Listener, error) {
+	ln, err := listenTCP("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("admin listening", "addr", ln.Addr().String(), "path", "/admin/")
+	return ln, nil
+}
+
+// newAdminServer serves the admin API, with whole-request timeouts like
+// the metrics server: every admin request is short, and its store call
+// has 5 s. DisableGeneralOptionsHandler hands "OPTIONS *" to the handler,
+// which answers it with its 401 like any other request without the token,
+// instead of net/http's own 200.
+func newAdminServer(h http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:                      h,
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            5 * time.Second,
+		ReadTimeout:                  10 * time.Second,
+		WriteTimeout:                 15 * time.Second,
+		IdleTimeout:                  60 * time.Second,
+		ErrorLog:                     slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
+}
+
+// keyStore is what the gateway needs of the key database: the admin API's
+// calls, the migrations and the key fetch. *store.Store satisfies it.
+type keyStore interface {
+	admin.Store
+	Migrate(ctx context.Context) error
+	SchemaVersion(ctx context.Context) (int, error)
+	ActiveDigests(ctx context.Context) ([][sha256.Size]byte, error)
+	Close()
+}
+
+var _ keyStore = (*store.Store)(nil)
+
+// openStore is store.Open; a var so tests can run the wiring on a fake
+// store.
+var openStore = func(ctx context.Context, url string) (keyStore, error) {
+	s, err := store.Open(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// startKeys returns the source of the client keys. Without a database it
+// holds the keys from SENTINEL_API_KEYS, db is nil and stop does nothing.
+// With one, startKeys opens and migrates the database, each within its
+// deadline, and starts a keys.Refreshing on it, which has loaded the keys
+// once when startKeys returns. stop cancels the refresh, waits for it a
+// bounded time, and closes the database.
+//
+// ctx cancels the startup steps but not the refresh, so keys keep
+// refreshing while the API drains its requests at shutdown, until stop.
+// Every error is safe to log: the store's are sanitized, and none holds
+// the URL.
+func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.Recorder) (src proxy.KeySource, db keyStore, stop func(), err error) {
+	if cfg.databaseURL == "" {
+		logger.Info("client keys from SENTINEL_API_KEYS", "keys", len(cfg.clientKeys))
+		return keys.NewStatic(cfg.clientKeys, rec), nil, func() {}, nil
+	}
+
+	octx, ocancel := context.WithTimeout(ctx, storeOpenTimeout)
+	db, err = openStore(octx, cfg.databaseURL)
+	ocancel()
+	if err != nil {
+		return nil, nil, nil, startupError(ctx, "SENTINEL_DATABASE_URL", err, storeOpenTimeout)
+	}
+	mctx, mcancel := context.WithTimeout(ctx, storeMigrateTimeout)
+	err = db.Migrate(mctx)
+	var version int
+	if err == nil {
+		version, err = db.SchemaVersion(mctx)
+	}
+	mcancel()
+	if err != nil {
+		db.Close()
+		return nil, nil, nil, startupError(ctx, "key store migration", err, storeMigrateTimeout)
+	}
+
+	rctx, rcancel := context.WithCancel(context.Background())
+	// A signal during the first fetch still stops startup.
+	unlink := context.AfterFunc(ctx, rcancel)
+	r, err := keys.NewRefreshing(rctx, keys.Config{
+		Fetch:    db.ActiveDigests,
+		Interval: cfg.keysRefresh,
+		Logger:   logger,
+		Recorder: rec,
+	})
+	unlink()
+	if err != nil {
+		rcancel()
+		db.Close()
+		return nil, nil, nil, fmt.Errorf("key store: %w", err)
+	}
+	logger.Info("client keys from postgres", "keys", r.Keys().Len(),
+		"refresh", cfg.keysRefresh.String(), "schema_version", version)
+	stop = func() {
+		rcancel()
+		select {
+		case <-r.Done():
+		case <-time.After(keysStopTimeout):
+			// Close waits for every connection in use, the stuck fetch's too.
+			logger.Warn("key refresh did not stop; leaving the key store open", "waited", keysStopTimeout.String())
+			return
+		}
+		db.Close()
+	}
+	return r, db, stop, nil
+}
+
+// startupError wraps the error of a startup step on the key database. A
+// step that ran out of its own deadline, rather than being cancelled by a
+// signal, says which deadline.
+func startupError(ctx context.Context, step string, err error, deadline time.Duration) error {
+	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w (startup deadline %s)", step, err, deadline)
+	}
+	return fmt.Errorf("%s: %w", step, err)
+}
+
 // newMetrics returns the gateway's metrics, labelled with the enabled
 // upstreams, watching admission and, when rate limiting is on, the Redis
 // breaker.
@@ -433,18 +656,18 @@ func newMetricsServer(metrics http.Handler, logger *slog.Logger) *http.Server {
 }
 
 // newMux registers the routes of every enabled upstream (see
-// upstreamSpec.routes), each behind the same client keys and one
+// upstreamSpec.routes), each behind the client keys from src and one
 // proxy.Auth, which reports rejections to opts.Recorder. Every handler gets
 // the same opts, so they share its rate limiter and Recorder, and one
 // Admission:
 // when opts has none, newMux creates it with cfg.maxConcurrent slots. One
 // cap for the whole gateway means every route and upstream draws on the
 // same slots, so the memory bound in ADR 0001 holds however many there are.
-func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux {
+func newMux(cfg config, logger *slog.Logger, opts proxy.Options, src proxy.KeySource) *http.ServeMux {
 	if opts.Admission == nil {
 		opts.Admission = proxy.NewAdmission(cfg.maxConcurrent)
 	}
-	auth := proxy.NewAuthSource(keys.NewStatic(cfg.clientKeys, opts.Recorder), logger, opts.Recorder)
+	auth := proxy.NewAuthSource(src, logger, opts.Recorder)
 	mux := http.NewServeMux()
 	for _, u := range cfg.upstreams {
 		o := opts
@@ -613,6 +836,9 @@ func logUpstreams(logger *slog.Logger, cfg config) {
 	for _, s := range cfg.ignored {
 		logger.Warn(fmt.Sprintf("%s is set but %s is not in SENTINEL_UPSTREAMS; ignoring", s.keyVar, s.name))
 	}
+	for _, w := range cfg.keyWarnings {
+		logger.Warn(w)
+	}
 	for _, name := range cfg.ignoredCustom {
 		logger.Warn(fmt.Sprintf("%s%s_* is set but %s is not in SENTINEL_UPSTREAMS; ignoring",
 			customVarPrefix, strings.ToUpper(name), name))
@@ -643,12 +869,8 @@ func closeUnmatched(mux *http.ServeMux) http.Handler {
 
 // parseMetricsAddr reads SENTINEL_METRICS_ADDR. Empty means
 // defaultMetricsAddr, and "off" means no metrics, returned as "". Anything
-// else must be host:port with a numeric port, and that port must not be
-// apiAddr's, whatever either host: 0.0.0.0, [::] and 127.0.0.1 overlap in
-// practice, and a client resolving localhost to ::1 would otherwise reach
-// metrics on the API's port. Ports compare as numbers, so 08081 is 8081,
-// and a named API port such as :http is resolved first. Port 0 (any free
-// port) is exempt.
+// else must be host:port with a numeric port other than apiAddr's (see
+// checkOwnPort).
 func parseMetricsAddr(s, apiAddr string) (string, error) {
 	switch s = strings.TrimSpace(s); s {
 	case "":
@@ -656,21 +878,145 @@ func parseMetricsAddr(s, apiAddr string) (string, error) {
 	case metricsOff:
 		return "", nil
 	}
+	if err := checkOwnPort(s, "metrics", listenerAddr{"SENTINEL_ADDR", apiAddr}); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// listenerAddr is another listener's address and the variable it is from.
+type listenerAddr struct{ name, addr string }
+
+// checkOwnPort checks that s, the address of the listener called what, is
+// host:port with a numeric port, and that the port is none of others',
+// whatever either host: 0.0.0.0, [::] and 127.0.0.1 overlap in practice,
+// and a client resolving localhost to ::1 would otherwise reach one
+// listener on another's port. Ports compare as numbers, so 08081 is 8081,
+// and a named port among others, such as :http, is resolved first. Port 0
+// (any free port) is exempt, and so is an other's address that doesn't
+// parse: it fails at its own bind.
+func checkOwnPort(s, what string, others ...listenerAddr) error {
 	_, port, err := net.SplitHostPort(s)
 	if err != nil {
-		return "", fmt.Errorf("%q is neither host:port nor %q", s, metricsOff)
+		return fmt.Errorf("%q is neither host:port nor %q", s, metricsOff)
 	}
 	n, err := strconv.ParseUint(port, 10, 16)
 	if err != nil {
-		return "", fmt.Errorf("%q has no numeric port", s)
+		return fmt.Errorf("%q has no numeric port", s)
 	}
-	// An API address that doesn't parse fails at its own bind.
-	if _, apiPort, err := net.SplitHostPort(apiAddr); err == nil && n != 0 {
-		if api, err := net.LookupPort("tcp", apiPort); err == nil && uint64(api) == n {
-			return "", fmt.Errorf("%q has SENTINEL_ADDR's port %d; metrics never share the API's port", s, n)
+	if n == 0 {
+		return nil
+	}
+	for _, o := range others {
+		_, oport, err := net.SplitHostPort(o.addr)
+		if err != nil {
+			continue
+		}
+		if p, err := net.LookupPort("tcp", oport); err == nil && uint64(p) == n {
+			return fmt.Errorf("%q has %s's port %d; %s needs a port of its own, never the API's or another listener's", s, o.name, n, what)
 		}
 	}
-	return s, nil
+	return nil
+}
+
+// loadKeyConfig reads where the client keys come from:
+// SENTINEL_API_KEYS, or the database at SENTINEL_DATABASE_URL, never both,
+// and SENTINEL_KEYS_REFRESH for the database. The returned config has only
+// those fields. No error holds the URL, which may carry a password.
+func loadKeyConfig(getenv func(string) string) (config, error) {
+	var kc config
+	kc.databaseURL = getenv("SENTINEL_DATABASE_URL")
+	rawKeys := getenv("SENTINEL_API_KEYS")
+	rawRefresh := getenv("SENTINEL_KEYS_REFRESH")
+	if kc.databaseURL == "" {
+		clientKeys, err := keys.Parse(rawKeys)
+		if err != nil {
+			return config{}, errors.New("SENTINEL_API_KEYS is not set; it is required unless SENTINEL_DATABASE_URL is set")
+		}
+		kc.clientKeys = clientKeys
+		if rawRefresh != "" {
+			kc.keyWarnings = append(kc.keyWarnings, "SENTINEL_KEYS_REFRESH is set but SENTINEL_DATABASE_URL is not; ignoring")
+		}
+		return kc, nil
+	}
+	// libpq and pgx read an empty connection string as "all defaults",
+	// from PG* variables and ~/.pgpass, which a blank value shouldn't mean.
+	if strings.TrimSpace(kc.databaseURL) == "" {
+		return config{}, errors.New("SENTINEL_DATABASE_URL is blank; unset it to take keys from SENTINEL_API_KEYS")
+	}
+	if rawKeys != "" {
+		return config{}, errors.New("SENTINEL_API_KEYS must be empty while SENTINEL_DATABASE_URL is set: " +
+			"the client keys come from the database, and the gateway never merges the two")
+	}
+	refresh, err := parseKeysRefresh(rawRefresh)
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_KEYS_REFRESH: %w", err)
+	}
+	kc.keysRefresh = refresh
+	return kc, nil
+}
+
+// parseKeysRefresh reads SENTINEL_KEYS_REFRESH, a Go duration such as 30s
+// or 1m. Empty means defaultKeysRefresh; anything else must be at least
+// minKeysRefresh.
+func parseKeysRefresh(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultKeysRefresh, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%q is not a positive duration such as 30s", s)
+	}
+	if d < minKeysRefresh {
+		return 0, fmt.Errorf("%q is under the minimum of %s", s, minKeysRefresh)
+	}
+	return d, nil
+}
+
+// loadAdminConfig reads SENTINEL_ADMIN_ADDR and SENTINEL_ADMIN_TOKEN into
+// kc, which loadKeyConfig filled. The admin API exists only with a
+// database: by default on defaultAdminAddr, "off" disables it, and any
+// other address must be host:port on a port of its own (checkOwnPort).
+// Without a database, an address other than "off" is an error. The token
+// is required while the admin API is on; no error holds it.
+func loadAdminConfig(getenv func(string) string, kc *config, apiAddr, metricsAddr string) error {
+	addr := strings.TrimSpace(getenv("SENTINEL_ADMIN_ADDR"))
+	token := getenv("SENTINEL_ADMIN_TOKEN")
+	if kc.databaseURL == "" {
+		if addr != "" && addr != metricsOff {
+			return errors.New("SENTINEL_ADMIN_ADDR is set but SENTINEL_DATABASE_URL is not; " +
+				"the admin API manages the keys in the database")
+		}
+		if token != "" {
+			kc.keyWarnings = append(kc.keyWarnings, "SENTINEL_ADMIN_TOKEN is set but SENTINEL_DATABASE_URL is not; ignoring")
+		}
+		return nil
+	}
+	switch addr {
+	case "":
+		addr = defaultAdminAddr
+	case metricsOff:
+		if token != "" {
+			kc.keyWarnings = append(kc.keyWarnings, "SENTINEL_ADMIN_TOKEN is set but SENTINEL_ADMIN_ADDR is off; ignoring")
+		}
+		return nil
+	}
+	others := []listenerAddr{{"SENTINEL_ADDR", apiAddr}}
+	if metricsAddr != "" {
+		others = append(others, listenerAddr{"SENTINEL_METRICS_ADDR", metricsAddr})
+	}
+	if err := checkOwnPort(addr, "the admin API", others...); err != nil {
+		return fmt.Errorf("SENTINEL_ADMIN_ADDR: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("SENTINEL_ADMIN_TOKEN is not set; it is required while the admin API is on (%s), "+
+			"or set SENTINEL_ADMIN_ADDR=off", addr)
+	}
+	if err := admin.ValidateToken(token); err != nil {
+		return fmt.Errorf("SENTINEL_ADMIN_TOKEN: %w", err)
+	}
+	kc.adminAddr, kc.adminToken = addr, token
+	return nil
 }
 
 // parseMaxConcurrent reads the concurrency cap. Empty means
