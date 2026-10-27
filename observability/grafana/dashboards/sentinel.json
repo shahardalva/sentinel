@@ -734,7 +734,8 @@
           "custom": {
             "lineWidth": 1,
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "axisSoftMax": 1
           },
           "min": 0,
           "decimals": 0

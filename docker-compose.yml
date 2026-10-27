@@ -58,6 +58,13 @@ services:
       # Metrics on all interfaces inside the container, for Prometheus on
       # the compose network. Not published on the host.
       SENTINEL_METRICS_ADDR: 0.0.0.0:9464
+      # .env holds these for the mock run's gateway, which has a database
+      # and an admin API (docker-compose.mock.yml sets them again). This
+      # gateway has neither: blank, so the admin token never reaches its
+      # container and nothing logs them as set but ignored. environment
+      # overrides env_file.
+      SENTINEL_ADMIN_TOKEN: ""
+      SENTINEL_KEYS_REFRESH: ""
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:

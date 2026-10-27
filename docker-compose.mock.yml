@@ -23,10 +23,14 @@ services:
       OPENAI_API_KEY: mock-not-a-real-key
       SENTINEL_UPSTREAM_MOCKCOMPAT_API_KEY: mock-not-a-real-key
       # Client keys come from the postgres service, issued and revoked
-      # through the admin API below; the gateway fetches them every 30 s
-      # (SENTINEL_KEYS_REFRESH, settable in .env). The password is the
-      # service's dev-only one (docker-compose.yml).
+      # through the admin API below. The password is the service's
+      # dev-only one (docker-compose.yml).
       SENTINEL_DATABASE_URL: postgres://sentinel:sentinel-dev-only@postgres:5432/sentinel?sslmode=disable
+      # How often the gateway fetches the keys; from .env, default 30s.
+      # Set here, by interpolation, because docker-compose.yml blanks it
+      # for the gateway without a database, and this file's environment
+      # wins over that one's, key by key.
+      SENTINEL_KEYS_REFRESH: ${SENTINEL_KEYS_REFRESH:-30s}
       # Empty, so a SENTINEL_API_KEYS in .env (for make up-real) doesn't
       # stop startup: the gateway refuses keys from both places.
       SENTINEL_API_KEYS: ""

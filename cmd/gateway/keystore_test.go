@@ -99,6 +99,12 @@ func TestLoadConfig_KeySource(t *testing.T) {
 	wantConfigErr(t, map[string]string{"ANTHROPIC_API_KEY": "sk"}, "SENTINEL_API_KEYS")
 	wantConfigErr(t, with(dbBase, map[string]string{"SENTINEL_API_KEYS": "k1"}), "SENTINEL_API_KEYS")
 	wantConfigErr(t, with(dbBase, map[string]string{"SENTINEL_DATABASE_URL": "\t"}), "SENTINEL_DATABASE_URL")
+
+	// Surrounding whitespace, as a .env line can leave, is dropped.
+	cfg, err = loadConfig(env(with(dbBase, map[string]string{"SENTINEL_DATABASE_URL": "  " + leakURL + " \n"})))
+	if err != nil || cfg.databaseURL != leakURL {
+		t.Errorf("padded URL: stored %d bytes, %v; want the trimmed URL", len(cfg.databaseURL), err)
+	}
 }
 
 func TestParseKeysRefresh(t *testing.T) {
@@ -301,8 +307,27 @@ type fakeStore struct {
 	// afterClose counts calls made after Close, which must be none.
 	afterClose int
 
-	migrate func(ctx context.Context) error
-	fetch   func(ctx context.Context) ([][sha256.Size]byte, error)
+	migrate      func(ctx context.Context) error
+	fetch        func(ctx context.Context) ([][sha256.Size]byte, error)
+	createTenant func(ctx context.Context) // runs before CreateTenant, unlocked
+
+	// events records what happened, in order, for tests of the shutdown
+	// order: "close" here, the rest from the hooks.
+	events []string
+}
+
+// event appends to f's event log.
+func (f *fakeStore) event(e string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, e)
+}
+
+// eventLog returns a copy of f's event log.
+func (f *fakeStore) eventLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.events)
 }
 
 type fakeKey struct {
@@ -330,7 +355,13 @@ func (f *fakeStore) id() string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012d", f.n)
 }
 
-func (f *fakeStore) CreateTenant(_ context.Context, name string) (store.Tenant, error) {
+func (f *fakeStore) CreateTenant(ctx context.Context, name string) (store.Tenant, error) {
+	f.mu.Lock()
+	hook := f.createTenant
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx)
+	}
 	defer f.call()()
 	t := &store.Tenant{ID: f.id(), Name: name, CreatedAt: time.Now()}
 	f.tenants[t.ID] = t
@@ -424,6 +455,7 @@ func (f *fakeStore) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
+	f.events = append(f.events, "close")
 }
 
 func (f *fakeStore) state() (migrated int, closed bool, afterClose int) {
@@ -437,16 +469,22 @@ func (f *fakeStore) state() (migrated int, closed bool, afterClose int) {
 func useStore(t *testing.T, f keyStore, openErr error) *string {
 	t.Helper()
 	var gotURL string
-	prev := openStore
-	t.Cleanup(func() { openStore = prev })
-	openStore = func(ctx context.Context, url string) (keyStore, error) {
+	useOpen(t, func(ctx context.Context, url string) (keyStore, error) {
 		gotURL = url
 		if openErr != nil {
 			return nil, openErr
 		}
 		return f, nil
-	}
+	})
 	return &gotURL
+}
+
+// useOpen makes serve open the key store with open.
+func useOpen(t *testing.T, open func(ctx context.Context, url string) (keyStore, error)) {
+	t.Helper()
+	prev := openStore
+	t.Cleanup(func() { openStore = prev })
+	openStore = open
 }
 
 // okUpstream answers every request with a 200, as a real upstream would a
@@ -730,9 +768,6 @@ func TestServe_DatabaseStartupFailures(t *testing.T) {
 		{name: "open fails", want: "SENTINEL_DATABASE_URL: store: open", setup: func(*fakeStore) error {
 			return &store.Error{Op: "open"}
 		}},
-		{name: "open times out", want: "SENTINEL_DATABASE_URL: ", timeout: true, setup: func(*fakeStore) error {
-			return fmt.Errorf("store: open: timed out: %w", context.DeadlineExceeded)
-		}},
 		{name: "migrate fails", want: "key store migration: " + errDB.Error(), closed: true, setup: func(f *fakeStore) error {
 			f.migrate = func(context.Context) error { return errDB }
 			return nil
@@ -854,7 +889,10 @@ func TestServe_AdminServeErrorKeepsAPI(t *testing.T) {
 // refresh, and is rejected after it is revoked and a refresh runs. Only
 // with SENTINEL_TEST_POSTGRES_URL, in a schema of its own.
 func TestServe_PostgresKeyLifecycle(t *testing.T) {
-	r := startServeWith(t, dbVars(t, testSchemaURL(t)), fastRefresh)
+	// 500 ms, not fastRefresh: each fetch gets half of it, and a real
+	// fetch, or a reconnect after one timed out, needs more than 25 ms on
+	// a loaded CI runner under -race.
+	r := startServeWith(t, dbVars(t, testSchemaURL(t)), func(cfg *config) { cfg.keysRefresh = 500 * time.Millisecond })
 	keyLifecycle(t, r)
 }
 

@@ -49,9 +49,6 @@ const (
 	// Loopback only, like metrics, and the port after it. Used only with a
 	// key database: the admin API manages it.
 	defaultAdminAddr = "127.0.0.1:9465"
-	// An admin request is one store call of at most 5 s (admin's own
-	// timeout); nothing on the admin port streams.
-	adminShutdownTimeout = 5 * time.Second
 	// defaultKeysRefresh is how often the key set is fetched from the
 	// database: the revocation latency (ADR 0005). minKeysRefresh keeps
 	// the fetch timeout, half the interval, long enough for a round trip to
@@ -59,12 +56,10 @@ const (
 	// querying it 30 times a second per gateway.
 	defaultKeysRefresh = 30 * time.Second
 	minKeysRefresh     = time.Second
-	// keysStopTimeout bounds the wait for the refresh loop at shutdown. A
-	// fetch honors its context, so it returns at once when cancelled.
-	keysStopTimeout = 5 * time.Second
 )
 
-// Startup deadlines for the key database; vars so tests can shorten them.
+// Deadlines for the key database and the admin API; vars so tests can
+// shorten them.
 //
 // storeOpenTimeout bounds store.Open: a TCP connect, TLS if configured,
 // authentication and a ping. Without it a database behind a firewall that
@@ -80,9 +75,18 @@ const (
 // needs longer (a backfill on a big table) should be run on purpose, not
 // on a gateway's startup, and the deadline rolls it back whole rather
 // than leaving startup hanging.
+//
+// adminShutdownTimeout bounds the admin server's graceful shutdown: an
+// admin request is one store call of at most 5 s (admin's own timeout),
+// and nothing on the admin port streams.
+//
+// keysStopTimeout bounds the wait for the refresh loop at shutdown. A
+// fetch honors its context, so it returns at once when cancelled.
 var (
-	storeOpenTimeout    = 10 * time.Second
-	storeMigrateTimeout = 30 * time.Second
+	storeOpenTimeout     = 10 * time.Second
+	storeMigrateTimeout  = 30 * time.Second
+	adminShutdownTimeout = 5 * time.Second
+	keysStopTimeout      = 5 * time.Second
 )
 
 func main() {
@@ -377,6 +381,12 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 
 	src, db, stopKeys, err := startKeys(ctx, logger, cfg, opts.Recorder)
 	if err != nil {
+		if ctx.Err() != nil {
+			// A signal while startup waited on the database: a stop that
+			// was asked for, not a failure, so no error exit.
+			logger.Info("startup interrupted", "error", err)
+			return nil
+		}
 		return err
 	}
 	defer stopKeys()
@@ -466,7 +476,11 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if adminSrv != nil {
 		actx, acancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
 		defer acancel()
-		_ = adminSrv.Shutdown(actx)
+		if err := adminSrv.Shutdown(actx); err != nil {
+			// The deferred Close cuts the admin requests still open; a
+			// change among them may or may not have been applied.
+			logger.Warn("admin grace period expired; closing open admin connections", "error", err)
+		}
 	}
 	if metricsSrv != nil {
 		mctx, mcancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
@@ -487,8 +501,8 @@ func listen(logger *slog.Logger, addr string) (net.Listener, error) {
 	return ln, nil
 }
 
-// listenTCP is net.Listen for the metrics listener; a var so tests can make
-// that listener fail.
+// listenTCP is net.Listen for the metrics and admin listeners; a var so
+// tests can make them fail.
 var listenTCP = net.Listen
 
 // listenMetrics binds the metrics address and only then logs "metrics
@@ -925,10 +939,10 @@ func checkOwnPort(s, what string, others ...listenerAddr) error {
 // those fields. No error holds the URL, which may carry a password.
 func loadKeyConfig(getenv func(string) string) (config, error) {
 	var kc config
-	kc.databaseURL = getenv("SENTINEL_DATABASE_URL")
+	rawURL := getenv("SENTINEL_DATABASE_URL")
 	rawKeys := getenv("SENTINEL_API_KEYS")
 	rawRefresh := getenv("SENTINEL_KEYS_REFRESH")
-	if kc.databaseURL == "" {
+	if rawURL == "" {
 		clientKeys, err := keys.Parse(rawKeys)
 		if err != nil {
 			return config{}, errors.New("SENTINEL_API_KEYS is not set; it is required unless SENTINEL_DATABASE_URL is set")
@@ -941,7 +955,8 @@ func loadKeyConfig(getenv func(string) string) (config, error) {
 	}
 	// libpq and pgx read an empty connection string as "all defaults",
 	// from PG* variables and ~/.pgpass, which a blank value shouldn't mean.
-	if strings.TrimSpace(kc.databaseURL) == "" {
+	// Surrounding whitespace, from a .env file say, is dropped.
+	if kc.databaseURL = strings.TrimSpace(rawURL); kc.databaseURL == "" {
 		return config{}, errors.New("SENTINEL_DATABASE_URL is blank; unset it to take keys from SENTINEL_API_KEYS")
 	}
 	if rawKeys != "" {

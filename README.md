@@ -277,7 +277,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9464` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. For `make up` it takes the client keys from the `postgres` service (`SENTINEL_DATABASE_URL`, with the service's dev-only password), sets `SENTINEL_API_KEYS` to empty so a key in `.env` doesn't clash, and serves the admin API on `0.0.0.0:9465` inside the container, published on `127.0.0.1:9465` only, with `SENTINEL_ADMIN_TOKEN` from `.env`, which has no default: compose refuses to start the stack without it. `make up-real` keeps `SENTINEL_API_KEYS` from `.env`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9464` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. For `make up` it takes the client keys from the `postgres` service (`SENTINEL_DATABASE_URL`, with the service's dev-only password), sets `SENTINEL_API_KEYS` to empty so a key in `.env` doesn't clash, and serves the admin API on `0.0.0.0:9465` inside the container, published on `127.0.0.1:9465` only, with `SENTINEL_ADMIN_TOKEN` from `.env`, which has no default: compose refuses to start the stack without it. `make up-real` keeps `SENTINEL_API_KEYS` from `.env`, and blanks `SENTINEL_ADMIN_TOKEN` and `SENTINEL_KEYS_REFRESH`, which only the mock run's gateway uses: the token never reaches a gateway without an admin API. The mock run sets `SENTINEL_KEYS_REFRESH` from `.env`, default `30s`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -339,11 +339,11 @@ The design is in [ADR 0003](docs/adr/0003-named-upstreams.md).
 
 ### Client keys in Postgres
 
-With `SENTINEL_DATABASE_URL` set, the client keys live in Postgres, per tenant, and are issued and revoked through the [admin API](#admin-api) without a restart. At startup the gateway connects (10 s deadline), applies its migrations (30 s; they are embedded in the binary, forward only, and gateways starting at once take turns on an advisory lock), and loads the active keys. Any of these failing stops startup with a sanitized error: an operation and a code, never the URL, user, host or database name. Then it fetches the active keys every `SENTINEL_KEYS_REFRESH` and swaps the whole set in; no request ever waits on the database. A failed refresh keeps the last good set and logs a `WARN`. The design, including why digests are plain SHA-256, is in [ADR 0005](docs/adr/0005-postgres-client-keys.md).
+With `SENTINEL_DATABASE_URL` set, the client keys live in Postgres, per tenant, and are issued and revoked through the [admin API](#admin-api) without a restart. At startup the gateway connects (10 s deadline), applies its migrations (30 s; they are embedded in the binary, forward only, and gateways starting at once take turns on an advisory lock), and loads the active keys. Any of these failing stops startup with a sanitized error: an operation and a code, never the URL, user, host or database name. A signal (Ctrl-C, `SIGTERM`) while one of them waits stops the gateway cleanly: an `INFO` line, `startup interrupted`, and exit status 0, not a failure. Then it fetches the active keys every `SENTINEL_KEYS_REFRESH` and swaps the whole set in; no request ever waits on the database. A failed refresh keeps the last good set and logs a `WARN`. The design, including why digests are plain SHA-256, is in [ADR 0005](docs/adr/0005-postgres-client-keys.md).
 
 Keys look like `snl_` followed by 43 base64url characters (256 random bits). The database holds only their SHA-256 digests and a 12-character prefix to tell them apart; the key itself is shown once, in the admin API's response that created it.
 
-The gateway applies migrations itself, so its database role needs to create tables on the first start and after an upgrade that adds a migration. An up-to-date database needs only `SELECT` on the gateway's tables and `UPDATE`/`INSERT` for the admin API. The connection string is passed to pgx as is: anything it leaves out comes from the libpq environment variables (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`...) and from `~/.pgpass`, which pgx reads too. See [Known limitations](#known-limitations).
+The gateway applies migrations itself, so its database role needs to create tables on the first start and after an upgrade that adds a migration. An up-to-date database needs only `SELECT` on the gateway's tables and `INSERT`/`UPDATE` for the admin API, so production can run the gateways as a role without CREATE and migrate with another (ADR 0005, Database roles). The connection string is passed to pgx as is: anything it leaves out comes from the libpq environment variables (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`...) and from `~/.pgpass`, which pgx reads too. See [Known limitations](#known-limitations).
 
 ### Admin API
 
@@ -359,13 +359,20 @@ On its own listener (`SENTINEL_ADMIN_ADDR`, default `127.0.0.1:9465`), only with
 | `DELETE /admin/keys/{id}` | Revokes a key: it stops working at the next refresh. `204` |
 
 ```bash
-# make up: the token is SENTINEL_ADMIN_TOKEN from .env
-export ADMIN="Authorization: Bearer $SENTINEL_ADMIN_TOKEN"
-curl -s -H "$ADMIN" -H 'Content-Type: application/json' -d '{"name":"acme"}' http://127.0.0.1:9465/admin/tenants
-curl -s -H "$ADMIN" -X POST http://127.0.0.1:9465/admin/tenants/<tenant id>/keys   # prints the key once
+# make up: the token is SENTINEL_ADMIN_TOKEN in .env. Load .env into this
+# shell, so the token is never typed, echoed or saved in the history.
+set -a; . ./.env; set +a
+# printf is a shell builtin and curl reads the header from stdin, so the
+# token doesn't show in the process list either.
+admin() { printf 'Authorization: Bearer %s\n' "$SENTINEL_ADMIN_TOKEN" | curl -s -H @- "$@"; }
+
+admin -H 'Content-Type: application/json' -d '{"name":"acme"}' http://127.0.0.1:9465/admin/tenants
+admin -X POST http://127.0.0.1:9465/admin/tenants/<tenant id>/keys   # prints the key once
 # within SENTINEL_KEYS_REFRESH (30 s), clients can use it on the API
-curl -s -H "$ADMIN" -X DELETE http://127.0.0.1:9465/admin/keys/<key id>
+admin -X DELETE http://127.0.0.1:9465/admin/keys/<key id>
 ```
+
+`set -a; . ./.env` loads every variable in `.env`, upstream keys included, into that shell, and needs `.env` to be valid shell (`NAME=value` lines, values with spaces quoted); close the shell when done. `curl -H @-` needs curl 7.55 or later.
 
 Nothing is ever deleted: a disabled tenant and a revoked key keep their rows, with the time.
 
@@ -632,7 +639,8 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - With keys in Postgres, a revoked key, or every key of a disabled tenant, keeps working until the next refresh: up to `SENTINEL_KEYS_REFRESH` (30 s) plus the time of two fetches. A request already accepted, such as a long stream, runs to its end. While the database is unreachable the gateway keeps its last good set, so revoked keys keep working and new keys don't work until a refresh succeeds; watch `sentinel_auth_key_refresh_age_seconds`. Only a restart takes a key out at once.
 - One admin secret. Every operator shares `SENTINEL_ADMIN_TOKEN`, so the audit line can only say `actor=admin-token`; anyone with it can issue keys for any tenant; rotating it means a restart. There is no rate limit on the admin API and no TLS of its own: keep it on loopback or behind something that terminates TLS and limits who reaches it.
 - pgx honors the libpq environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and the rest) and `~/.pgpass` (or `PGPASSFILE`) for anything `SENTINEL_DATABASE_URL` leaves out, as well as a service file (`PGSERVICEFILE`). A gateway started with any of them in its environment uses them; put the whole connection in the URL to avoid surprises. `sslmode` defaults to `prefer`, which doesn't verify the server: use `sslmode=verify-full` outside a private network.
-- The gateway connects to Postgres as one role that also runs the migrations, so that role can change the schema. There is no separate migrate command or least-privilege runtime role yet.
+- The gateway connects to Postgres as one role that also runs the migrations. In the compose stack that role is the image's superuser, which is fine only for local development. In production, use a migration role that owns the schema and a runtime role without CREATE (SELECT, INSERT, UPDATE) for the gateways; see [ADR 0005](docs/adr/0005-postgres-client-keys.md), Database roles. There is no separate migrate command yet.
+- The admin API and the key refresh share one database connection pool, so a burst of admin requests can make refreshes time out (the last good set stays). The admin API has no rate limit.
 - No traces yet: metrics and the log line are all there is. Traces are planned on the same OpenTelemetry SDK ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)). There are no Go runtime metrics (goroutines, memory, GC) either.
 
 The ones marked "Tracked as an issue" have a fix planned; the rest are deliberate scope limits for now.

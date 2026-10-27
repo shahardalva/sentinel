@@ -44,12 +44,49 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - If the refresh doesn't stop within 5 s, the pool is left open: Close
   would wait for the stuck fetch's connection.
 
+### Verified
+- 2026-10-27, make up smoke test: the postgres service starts as user
+  postgres on a read-only root; a tenant and key issued through the admin
+  API get 200 on the API after one refresh and 401 after revoke and a
+  refresh; the key is in no log line; three audit lines;
+  sentinel_auth_keys 1 -> 0, refresh errors 0; every Grafana panel shows
+  data.
+
+### After review (go-reviewer), tests first
+- A signal during Open, Migrate or the first fetch: INFO "startup
+  interrupted", serve returns nil (exit 0), not an ERROR exit. Tests for
+  all three fail if the AfterFunc hook or the signal ctx is dropped.
+- Shutdown order test: an admin call held in flight and a fetch blocked
+  until cancelled; it asserts admin drained, refresh cancelled and
+  returned, then Close. Fails if Close moves before the cancel, the wait
+  on Done goes, or stopKeys runs before the admin shutdown.
+- Open and Migrate deadlines tested in synctest (exactly 10 s and 30 s;
+  a step without its WithTimeout deadlocks the bubble).
+- keysStopTimeout and adminShutdownTimeout are vars: a fetch ignoring
+  its ctx leaves the pool open with a WARN and shutdown completes; an
+  admin request open past the admin grace period gets a WARN.
+- The real-Postgres lifecycle test refreshes every 500 ms (fetch timeout
+  250 ms) instead of 50 ms, against CI flakes.
+- The base compose gateway blanks SENTINEL_ADMIN_TOKEN and
+  SENTINEL_KEYS_REFRESH, so make up-real neither receives the token nor
+  warns; the mock override sets the token and the refresh
+  (${SENTINEL_KEYS_REFRESH:-30s}) again.
+- The README admin example loads .env with set -a and sends the token
+  through curl -H @- from a shell function.
+- The DB URL is stored trimmed. CI's negative compose check requires the
+  error to name SENTINEL_ADMIN_TOKEN. Grafana refresh errors panel:
+  axisSoftMax 1.
+- Database roles (ADR 0005): compose connects as the image's superuser;
+  production should use a migration role that owns the schema and a
+  runtime role without CREATE (SELECT, INSERT, UPDATE), which the
+  to_regclass check in the runner allows.
+
 ### Next
-- Run make up and make test-postgres (not run here: no Docker): the
-  postgres service as user postgres on a read-only root is unverified,
-  and so is the Postgres lifecycle test.
-- A separate migrate command and a least-privilege runtime role.
-- Per-operator admin credentials, admin rate limit (ADR 0005 limits).
+- A separate migrate command, so the runtime role never needs CREATE.
+- The admin API and the key refresh share one pgx pool (default size),
+  so a token holder could starve refreshes: a pool of its own for the
+  admin API, or an admin rate limit.
+- Per-operator admin credentials (ADR 0005 limits).
 
 ## 2026-10-27: admin API package (Postgres keys, PR 1c)
 

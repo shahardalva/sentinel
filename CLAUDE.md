@@ -44,10 +44,14 @@ tool policies, and writes an audit log.
 - cmd/gateway with SENTINEL_DATABASE_URL: startKeys does store.Open (10 s)
   and Migrate (30 s, automatic on every start), then keys.NewRefreshing
   on ActiveDigests with the Recorder, all before any listener binds; any
-  failure stops startup. It sees the store as a keyStore interface
-  (openStore is a var, so tests use a fake). The refresh ctx is not the
-  signal's; shutdown: API, admin (5 s), metrics, then cancel the refresh,
-  wait for Done (5 s), close the pool.
+  failure stops startup, except that a signal during them logs INFO
+  "startup interrupted" and returns nil. It sees the store as a keyStore
+  interface (openStore is a var, so tests use a fake). The refresh ctx is not the
+  signal's; shutdown: API, admin (5 s, WARN if cut), metrics, then cancel
+  the refresh, wait for Done (5 s; if it doesn't stop, WARN and leave the
+  pool open), close the pool. Compose connects as the image's superuser;
+  production: a migration role and a runtime role without CREATE (ADR
+  0005, Database roles). Admin and refresh share one pool.
 - Admin API: internal/admin, New(Config{Store, Token, Logger})
   http.Handler over an admin.Store interface (*store.Store satisfies it),
   on its own listener (SENTINEL_ADMIN_ADDR, like the metrics one; its
@@ -247,8 +251,10 @@ service (postgres:18.6-alpine3.24, mock profile, no host port, volume
 postgres-data, TCP pg_isready healthcheck the gateway waits on, hardened,
 user postgres, dev-only password sentinel-dev-only in the compose file),
 SENTINEL_API_KEYS="", SENTINEL_ADMIN_ADDR=0.0.0.0:9465 published on
-127.0.0.1:9465 only, and SENTINEL_ADMIN_TOKEN=${SENTINEL_ADMIN_TOKEN:?}.
-gateway-bench keeps env keys. The gateway, gateway-bench and k6 mount only
+127.0.0.1:9465 only, and SENTINEL_ADMIN_TOKEN=${SENTINEL_ADMIN_TOKEN:?} and
+SENTINEL_KEYS_REFRESH=${SENTINEL_KEYS_REFRESH:-30s}; the base gateway
+blanks both, so make up-real never gets the token. gateway-bench keeps
+env keys. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
 copies the server key into a volume as a file owned by the nonroot user
 (65532) with mode 0400, since devcerts writes it 0600 for the host user; the
