@@ -2,9 +2,11 @@ COMPOSE         := docker compose
 COMPOSE_MOCK    := $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml --profile mock
 COMPOSE_BENCH   := $(COMPOSE_MOCK) --profile bench
 MOCK_URL        := https://mockupstream:9090
+# Pinned exactly; CI's postgres service uses the same tag.
+POSTGRES_IMAGE  := postgres:18.6-alpine3.24
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt vet test test-redis certs run up up-real down logs bench bench-gateway
+.PHONY: help fmt vet test test-redis test-postgres certs run up up-real down logs bench bench-gateway
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -22,6 +24,14 @@ test: ## Run tests with the race detector (needs cgo and a C compiler)
 test-redis: ## Run the tests with the race detector, the rate-limit ones also on a real Redis (needs Docker)
 	docker run -d --rm --name sentinel-test-redis -p 127.0.0.1:6390:6379 redis:7-alpine
 	SENTINEL_TEST_REDIS_URL=redis://127.0.0.1:6390/0 go test -race ./...; status=$$?; 	docker stop sentinel-test-redis >/dev/null; exit $$status
+
+# A throwaway Postgres on 127.0.0.1:5433, removed afterwards. The password
+# is for this container only. pg_isready over TCP: during the image's first
+# start it listens on the unix socket alone, then restarts.
+test-postgres: ## Run the tests with the race detector, the store ones also on a real Postgres (needs Docker)
+	docker run -d --rm --name sentinel-test-postgres -p 127.0.0.1:5433:5432 		-e POSTGRES_PASSWORD=sentinel-test-only -e POSTGRES_DB=sentinel_test $(POSTGRES_IMAGE)
+	@i=0; until docker exec sentinel-test-postgres pg_isready -q -h 127.0.0.1 -U postgres; do 		i=$$((i + 1)); 		if [ $$i -ge 60 ]; then echo "test-postgres: postgres did not start" >&2; docker stop sentinel-test-postgres >/dev/null; exit 1; fi; 		sleep 0.5; 	done
+	SENTINEL_TEST_POSTGRES_URL='postgres://postgres:sentinel-test-only@127.0.0.1:5433/sentinel_test?sslmode=disable' go test -race ./...; status=$$?; 	docker stop sentinel-test-postgres >/dev/null; exit $$status
 
 certs: ## Write a dev CA and server cert to ./certs if missing or expiring within 7 days
 	go run ./cmd/devcerts -hosts localhost,127.0.0.1,mockupstream -renew-within 168h

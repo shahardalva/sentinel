@@ -8,6 +8,7 @@
       "Bash(make bench:*)",
       "Bash(make bench-gateway:*)",
       "Bash(make test-redis:*)",
+      "Bash(make test-postgres:*)",
       "Read(./.env)"
     ]
   }

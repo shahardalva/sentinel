@@ -27,18 +27,27 @@ tool policies, and writes an audit log.
   set rejects everything. internal/keys implements it: Static (from
   SENTINEL_API_KEYS, used today) and Refreshing (a Fetch of digests on an
   interval, atomic swap, last good set kept on failure, first fetch must
-  succeed within FetchTimeout; for the Postgres store in PR 1b). A Fetch
-  must honor ctx and return errors safe to log. internal/proxy never
-  imports internal/keys or a DB package.
-- Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
-  Python detector service over gRPC
+  succeed within FetchTimeout). A Fetch must honor ctx and return errors
+  safe to log. internal/proxy never imports internal/keys or a DB package.
+- Key store: internal/store, Postgres via pgx/pgxpool, no sqlc
+  (docs/adr/0005-postgres-client-keys.md). Tenants and api_keys (UUID ids,
+  only SHA-256 digests, nothing deleted: disabled_at, revoked_at).
+  Store.ActiveDigests is a keys.Fetch. Keys are "snl_" + base64url of 32
+  random bytes, returned once by CreateKey, never stored or logged.
+  Migrations: embedded internal/store/migrations/NNNN_name.sql, own runner
+  (schema_migrations, one tx per migration under pg_advisory_xact_lock,
+  ErrSchemaTooNew for a newer DB), forward only. Every error is a
+  sanitized *store.Error (op, SQLSTATE, constraint; never pgx's text,
+  which names user, database or host) or a typed error. Not wired into
+  cmd/gateway until PR 1c.
+- Later: Kafka (franz-go), ClickHouse, Python detector service over gRPC
 
 ## Principles
 - The hot path must be fast and measurable. Every stage records its latency.
 - Keep it simple: stdlib first, add a dependency only with a reason. So
   far: go-redis (docs/adr/0002-rate-limiting.md) and OpenTelemetry with its
-  Prometheus exporter (docs/adr/0004-opentelemetry-metrics.md); miniredis
-  is test-only.
+  Prometheus exporter (docs/adr/0004-opentelemetry-metrics.md), pgx
+  (docs/adr/0005-postgres-client-keys.md); miniredis is test-only.
 - Every change comes with tests.
 - Never commit secrets. API keys come only from environment variables.
 - Claude Code never runs docker, docker compose, or make targets that start
@@ -48,7 +57,10 @@ tool policies, and writes an audit log.
 - go run ./cmd/gateway (needs the env vars below), or make run
 - go test ./... (make test adds -race; make vet, make fmt). make test-redis
   also runs the rate-limit tests on a throwaway redis:7-alpine container;
-  SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it.
+  SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it. make
+  test-postgres does the same for the store tests on a throwaway
+  postgres:18.6-alpine3.24 on 127.0.0.1:5433 (SENTINEL_TEST_POSTGRES_URL;
+  CI sets it too). Each store test uses a schema of its own.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
   redis for rate limiting, and Prometheus and Grafana (127.0.0.1:3000,
