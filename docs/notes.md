@@ -2,6 +2,68 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-27: Postgres key store (Postgres keys, PR 1b)
+
+### Done
+- internal/store on pgx v5.11.0 (pgxpool): Open (parses, pings), Migrate,
+  CreateTenant, ListTenants, DisableTenant, CreateKey (metadata plus the
+  plaintext once), ListKeys, RevokeKey, ActiveDigests (a keys.Fetch: keys
+  not revoked of tenants not disabled). Typed errors: ErrNotFound (also
+  for a malformed UUID), ErrDuplicateName, ErrTenantDisabled,
+  ErrInvalidName, ErrSchemaTooNew. Disable and revoke are idempotent and
+  keep the first time.
+- Migration 0001: tenants and api_keys as specified, plus an index on
+  api_keys.tenant_id. Own runner: one tx per migration, advisory xact
+  lock, newer-version refusal.
+- Key format snl_ + 43 chars base64url (32 bytes); prefix is the first 12;
+  digest is SHA-256 of the whole key, equal to proxy.DigestKeys.
+- Errors: every pgx error becomes *store.Error with op, a fixed
+  description, SQLSTATE and constraint; pgx's text is dropped, not
+  wrapped. Unwrap keeps only context errors.
+- make test-postgres (postgres:18.6-alpine3.24 on 127.0.0.1:5433), denied
+  to Claude Code in .claude/settings.json; CI gets a postgres service on
+  the same image. ADR 0005.
+- Tests: unit (no DB) for sanitizing, key format and digest equality;
+  integration behind SENTINEL_TEST_POSTGRES_URL, each test in its own
+  schema (search_path in the URL): migrate twice, 5 pools migrating at
+  once, newer schema refused, digest length check, lifecycle, disable,
+  typed errors, wrong password leaks nothing, and end to end with
+  keys.Refreshing and proxy.Auth (revoked key 401 after one refresh).
+
+### Decided
+- No sqlc and no goose, against the earlier plan: seven short queries, and
+  a migration runner small enough to read. Revisit sqlc with the admin API.
+- No columns for #1 or #24; ADR 0005 says where they go.
+- The constant-time loop stays; a scratch benchmark put it at about 20 ns
+  per digest (0.2 ms at 10,000 keys) against ~15 ns for a map at any size.
+  Switch to a map in KeySet before tens of thousands of keys.
+
+- After review (go-reviewer), tests first: migration transactions are
+  READ COMMITTED whatever the default (a serializable default made a
+  gateway that waited on the lock rerun 0001); schema_migrations is
+  created only when to_regclass finds none, so an up-to-date DB needs no
+  CREATE; SchemaVersion is 0 on a never-migrated DB; an applied migration
+  whose name differs is ErrSchemaMismatch; CreateKey's INSERT ... SELECT
+  takes FOR SHARE on the tenant, so it waits for a concurrent disable and
+  returns ErrTenantDisabled instead of a dead key; the rollback after a
+  failed migration has a 5 s deadline. Migrate calls migrate(ctx, fs.FS),
+  so a test runs a 0002 that fails halfway. sanitize passes through only
+  an *Error or a bare sentinel, never a wrapper. validName rejects
+  anything not unicode.IsPrint and format characters (Cf). The concurrent
+  test opens five pools, then releases them together.
+
+### Next
+- PR 1c: config (connection string from env, refresh interval), main.go
+  choosing Static or the store, the admin API, compose, binary size.
+- Decide whether the gateway migrates at startup or a separate command does.
+- PR 1c: give Open and Migrate a context with a deadline. Ping to a
+  blackholed host waits for the OS TCP timeout, and pg_advisory_xact_lock
+  waits forever behind a stuck migrator (or set lock_timeout).
+- The deny rules in .claude/settings.json match by prefix:
+  Bash(make test-redis:*) and Bash(make test-postgres:*) don't catch
+  "make test test-postgres" or "make -C . test-redis". CLAUDE.md is the
+  real control; consider a hook that checks the targets.
+
 ## 2026-10-27: refreshable key source (Postgres keys, PR 1a)
 
 ### Done
