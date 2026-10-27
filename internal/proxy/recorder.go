@@ -18,6 +18,15 @@ type Recorder interface {
 	// given this Recorder (NewAuth(keys, logger, rec).Require). RequireKey
 	// passes none. Nothing about the presented key is passed on.
 	RecordAuthRejection(ctx context.Context)
+	// RecordKeySetSize is called by a key source with the number of digests
+	// in the set it now serves: once when it is built, and after every
+	// successful refresh. Nothing about the keys themselves is passed on.
+	RecordKeySetSize(ctx context.Context, n int)
+	// RecordKeyRefresh is called by a key source that refreshes, after its
+	// initial fetch succeeds and after every refresh; ok is false for a
+	// failed refresh, which kept the last good set. A source that never
+	// refreshes never calls it. Nothing about the error is passed on.
+	RecordKeyRefresh(ctx context.Context, ok bool)
 }
 
 // RequestInfo summarizes one request for a Recorder. Every field is from a

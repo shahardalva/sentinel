@@ -23,6 +23,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/shahardalva/sentinel/internal/keys"
 	"github.com/shahardalva/sentinel/internal/provider/anthropic"
 	"github.com/shahardalva/sentinel/internal/provider/openai"
 	"github.com/shahardalva/sentinel/internal/provider/upstream"
@@ -194,8 +195,8 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 			ignored = append(ignored, s)
 		}
 	}
-	clientKeys := parseKeys(getenv("SENTINEL_API_KEYS"))
-	if len(clientKeys) == 0 {
+	clientKeys, err := keys.Parse(getenv("SENTINEL_API_KEYS"))
+	if err != nil {
 		return config{}, errors.New("SENTINEL_API_KEYS is not set")
 	}
 	addr := getenv("SENTINEL_ADDR")
@@ -443,7 +444,7 @@ func newMux(cfg config, logger *slog.Logger, opts proxy.Options) *http.ServeMux 
 	if opts.Admission == nil {
 		opts.Admission = proxy.NewAdmission(cfg.maxConcurrent)
 	}
-	auth := proxy.NewAuth(cfg.clientKeys, logger, opts.Recorder)
+	auth := proxy.NewAuthSource(keys.NewStatic(cfg.clientKeys, opts.Recorder), logger, opts.Recorder)
 	mux := http.NewServeMux()
 	for _, u := range cfg.upstreams {
 		o := opts
@@ -638,17 +639,6 @@ func closeUnmatched(mux *http.ServeMux) http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
-}
-
-// parseKeys splits a comma-separated key list, dropping blank entries.
-func parseKeys(s string) []string {
-	var keys []string
-	for k := range strings.SplitSeq(s, ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			keys = append(keys, k)
-		}
-	}
-	return keys
 }
 
 // parseMetricsAddr reads SENTINEL_METRICS_ADDR. Empty means

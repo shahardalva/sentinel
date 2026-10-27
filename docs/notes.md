@@ -2,6 +2,45 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-27: refreshable key source (Postgres keys, PR 1a)
+
+### Done
+- proxy.KeySource returns a *proxy.KeySet, an immutable set of SHA-256
+  digests (NewKeySet copies). Auth asks it once per request, so a request
+  is checked against one whole set. Digest compare, the constant-time loop
+  over every digest and clientID (hex digest, so rate-limit buckets) are
+  unchanged. A nil or empty set rejects every request. NewAuthSource takes
+  a KeySource; NewAuth and RequireKey keep taking []string and wrap it.
+  internal/proxy imports neither internal/keys nor any DB package.
+- internal/keys: Parse (SENTINEL_API_KEYS's rules, moved from main.go) and
+  Static; Refreshing, which fetches digests on an interval and swaps them
+  in with an atomic.Pointer. The first fetch must succeed or the
+  constructor returns its error and starts nothing. Each later fetch is
+  bounded by the interval; a failure keeps the last good set, is recorded
+  and logged at WARN through proxy.LogThrottle (10 s). A fetch cut off by
+  shutdown is not a failure. Done() closes when the loop stops on ctx
+  cancel. Becoming empty logs one WARN.
+- proxy.Recorder gained RecordKeySetSize and RecordKeyRefresh. Telemetry:
+  sentinel_auth_keys, sentinel_auth_key_refresh_errors_total and
+  sentinel_auth_key_refresh_age_seconds, no labels. Static reports only the
+  size, so it has no age or error series; a refreshing source's error
+  series exists at 0 from its first success.
+- main.go uses keys.Static; Refreshing has no caller until PR 1b.
+- Tests under -race: a removed key rejected after the next refresh, swaps
+  racing concurrent requests, a failed refresh keeping the set, empty sets,
+  cancel (also mid-fetch) stopping the loop, a failed first fetch starting
+  nothing. The refresh tests run in testing/synctest, which also fails on a
+  leaked goroutine. Existing auth tests unchanged.
+
+### Decided
+- logThrottle stays in internal/proxy; LogThrottle exports it with Allow
+  for internal/keys, which already imports proxy. Moving it to a package
+  of its own would have meant changing the existing auth tests.
+
+### Next
+- PR 1b: Postgres fetch (pgx, sqlc, goose) behind keys.Refreshing, ADR 0005.
+- Dashboard panels for the key metrics.
+
 ## 2026-10-25: fail-open windows in a bench
 
 ### Done

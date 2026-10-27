@@ -258,7 +258,10 @@ func TestRecordRequest_NoGaugesWithoutSources(t *testing.T) {
 	m, reader := newTestMetrics(t, Config{})
 	m.RecordAuthRejection(context.Background())
 	got := collect(t, reader)
-	for _, name := range []string{"sentinel.admission.in_use", "sentinel.admission.limit", "sentinel.ratelimit.breaker.open"} {
+	for _, name := range []string{
+		"sentinel.admission.in_use", "sentinel.admission.limit", "sentinel.ratelimit.breaker.open",
+		"sentinel.auth.keys", "sentinel.auth.key_refresh.age", "sentinel.auth.key_refresh.errors",
+	} {
 		if _, ok := got.data[name]; ok {
 			t.Errorf("%s registered without a source", name)
 		}
@@ -341,4 +344,62 @@ func equal(a, b map[string]int64) bool {
 func near(a, b float64) bool {
 	d := a - b
 	return d < 1e-9 && d > -1e-9
+}
+
+// A static key source reports only the set's size: no refresh age, no
+// error series. A refreshing one adds both; the error series exists at 0
+// from its first success. None of them has an attribute.
+func TestRecordKeys(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t, Config{})
+	now := m.base.Add(time.Hour)
+	m.now = func() time.Time { return now }
+
+	m.RecordKeySetSize(ctx, 0) // an empty set is a value, not "no point"
+	got := collect(t, reader)
+	if n := got.gauge(t, "sentinel.auth.keys"); n != 0 {
+		t.Errorf("keys = %d, want 0", n)
+	}
+	for _, name := range []string{"sentinel.auth.key_refresh.age", "sentinel.auth.key_refresh.errors"} {
+		if _, ok := got.data[name]; ok {
+			t.Errorf("%s reported for a source that never refreshed", name)
+		}
+	}
+
+	m.RecordKeySetSize(ctx, 3)
+	m.RecordKeyRefresh(ctx, true)
+	got = collect(t, reader)
+	if n := got.gauge(t, "sentinel.auth.keys"); n != 3 {
+		t.Errorf("keys = %d, want 3", n)
+	}
+	if e := got.sums(t, "sentinel.auth.key_refresh.errors"); !equal(e, map[string]int64{"": 0}) {
+		t.Errorf("errors = %v, want one series at 0", e)
+	}
+	if age := got.floatGauge(t, "sentinel.auth.key_refresh.age"); age != 0 {
+		t.Errorf("age right after a refresh = %v, want 0", age)
+	}
+
+	now = now.Add(90 * time.Second)
+	m.RecordKeyRefresh(ctx, false)
+	m.RecordKeyRefresh(ctx, false)
+	got = collect(t, reader)
+	if e := got.sums(t, "sentinel.auth.key_refresh.errors"); !equal(e, map[string]int64{"": 2}) {
+		t.Errorf("errors = %v, want 2", e)
+	}
+	// A failure doesn't reset the age: it is time since the last success.
+	if age := got.floatGauge(t, "sentinel.auth.key_refresh.age"); age != 90 {
+		t.Errorf("age = %v, want 90", age)
+	}
+	if got.units["sentinel.auth.key_refresh.age"] != "s" {
+		t.Errorf("age unit %q, want s", got.units["sentinel.auth.key_refresh.age"])
+	}
+}
+
+func (c collected) floatGauge(t *testing.T, name string) float64 {
+	t.Helper()
+	g, ok := c.data[name].(metricdata.Gauge[float64])
+	if !ok || len(g.DataPoints) != 1 {
+		t.Fatalf("%s: %#v, want one float64 gauge point", name, c.data[name])
+	}
+	return g.DataPoints[0].Value
 }
