@@ -238,10 +238,23 @@ func TestServe_MetricsOnTheirOwnListener(t *testing.T) {
 			t.Errorf("scrape has no %s:\n%s", want, body)
 		}
 	}
+	// The key set size comes from keys.Static through the Recorder: one
+	// key in SENTINEL_API_KEYS. A static source never refreshes, so it has
+	// no refresh age or error series.
+	var keysLine string
 	for line := range strings.SplitSeq(body, "\n") {
 		if strings.HasPrefix(line, "sentinel_auth_rejections_total{") && !strings.HasSuffix(line, "} 1") {
 			t.Errorf("auth rejections: %s, want 1", line)
 		}
+		if strings.HasPrefix(line, "sentinel_auth_keys{") {
+			keysLine = line
+		}
+	}
+	if !strings.HasSuffix(keysLine, "} 1") {
+		t.Errorf("key set size: %q, want a sentinel_auth_keys series at 1", keysLine)
+	}
+	if strings.Contains(body, "sentinel_auth_key_refresh_") {
+		t.Error("refresh age or error series served for a static key source")
 	}
 	if strings.Contains(body, "sentinel_ratelimit_breaker_open") {
 		t.Error("breaker gauge served with rate limiting off")

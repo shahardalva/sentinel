@@ -136,16 +136,6 @@ func TestCloseUnmatched(t *testing.T) {
 	}
 }
 
-func TestParseKeys(t *testing.T) {
-	got := parseKeys(" a ,b,, ,c ")
-	if want := []string{"a", "b", "c"}; !slices.Equal(got, want) {
-		t.Errorf("parseKeys = %q, want %q", got, want)
-	}
-	if got := parseKeys(""); len(got) != 0 {
-		t.Errorf("parseKeys(\"\") = %q, want empty", got)
-	}
-}
-
 func TestLoadConfig_RejectsInvalidMaxConcurrent(t *testing.T) {
 	wantConfigErr(t, map[string]string{
 		"ANTHROPIC_API_KEY":       "sk",

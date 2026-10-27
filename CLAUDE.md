@@ -15,10 +15,21 @@ tool policies, and writes an audit log.
   are never read. The core strips hop-by-hop headers as a backstop.
 - Metrics: OpenTelemetry in internal/telemetry, exposed with the OTel
   Prometheus exporter (built on prometheus/client_golang). The core calls a
-  proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401) and
-  never imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only
-  from closed sets: never the client key, its digest, the model or the path.
+  proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401,
+  RecordKeySetSize and RecordKeyRefresh from the key source) and never
+  imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only from
+  closed sets: never the client key, its digest, the model or the path.
+  The key metrics have no labels: one key source per process.
   Traces come later on the same SDK.
+- Client keys: proxy.Auth reads them from a proxy.KeySource, once per
+  request, as an immutable proxy.KeySet of SHA-256 digests (constant-time
+  compare over every digest; clientID is the hex digest). A nil or empty
+  set rejects everything. internal/keys implements it: Static (from
+  SENTINEL_API_KEYS, used today) and Refreshing (a Fetch of digests on an
+  interval, atomic swap, last good set kept on failure, first fetch must
+  succeed within FetchTimeout; for the Postgres store in PR 1b). A Fetch
+  must honor ctx and return errors safe to log. internal/proxy never
+  imports internal/keys or a DB package.
 - Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
   Python detector service over gRPC
 
