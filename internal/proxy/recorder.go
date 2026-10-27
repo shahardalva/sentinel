@@ -21,6 +21,9 @@ type Recorder interface {
 	// RecordKeySetSize is called by a key source with the number of digests
 	// in the set it now serves: once when it is built, and after every
 	// successful refresh. Nothing about the keys themselves is passed on.
+	// A process has one key source, so the key metrics have no source
+	// label, by design: a second source reporting to the same Recorder
+	// would overwrite the first's values.
 	RecordKeySetSize(ctx context.Context, n int)
 	// RecordKeyRefresh is called by a key source that refreshes, after its
 	// initial fetch succeeds and after every refresh; ok is false for a

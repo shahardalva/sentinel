@@ -15,9 +15,9 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - internal/keys: Parse (SENTINEL_API_KEYS's rules, moved from main.go) and
   Static; Refreshing, which fetches digests on an interval and swaps them
   in with an atomic.Pointer. The first fetch must succeed or the
-  constructor returns its error and starts nothing. Each later fetch is
-  bounded by the interval; a failure keeps the last good set, is recorded
-  and logged at WARN through proxy.LogThrottle (10 s). A fetch cut off by
+  constructor returns its error and starts nothing. A failed refresh keeps
+  the last good set, is recorded and logged at WARN through
+  proxy.LogThrottle (10 s). A fetch cut off by
   shutdown is not a failure. Done() closes when the loop stops on ctx
   cancel. Becoming empty logs one WARN.
 - proxy.Recorder gained RecordKeySetSize and RecordKeyRefresh. Telemetry:
@@ -32,13 +32,39 @@ Newest entries first. Short: what was done, what was decided, what's next.
   nothing. The refresh tests run in testing/synctest, which also fails on a
   leaked goroutine. Existing auth tests unchanged.
 
+- After review (go-reviewer): the ticker is now a timer reset after each
+  refresh returns, so a hung fetch is followed by a full Interval of rest,
+  not another fetch at once. Config.FetchTimeout (default
+  min(Interval/2, 10s), must be positive and below Interval) bounds every
+  fetch, the first too: a hung store fails startup with "the key store did
+  not answer in time". refresh checks ctx before fetching; a ctx already
+  done fails NewRefreshing before any fetch. Keys() on a nil Static or
+  Refreshing returns nil and rejects. Config.Now drives the warning
+  throttle, so synctest tests run it after its base. proxy.DigestKeys is
+  the one place keys become digests. Tests added for each, written to fail
+  first for the hung fetches and the fetch after cancel.
+
 ### Decided
 - logThrottle stays in internal/proxy; LogThrottle exports it with Allow
   for internal/keys, which already imports proxy. Moving it to a package
-  of its own would have meant changing the existing auth tests.
+  of its own would have meant changing the existing auth tests. A known
+  smell: revisit if a third user appears.
+- An empty first fetch is accepted: the gateway starts and fails closed,
+  rejecting every request, with one WARN. Refusing to start would turn
+  "every key revoked" into "gateway down".
+- One key source per process, so the key gauges have no source label by
+  design; a second source would overwrite the first's values.
+- Review: go-reviewer with a focused brief on every PR; the multi-agent
+  code-review skill on each dev->main release diff.
 
 ### Next
 - PR 1b: Postgres fetch (pgx, sqlc, goose) behind keys.Refreshing, ADR 0005.
+  - Sanitize pgx errors in the Fetch (connect errors carry user, database
+    and host:port) and test that no connection string reaches a log line.
+  - With a large key set, look the digest up in a map instead of the
+    linear constant-time loop; record the trade-off in the ADR.
+  - Alert on sentinel_auth_key_refresh_age_seconds, not only on refresh
+    errors: a Fetch that ignores ctx records no failure.
 - Dashboard panels for the key metrics.
 
 ## 2026-10-25: fail-open windows in a bench

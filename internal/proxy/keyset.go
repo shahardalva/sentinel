@@ -13,6 +13,18 @@ type KeySet struct {
 	digests [][sha256.Size]byte
 }
 
+// DigestKeys returns the SHA-256 digests of keys, dropping empty keys: an
+// empty key is never accepted.
+func DigestKeys(keys []string) [][sha256.Size]byte {
+	var digests [][sha256.Size]byte
+	for _, k := range keys {
+		if k != "" {
+			digests = append(digests, sha256.Sum256([]byte(k)))
+		}
+	}
+	return digests
+}
+
 // NewKeySet returns a KeySet of a copy of digests.
 func NewKeySet(digests [][sha256.Size]byte) *KeySet {
 	return &KeySet{digests: append([][sha256.Size]byte(nil), digests...)}
@@ -35,9 +47,11 @@ func (s *KeySet) list() [][sha256.Size]byte {
 }
 
 // KeySource supplies the client keys an Auth accepts. Keys is called once
-// per request and must be safe for concurrent use and cheap: it runs on the
-// request's goroutine before anything else. A source that changes its keys
-// returns a new KeySet rather than changing one already returned.
+// per request, on the request's goroutine, before the request goes any
+// further than hashing the presented key; it must be safe for concurrent
+// use and cheap. A source that changes its keys returns a new KeySet rather
+// than changing one already returned. One KeySource serves the whole
+// process (see Recorder.RecordKeySetSize).
 type KeySource interface {
 	Keys() *KeySet
 }
@@ -51,12 +65,14 @@ func (f fixedKeys) Keys() *KeySet { return f.set }
 // LogThrottle lets a repeated log line through at most once per interval
 // and counts the ones it holds back, as the gateway's own warnings do. The
 // zero value is ready to use. It is for packages outside proxy, such as
-// internal/keys; see logThrottle.
+// internal/keys; see logThrottle. Exporting it from proxy is a stopgap
+// while internal/keys is its only outside user.
 type LogThrottle struct{ t logThrottle }
 
 // Allow reports whether to log at now, and if so how many lines were held
-// back since the last one. now must not be before the process started;
-// pass time.Now().
+// back since the last one. now must not be before the process started:
+// pass time.Now(), or in a testing/synctest bubble, whose clock starts in
+// 2000, a time offset from one taken outside it.
 func (t *LogThrottle) Allow(now time.Time, interval time.Duration) (ok bool, suppressed int64) {
 	return t.t.allow(now, interval)
 }

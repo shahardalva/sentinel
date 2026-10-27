@@ -38,13 +38,7 @@ type Auth struct {
 // are dropped, and with none left every request is rejected. rec, if not
 // nil, is told of every rejection.
 func NewAuth(keys []string, logger *slog.Logger, rec Recorder) *Auth {
-	var digests [][sha256.Size]byte
-	for _, k := range keys {
-		if k != "" {
-			digests = append(digests, sha256.Sum256([]byte(k)))
-		}
-	}
-	return NewAuthSource(fixedKeys{&KeySet{digests: digests}}, logger, rec)
+	return NewAuthSource(fixedKeys{&KeySet{digests: DigestKeys(keys)}}, logger, rec)
 }
 
 // NewAuthSource returns an Auth accepting the keys src supplies, asking it

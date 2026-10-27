@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/shahardalva/sentinel/internal/keys"
 	"github.com/shahardalva/sentinel/internal/proxy"
+	"github.com/shahardalva/sentinel/internal/telemetry"
 )
 
 const interval = time.Minute
@@ -109,6 +111,52 @@ func status(h http.Handler, key string) int {
 	return w.Code
 }
 
+// realStart is taken when the test binary starts, outside any synctest
+// bubble, so after proxy's throttle base.
+var realStart = time.Now()
+
+// bubbleClock is a Config.Now for a synctest bubble, whose clock starts in
+// 2000, before the throttle's base: real time from realStart, advanced by
+// the bubble's fake time. Call it inside the bubble.
+func bubbleClock() func() time.Time {
+	start := time.Now()
+	return func() time.Time { return realStart.Add(time.Since(start)) }
+}
+
+// recorderTee reports to real Metrics and keeps a copy in a fakeRecorder.
+type recorderTee struct {
+	*telemetry.Metrics
+	fake *fakeRecorder
+}
+
+func (r *recorderTee) RecordKeySetSize(ctx context.Context, n int) {
+	r.Metrics.RecordKeySetSize(ctx, n)
+	r.fake.RecordKeySetSize(ctx, n)
+}
+
+func (r *recorderTee) RecordKeyRefresh(ctx context.Context, ok bool) {
+	r.Metrics.RecordKeyRefresh(ctx, ok)
+	r.fake.RecordKeyRefresh(ctx, ok)
+}
+
+// refreshAge scrapes m and returns sentinel_auth_key_refresh_age_seconds.
+func refreshAge(t *testing.T, m *telemetry.Metrics) float64 {
+	t.Helper()
+	w := httptest.NewRecorder()
+	m.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for line := range strings.SplitSeq(w.Body.String(), "\n") {
+		if strings.HasPrefix(line, "sentinel_auth_key_refresh_age_seconds") {
+			v, err := strconv.ParseFloat(line[strings.LastIndexByte(line, ' ')+1:], 64)
+			if err != nil {
+				t.Fatalf("%s: %v", line, err)
+			}
+			return v
+		}
+	}
+	t.Fatalf("scrape has no refresh age:\n%s", w.Body.String())
+	return 0
+}
+
 // logBuffer is a log destination safe to read while the refresh loop
 // writes to it.
 type logBuffer struct {
@@ -185,57 +233,76 @@ func TestRefreshing_RemovedKeyRejectedAfterRefresh(t *testing.T) {
 
 // Requests racing a stream of swaps each see one whole set: a key in every
 // set is never rejected, a key in none is never accepted, and a key in
-// every other set gets only 200 or 401. Real time, so the swaps and the
-// requests overlap; run under -race.
+// every other set gets only 200 or 401, and both are seen. In a synctest
+// bubble, with no real-time deadline: every requester wakes at each
+// refresh instant, so on real threads its requests run alongside the swap,
+// and -race checks the handoff.
 func TestRefreshing_SwapDuringConcurrentRequests(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	var n atomic.Int64
-	fetch := func(context.Context) ([][sha256.Size]byte, error) {
-		if n.Add(1)%2 == 0 {
-			return digests("always", "sometimes"), nil
-		}
-		return digests("always"), nil
-	}
-	r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := gate(r)
-
-	var wg sync.WaitGroup
-	var sometimesOK, sometimesNo atomic.Int64
-	deadline := time.Now().Add(5 * time.Second)
-	for range 8 {
-		wg.Go(func() {
-			for n.Load() < 50 && time.Now().Before(deadline) {
-				if got := status(h, "always"); got != http.StatusOK {
-					t.Errorf("key in every set: %d", got)
-					return
-				}
-				if got := status(h, "never"); got != http.StatusUnauthorized {
-					t.Errorf("key in no set: %d", got)
-					return
-				}
-				switch status(h, "sometimes") {
-				case http.StatusOK:
-					sometimesOK.Add(1)
-				case http.StatusUnauthorized:
-					sometimesNo.Add(1)
-				default:
-					t.Error("key in every other set: neither 200 nor 401")
-					return
-				}
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var n atomic.Int64
+		fetch := func(context.Context) ([][sha256.Size]byte, error) {
+			if n.Add(1)%2 == 0 {
+				return digests("always", "sometimes"), nil
 			}
-		})
-	}
-	wg.Wait()
-	if n.Load() < 50 {
-		t.Fatalf("only %d fetches in 5 s; the swaps didn't overlap the requests", n.Load())
-	}
-	t.Logf("%d fetches; sometimes-key %d accepted, %d rejected", n.Load(), sometimesOK.Load(), sometimesNo.Load())
-	cancel()
-	<-r.Done()
+			return digests("always"), nil
+		}
+		rec := &fakeRecorder{}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval, Recorder: rec})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := gate(r)
+
+		const rounds = 60 // refreshes to run through
+		var wg sync.WaitGroup
+		var sometimesOK, sometimesNo atomic.Int64
+		for g := range 8 {
+			wg.Go(func() {
+				// Requester g wakes g+1 times per interval, always at the
+				// refresh instant too.
+				step := interval / time.Duration(g+1)
+				for range rounds * (g + 1) {
+					if got := status(h, "always"); got != http.StatusOK {
+						t.Errorf("key in every set: %d", got)
+						return
+					}
+					if got := status(h, "never"); got != http.StatusUnauthorized {
+						t.Errorf("key in no set: %d", got)
+						return
+					}
+					switch status(h, "sometimes") {
+					case http.StatusOK:
+						sometimesOK.Add(1)
+					case http.StatusUnauthorized:
+						sometimesNo.Add(1)
+					default:
+						t.Error("key in every other set: neither 200 nor 401")
+						return
+					}
+					time.Sleep(step)
+				}
+			})
+		}
+		wg.Wait()
+		cancel()
+		<-r.Done()
+
+		if sometimesOK.Load() == 0 || sometimesNo.Load() == 0 {
+			t.Errorf("key in every other set: %d accepted, %d rejected; want both seen", sometimesOK.Load(), sometimesNo.Load())
+		}
+		// Every refresh swapped in the other set.
+		sizes, _ := rec.got()
+		if len(sizes) < rounds {
+			t.Fatalf("%d sets stored, want at least %d", len(sizes), rounds)
+		}
+		for i := 1; i < len(sizes); i++ {
+			if sizes[i] == sizes[i-1] {
+				t.Fatalf("set sizes %v: refresh %d did not swap", sizes, i)
+			}
+		}
+	})
 }
 
 // A failed refresh keeps the last good set, is recorded, and its warning
@@ -252,6 +319,7 @@ func TestRefreshing_ErrorKeepsLastSet(t *testing.T) {
 			Interval: time.Second, // below the 10 s warning interval
 			Logger:   slog.New(slog.NewJSONHandler(&logs, nil)),
 			Recorder: rec,
+			Now:      bubbleClock(),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -387,11 +455,13 @@ func TestRefreshing_StopsOnCancel(t *testing.T) {
 	})
 }
 
-// A fetch that hangs past the interval is cut off and counts as a failure.
-func TestRefreshing_FetchBoundedByInterval(t *testing.T) {
+// A refresh whose fetch hangs is cut off at FetchTimeout, not before, and
+// counts as a failure that keeps the set.
+func TestRefreshing_FetchTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
+		const timeout = 5 * time.Second
 		rec := &fakeRecorder{}
 		var first atomic.Bool
 		fetch := func(ctx context.Context) ([][sha256.Size]byte, error) {
@@ -401,19 +471,78 @@ func TestRefreshing_FetchBoundedByInterval(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
-		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval, Recorder: rec})
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval, FetchTimeout: timeout, Recorder: rec, Now: bubbleClock()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(2 * interval)
+		time.Sleep(interval + timeout - time.Nanosecond)
+		synctest.Wait()
+		if _, refreshes := rec.got(); !slices.Equal(refreshes, []bool{true}) {
+			t.Errorf("just before the timeout: refreshes %v, want [true]", refreshes)
+		}
+		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		if _, refreshes := rec.got(); !slices.Equal(refreshes, []bool{true, false}) {
-			t.Errorf("refreshes %v, want [true false]", refreshes)
+			t.Errorf("at the timeout: refreshes %v, want [true false]", refreshes)
 		}
 		if r.Keys().Len() != 1 {
 			t.Error("a timed-out fetch changed the set")
 		}
 		cancel()
+		<-r.Done()
+	})
+}
+
+// A Fetch that ignores ctx blocks the loop: it records no failure, Done
+// stays open after cancel, and only the refresh age gauge shows it, by
+// growing.
+func TestRefreshing_FetchIgnoringCtx(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		m, err := telemetry.New(telemetry.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer m.Shutdown(context.Background())
+		release := make(chan struct{})
+		var calls atomic.Int64
+		fetch := func(context.Context) ([][sha256.Size]byte, error) {
+			if calls.Add(1) > 1 {
+				<-release
+			}
+			return digests("k"), nil
+		}
+		rec := &recorderTee{m, &fakeRecorder{}}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval, Recorder: rec})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(5 * interval) // the second fetch started at 1m and never returns
+		synctest.Wait()
+		if _, refreshes := rec.fake.got(); !slices.Equal(refreshes, []bool{true}) {
+			t.Errorf("refreshes %v, want [true]: a blocked fetch records nothing", refreshes)
+		}
+		if n := calls.Load(); n != 2 {
+			t.Errorf("%d fetches, want 2: the loop is blocked in the second", n)
+		}
+		if age := refreshAge(t, m); age != (5 * interval).Seconds() {
+			t.Errorf("refresh age %v s, want %v", age, (5 * interval).Seconds())
+		}
+		time.Sleep(5 * interval)
+		if age := refreshAge(t, m); age != (10 * interval).Seconds() {
+			t.Errorf("refresh age %v s, want %v: it grows while the fetch is blocked", age, (10 * interval).Seconds())
+		}
+
+		cancel()
+		synctest.Wait()
+		select {
+		case <-r.Done():
+			t.Error("Done closed while the fetch is still blocked")
+		default:
+		}
+		close(release)
 		<-r.Done()
 	})
 }
@@ -438,16 +567,74 @@ func TestNewRefreshing_InitialFetchFails(t *testing.T) {
 	})
 }
 
+// A bad Config is refused before any fetch; synctest.Test fails if a loop
+// was started anyway.
 func TestNewRefreshing_RejectsBadConfig(t *testing.T) {
-	fetch := func(context.Context) ([][sha256.Size]byte, error) { return nil, nil }
-	for _, cfg := range []keys.Config{
-		{Interval: interval},
-		{Fetch: fetch},
-		{Fetch: fetch, Interval: -time.Second},
-	} {
-		if _, err := keys.NewRefreshing(t.Context(), cfg); err == nil {
-			t.Errorf("NewRefreshing(%+v) succeeded", cfg)
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int64
+		fetch := func(context.Context) ([][sha256.Size]byte, error) {
+			calls.Add(1)
+			return digests("k"), nil
 		}
+		for name, cfg := range map[string]keys.Config{
+			"no fetch":                 {Interval: interval},
+			"no interval":              {Fetch: fetch},
+			"negative interval":        {Fetch: fetch, Interval: -time.Second},
+			"negative timeout":         {Fetch: fetch, Interval: interval, FetchTimeout: -time.Second},
+			"timeout equals interval":  {Fetch: fetch, Interval: interval, FetchTimeout: interval},
+			"timeout above interval":   {Fetch: fetch, Interval: interval, FetchTimeout: 2 * interval},
+			"default timeout rounds 0": {Fetch: fetch, Interval: time.Nanosecond},
+		} {
+			if r, err := keys.NewRefreshing(t.Context(), cfg); r != nil || err == nil {
+				t.Errorf("%s: NewRefreshing = %v, %v; want an error", name, r, err)
+			}
+		}
+		if n := calls.Load(); n != 0 {
+			t.Errorf("%d fetches for bad configs, want 0", n)
+		}
+	})
+}
+
+// A ctx already done fails NewRefreshing before any fetch, even one that
+// would ignore ctx and succeed.
+func TestNewRefreshing_CancelledCtx(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		var calls atomic.Int64
+		fetch := func(context.Context) ([][sha256.Size]byte, error) {
+			calls.Add(1)
+			return digests("k"), nil
+		}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval})
+		if r != nil || !errors.Is(err, context.Canceled) {
+			t.Errorf("NewRefreshing = %v, %v; want nil and context.Canceled", r, err)
+		}
+		if n := calls.Load(); n != 0 {
+			t.Errorf("%d fetches, want 0", n)
+		}
+		// synctest.Test fails here if a refresh loop was started.
+	})
+}
+
+// A nil source has no keys: it rejects every request instead of panicking,
+// as a *Refreshing left nil by an ignored NewRefreshing error would be.
+func TestNilSourcesRejectEverything(t *testing.T) {
+	for name, src := range map[string]proxy.KeySource{
+		"static":     (*keys.Static)(nil),
+		"refreshing": (*keys.Refreshing)(nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if set := src.Keys(); set != nil {
+				t.Errorf("Keys() = %v, want nil", set)
+			}
+			h := gate(src)
+			for _, k := range []string{"", "k"} {
+				if got := status(h, k); got != http.StatusUnauthorized {
+					t.Errorf("key %q: %d, want 401", k, got)
+				}
+			}
+		})
 	}
 }
 
@@ -526,5 +713,139 @@ func TestParse(t *testing.T) {
 		if got, err := keys.Parse(s); !errors.Is(err, keys.ErrNoKeys) || got != nil {
 			t.Errorf("Parse(%q) = %q, %v; want ErrNoKeys", s, got, err)
 		}
+	}
+}
+
+// Review finding 1: a fetch that runs to its timeout is followed by a full
+// interval of rest, never by another fetch at once. Start and end times
+// are recorded, and every gap from an end to the next start is checked.
+func TestRefreshing_RestsAfterTimedOutFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var mu sync.Mutex
+		var starts, ends []time.Time
+		var first atomic.Bool
+		fetch := func(ctx context.Context) ([][sha256.Size]byte, error) {
+			if !first.Swap(true) {
+				return digests("k"), nil
+			}
+			mu.Lock()
+			starts = append(starts, time.Now())
+			mu.Unlock()
+			<-ctx.Done() // hangs until its timeout
+			mu.Lock()
+			ends = append(ends, time.Now())
+			mu.Unlock()
+			return nil, ctx.Err()
+		}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval, Now: bubbleClock()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * interval)
+		synctest.Wait()
+		cancel()
+		<-r.Done()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(starts) < 3 {
+			t.Fatalf("%d refreshes in 10 intervals, want at least 3", len(starts))
+		}
+		for i := 1; i < len(starts) && i-1 < len(ends); i++ {
+			if gap := starts[i].Sub(ends[i-1]); gap < interval {
+				t.Errorf("fetch %d started %s after fetch %d timed out, want at least %s", i+1, gap, i, interval)
+			}
+		}
+	})
+}
+
+// Review finding 2: a first fetch that hangs fails startup once the fetch
+// timeout passes, with an error saying the key store did not answer.
+// Each case checks the timeout exactly: still waiting 1ns before it, done
+// at it. The defaults are min(Interval/2, 10s).
+func TestNewRefreshing_InitialFetchHangs(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		interval, explicit time.Duration
+		want               time.Duration
+	}{
+		{"default capped at 10s", interval, 0, 10 * time.Second},
+		{"default half the interval", 4 * time.Second, 0, 2 * time.Second},
+		{"explicit", interval, 3 * time.Second, 3 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				hang := func(ctx context.Context) ([][sha256.Size]byte, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				done := make(chan struct{})
+				var r *keys.Refreshing
+				var err error
+				go func() {
+					defer close(done)
+					r, err = keys.NewRefreshing(ctx, keys.Config{Fetch: hang, Interval: tt.interval, FetchTimeout: tt.explicit})
+				}()
+				time.Sleep(tt.want - time.Nanosecond)
+				synctest.Wait()
+				select {
+				case <-done:
+					t.Fatalf("NewRefreshing returned before the %s timeout: %v", tt.want, err)
+				default:
+				}
+				time.Sleep(time.Nanosecond)
+				synctest.Wait()
+				select {
+				case <-done:
+				default:
+					t.Error("NewRefreshing still waiting on a hung store after the fetch timeout")
+					cancel()
+					<-done
+					return
+				}
+				if r != nil || err == nil || !strings.Contains(err.Error(), "did not answer in time") || !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("NewRefreshing = %v, %v; want an error saying the key store did not answer in time", r, err)
+				}
+			})
+		})
+	}
+}
+
+// Review finding 6: once ctx is cancelled no new fetch starts. The second
+// fetch ignores ctx, outlasts an interval and returns after the cancel.
+// With the ticker this left a tick pending, and select picked it about
+// half the time, so the case is repeated. The timer, reset only after a
+// refresh, leaves none, so this now passes without the ctx check at the
+// top of refresh as well; that check covers a timer firing at the instant
+// of the cancel, which can't be timed deterministically.
+func TestRefreshing_NoFetchAfterCancel(t *testing.T) {
+	for range 20 {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			release := make(chan struct{})
+			var calls atomic.Int64
+			fetch := func(context.Context) ([][sha256.Size]byte, error) {
+				if calls.Add(1) == 2 {
+					<-release // ignores ctx
+				}
+				return digests("k"), nil
+			}
+			r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: fetch, Interval: interval})
+			if err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(3 * interval) // fetch 2 starts at 1m and is still running
+			synctest.Wait()
+			cancel()
+			close(release)
+			<-r.Done()
+			if n := calls.Load(); n != 2 {
+				t.Fatalf("%d fetches, want 2: a fetch started after cancel", n)
+			}
+		})
 	}
 }
