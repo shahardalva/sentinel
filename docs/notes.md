@@ -2,6 +2,55 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-27: admin API package (Postgres keys, PR 1c)
+
+### Done
+- internal/admin: New(Config{Store, Token, Logger}) http.Handler; Store
+  is an interface of the six store methods it calls, and a compile-time
+  check holds *store.Store to it. Routes: POST/GET /admin/tenants, POST
+  /admin/tenants/{id}/disable, POST/GET /admin/tenants/{id}/keys, DELETE
+  /admin/keys/{id}. Lists are {"tenants": [...]} and {"keys": [...]},
+  [] when empty. JSON 404/405 (with Allow) via method-less patterns and a
+  "/" catch-all; an unclean path is a 400 before the mux, which would
+  redirect it.
+- Auth wraps the whole mux: bearer token, one Authorization header only,
+  SHA-256 digests compared in constant time, the same 401 with
+  WWW-Authenticate: Bearer and Connection: close for every path. WARN via
+  proxy.LogThrottle (10 s). ValidateToken exported for 1d.
+- Body rules, error mapping, no-store and nosniff on every response, one
+  audit line per change. ADR 0005 has an Admin API section; the wiring
+  references in it moved from 1c to 1d.
+- Tests with a fake store and a JSON log buffer: every route and some
+  unmatched ones against 16 bad Authorization variants (same body, no
+  store call, no body read), the key only in the create response, error
+  mapping on all six routes including an error text that must not leak,
+  body limits at and over 4 KiB, a real httptest server. Mutations
+  (accepting any bearer, a leaking 500, no body limit, logging the key)
+  each fail tests.
+
+### Decided
+- PR 1c is the package only; 1d adds SENTINEL_ADMIN_ADDR (its own port,
+  refused if it equals the API's, as the metrics address is), the token
+  env var, the store, and compose.
+- ValidateToken allows printable ASCII only (0x21-0x7e), stricter than
+  "no whitespace or control": a non-ASCII token can be encoded differently
+  by a client than by the config.
+- Every response is no-store, not only the create-key one, which also
+  sets it itself.
+- New panics on a nil Store or Logger or an invalid token, since it
+  returns no error; 1d validates the token first.
+- POST disable and create-key take no input, but a body if sent must be
+  application/json and decode into an empty object ({} or null).
+- revoke_key's audit line has only key_id: RevokeKey returns no tenant or
+  prefix. Reads are not audited.
+
+### Next
+- PR 1d: wire it (listener, server timeouts like the metrics one, token
+  from env, store Open/Migrate with deadlines), compose, binary size.
+- Give LogThrottle a package of its own (keys and admin both use it).
+- Per-operator admin credentials and a rate limit on admin, when needed
+  (ADR 0005 known limits).
+
 ## 2026-10-27: Postgres key store (Postgres keys, PR 1b)
 
 ### Done
