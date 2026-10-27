@@ -50,7 +50,9 @@ tool policies, and writes an audit log.
   printable ASCII, no space). JSON in and out, one error shape
   {"error":{"type","message"}}, 4 KiB bodies, application/json only,
   unknown fields and trailing values rejected; 500s say only "internal
-  error". The plaintext key is only in the create-key 201; every response
+  error". Store calls get 5 s; changes ignore the client's cancellation
+  (WithoutCancel); a read the client canceled is a WARN 499, any other
+  store error ERROR and 500. The plaintext key is only in the create-key 201; every response
   is no-store. One INFO "admin" line per change (action, ids, prefix,
   actor "admin-token"), never the key or token.
 - Later: Kafka (franz-go), ClickHouse, Python detector service over gRPC

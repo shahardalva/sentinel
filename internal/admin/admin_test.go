@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +59,9 @@ func (f *fakeStore) callCount() int {
 func (f *fakeStore) CreateTenant(_ context.Context, name string) (store.Tenant, error) {
 	if err := f.record("CreateTenant", name); err != nil {
 		return store.Tenant{}, err
+	}
+	if name == "" {
+		return store.Tenant{}, store.ErrInvalidName // as the real store does
 	}
 	return store.Tenant{ID: tenantID, Name: name, CreatedAt: created}, nil
 }
@@ -203,7 +207,6 @@ var badAuth = map[string]http.Header{
 	"wrong token":          {"Authorization": {"Bearer wrong-token-wrong-token-wrong-token"}},
 	"token prefix":         {"Authorization": {"Bearer " + token[:len(token)-1]}},
 	"token plus a char":    {"Authorization": {"Bearer " + token + "x"}},
-	"trailing space":       {"Authorization": {"Bearer " + token + " "}},
 	"two spaces":           {"Authorization": {"Bearer  " + token}},
 	"basic scheme":         {"Authorization": {"Basic " + token}},
 	"bare token":           {"Authorization": {token}},
@@ -471,7 +474,9 @@ func TestUnmatched(t *testing.T) {
 		{http.MethodGet, "/admin/tenants/", 400, "invalid_request_error", ""},
 		{http.MethodGet, "/admin//tenants", 400, "invalid_request_error", ""},
 		{http.MethodGet, "/admin/x/../tenants", 400, "invalid_request_error", ""},
-		{http.MethodDelete, "/admin/keys/%2e%2e", 400, "invalid_request_error", ""},
+		{http.MethodHead, "/admin/tenants/" + tenantID + "/disable", 405, "method_not_allowed_error", "POST"},
+		{http.MethodHead, "/admin/keys/" + keyID, 405, "method_not_allowed_error", "DELETE"},
+		{http.MethodOptions, "/admin/tenants", 405, "method_not_allowed_error", "GET, HEAD, POST"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
@@ -530,6 +535,10 @@ func TestBodyRules(t *testing.T) {
 		{"unknown field on disable", disable, "application/json", `{"x":1}`, 400, "invalid_request_error"},
 		{"two values on create key", keys, "application/json", `{}{}`, 400, "invalid_request_error"},
 		{"empty object on create key", keys, "application/json", `{}`, 201, ""},
+		{"null on create key", keys, "application/json", `null`, 201, ""},
+		{"empty body, any type, on create key", keys, "text/plain", "", 201, ""},
+		{"whitespace body, no type, on disable", disable, "", " \r\n", 204, ""},
+		{"empty body, no type, on create tenant", tenants, "", "", 400, "invalid_request_error"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -749,5 +758,47 @@ func TestOverHTTP(t *testing.T) {
 	}
 	if n := fs.callCount(); n != 1 {
 		t.Errorf("store called %d times, want 1", n)
+	}
+
+	// net/http trims whitespace around a header value, so a real client's
+	// token with spaces around it is accepted; whitespace inside isn't.
+	addr := srv.Listener.Addr().String()
+	for _, tt := range []struct {
+		name, header, want string
+	}{
+		{"trailing spaces", "Authorization: Bearer " + token + "   ", "HTTP/1.1 200 OK"},
+		{"leading spaces", "Authorization:    Bearer " + token, "HTTP/1.1 200 OK"},
+		{"trailing tab", "Authorization: Bearer " + token + "\t", "HTTP/1.1 200 OK"},
+		{"two spaces inside", "Authorization: Bearer  " + token, "HTTP/1.1 401 Unauthorized"},
+		{"tab inside", "Authorization: Bearer\t" + token, "HTTP/1.1 401 Unauthorized"},
+	} {
+		_, r := rawRequest(t, addr, "GET /admin/tenants HTTP/1.1\r\nHost: x\r\n"+tt.header+"\r\nConnection: close\r\n\r\n")
+		if got := statusLine(t, r); got != tt.want {
+			t.Errorf("%s: %q, want %q", tt.name, got, tt.want)
+		}
+	}
+
+	// Expect: 100-continue: without the token the 401 comes at once and
+	// no 100 is sent, so the body is never asked for; with it, the 100
+	// comes when the handler reads the body.
+	body := `{"name":"cont"}`
+	head := "POST /admin/tenants HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" +
+		"Expect: 100-continue\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n"
+	_, r := rawRequest(t, addr, head+"\r\n")
+	if got := statusLine(t, r); got != "HTTP/1.1 401 Unauthorized" {
+		t.Errorf("100-continue without token: %q, want an immediate 401", got)
+	}
+	c, r := rawRequest(t, addr, head+"Authorization: Bearer "+token+"\r\n\r\n")
+	if got := statusLine(t, r); got != "HTTP/1.1 100 Continue" {
+		t.Fatalf("100-continue with token: %q", got)
+	}
+	if _, err := r.ReadString('\n'); err != nil { // the blank line after the 100
+		t.Fatal(err)
+	}
+	if _, err := c.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusLine(t, r); got != "HTTP/1.1 201 Created" {
+		t.Errorf("after the body: %q", got)
 	}
 }

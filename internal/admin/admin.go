@@ -31,6 +31,14 @@ import (
 // name of at most 200 bytes, escaped.
 const maxBodyBytes = 4 << 10
 
+// storeTimeout bounds every store call, so a hung database or an
+// exhausted pool can't hold a request forever; the server's own timeouts
+// don't cancel a running handler. A read also ends when the client goes
+// away. A change doesn't: once started it runs to the end or to this
+// timeout, so a change that commits is always answered or logged as one,
+// never dropped half-way because the client left (see changeContext).
+const storeTimeout = 5 * time.Second
+
 // actor names who made a change in the audit log. There is one shared
 // token, so it says no more than that.
 const actor = "admin-token"
@@ -116,7 +124,9 @@ func (h *handler) createTenant(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &in, true) {
 		return
 	}
-	t, err := h.store.CreateTenant(r.Context(), in.Name)
+	ctx, cancel := changeContext(r)
+	defer cancel()
+	t, err := h.store.CreateTenant(ctx, in.Name)
 	if err != nil {
 		h.storeError(w, r, "create_tenant", err)
 		return
@@ -126,7 +136,9 @@ func (h *handler) createTenant(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) listTenants(w http.ResponseWriter, r *http.Request) {
-	ts, err := h.store.ListTenants(r.Context())
+	ctx, cancel := readContext(r)
+	defer cancel()
+	ts, err := h.store.ListTenants(ctx)
 	if err != nil {
 		h.storeError(w, r, "list_tenants", err)
 		return
@@ -145,7 +157,9 @@ func (h *handler) disableTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if err := h.store.DisableTenant(r.Context(), id); err != nil {
+	ctx, cancel := changeContext(r)
+	defer cancel()
+	if err := h.store.DisableTenant(ctx, id); err != nil {
 		h.storeError(w, r, "disable_tenant", err)
 		return
 	}
@@ -157,7 +171,9 @@ func (h *handler) createKey(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &struct{}{}, false) {
 		return
 	}
-	k, key, err := h.store.CreateKey(r.Context(), r.PathValue("id"))
+	ctx, cancel := changeContext(r)
+	defer cancel()
+	k, key, err := h.store.CreateKey(ctx, r.PathValue("id"))
 	if err != nil {
 		h.storeError(w, r, "create_key", err)
 		return
@@ -180,7 +196,9 @@ func (h *handler) createKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) listKeys(w http.ResponseWriter, r *http.Request) {
-	ks, err := h.store.ListKeys(r.Context(), r.PathValue("id"))
+	ctx, cancel := readContext(r)
+	defer cancel()
+	ks, err := h.store.ListKeys(ctx, r.PathValue("id"))
 	if err != nil {
 		h.storeError(w, r, "list_keys", err)
 		return
@@ -195,13 +213,33 @@ func (h *handler) listKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) revokeKey(w http.ResponseWriter, r *http.Request) {
+	if !requireNoBody(w, r) {
+		return
+	}
 	id := r.PathValue("id")
-	if err := h.store.RevokeKey(r.Context(), id); err != nil {
+	ctx, cancel := changeContext(r)
+	defer cancel()
+	if err := h.store.RevokeKey(ctx, id); err != nil {
 		h.storeError(w, r, "revoke_key", err)
 		return
 	}
 	h.audit(r, "revoke_key", slog.String("key_id", id))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// changeContext is the context for a store call that changes something:
+// r's values, but not its cancellation, so a client that disconnects
+// can't cancel the change after the database has committed it, which
+// would leave a change without its audit line. storeTimeout still bounds
+// it.
+func changeContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), storeTimeout)
+}
+
+// readContext is the context for a store call that only reads: it ends
+// when the client goes away, or after storeTimeout.
+func readContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), storeTimeout)
 }
 
 // tenant is a tenant as the API shows it.
@@ -239,7 +277,12 @@ func (h *handler) audit(r *http.Request, action string, attrs ...slog.Attr) {
 
 // storeError answers a store error. The typed errors map to their status;
 // anything else is a 500 whose body says nothing about the error, which
-// goes to the log only (the store's errors are sanitized).
+// goes to the log only (the store's errors are sanitized). A call the
+// client canceled by going away has nobody left to answer: it is logged
+// at WARN as 499, as the gateway does, not as an ERROR. Only a read can
+// be canceled so; a change runs on a context the client can't cancel
+// (changeContext), so any error from it is the store's, logged at ERROR
+// and answered with a 500 even if the client has gone.
 func (h *handler) storeError(w http.ResponseWriter, r *http.Request, action string, err error) {
 	switch {
 	case errors.Is(err, store.ErrInvalidName):
@@ -250,6 +293,12 @@ func (h *handler) storeError(w http.ResponseWriter, r *http.Request, action stri
 		writeError(w, http.StatusConflict, errConflict, "a tenant with that name exists")
 	case errors.Is(err, store.ErrTenantDisabled):
 		writeError(w, http.StatusConflict, errConflict, "tenant is disabled")
+	case errors.Is(err, context.Canceled) && r.Context().Err() != nil:
+		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin client closed request",
+			slog.String("action", action),
+			slog.Int("status", 499),
+			slog.String("error", err.Error()),
+		)
 	default:
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin store error",
 			slog.String("action", action),
@@ -259,32 +308,58 @@ func (h *handler) storeError(w http.ResponseWriter, r *http.Request, action stri
 	}
 }
 
-// decodeBody reads a JSON body into v: at most maxBodyBytes (413), sent
-// as application/json (415), one JSON value with no unknown fields (400).
-// An empty body is a 400 if required, else leaves v alone. It reports
-// whether to go on; if not, it has answered.
-func decodeBody(w http.ResponseWriter, r *http.Request, v any, required bool) bool {
-	if r.ContentLength != 0 && !isJSON(r.Header.Get("Content-Type")) {
-		rejectEarly(w, http.StatusUnsupportedMediaType, errUnsupportedMediaType, "body must be application/json")
-		return false
-	}
+// readBody reads the body, at most maxBodyBytes (413), and returns it
+// with surrounding whitespace trimmed, so a body of only whitespace is
+// empty. It reports whether to go on; if not, it has answered.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
 			// MaxBytesReader has told the server to close the connection.
 			writeError(w, http.StatusRequestEntityTooLarge, errTooLarge, "body is larger than 4 KiB")
-			return false
+			return nil, false
 		}
 		writeError(w, http.StatusBadRequest, errInvalidRequest, "cannot read body")
+		return nil, false
+	}
+	return bytes.TrimSpace(b), true
+}
+
+// requireNoBody answers 400 to a request with a non-empty body, for a
+// route that takes none. It reports whether to go on.
+func requireNoBody(w http.ResponseWriter, r *http.Request) bool {
+	b, ok := readBody(w, r)
+	if ok && len(b) != 0 {
+		writeError(w, http.StatusBadRequest, errInvalidRequest, "this route takes no body")
 		return false
 	}
-	if len(bytes.TrimSpace(b)) == 0 {
+	return ok
+}
+
+// decodeBody reads a JSON body into v (see readBody). A non-empty body
+// must be sent as application/json (415) and be one JSON value with no
+// unknown fields (400). An empty body, whatever its Content-Type, is a 400
+// if required, else leaves v alone. It reports whether to go on; if not,
+// it has answered.
+//
+// encoding/json matches field names ignoring case and lets a repeated
+// field's last value win; the store validates the one field there is.
+func decodeBody(w http.ResponseWriter, r *http.Request, v any, required bool) bool {
+	b, ok := readBody(w, r)
+	if !ok {
+		return false
+	}
+	if len(b) == 0 {
 		if required {
 			writeError(w, http.StatusBadRequest, errInvalidRequest, "body is required")
 			return false
 		}
 		return true
+	}
+	if !isJSON(r.Header.Get("Content-Type")) {
+		writeError(w, http.StatusUnsupportedMediaType, errUnsupportedMediaType, "body must be application/json")
+		return false
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -322,10 +397,14 @@ func commonHeaders(next http.Handler) http.Handler {
 
 // requireCleanPath answers a path that isn't already clean (a double
 // slash, a dot segment, a trailing slash) with a 400, as the gateway does.
-// ServeMux would redirect it to the cleaned path instead.
+// ServeMux would redirect it to the cleaned path instead. Like ServeMux,
+// it looks at the escaped path: an escaped slash or dot (%2F, %2e) is part
+// of a segment, which ServeMux unescapes into a wildcard's value, so
+// /admin/keys/a%2Fb and /admin/keys/a%2F both reach the store, which finds
+// no such ID.
 func requireCleanPath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != path.Clean(r.URL.Path) {
+		if p := r.URL.EscapedPath(); p != path.Clean(p) {
 			rejectEarly(w, http.StatusBadRequest, errInvalidRequest, "request path is not clean")
 			return
 		}

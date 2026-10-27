@@ -53,17 +53,33 @@ func (h *handler) requireToken(next http.Handler) http.Handler {
 	})
 }
 
-// reject logs a rejected request, if the throttle allows.
+// maxLoggedPath caps the path in the "admin unauthorized" warning: the
+// client chooses it, up to the server's header limit.
+const maxLoggedPath = 256
+
+// reject logs a rejected request, if the throttle allows. The path is
+// logged escaped, which is all ASCII, so cutting it at maxLoggedPath bytes
+// can't split a character; a cut one carries path_truncated and its full
+// length.
 func (h *handler) reject(r *http.Request) {
 	ok, suppressed := h.warn.Allow(h.now(), authWarnInterval)
 	if !ok {
 		return
 	}
-	h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin unauthorized",
-		slog.String("path", r.URL.Path),
+	p := r.URL.EscapedPath()
+	attrs := []slog.Attr{slog.String("path", p)}
+	if len(p) > maxLoggedPath {
+		attrs = []slog.Attr{
+			slog.String("path", p[:maxLoggedPath]),
+			slog.Bool("path_truncated", true),
+			slog.Int("path_len", len(p)),
+		}
+	}
+	attrs = append(attrs,
 		slog.String("remote_addr", r.RemoteAddr),
 		slog.Int64("suppressed", suppressed),
 	)
+	h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin unauthorized", attrs...)
 }
 
 // bearerToken returns the token of the request's only Authorization

@@ -47,9 +47,40 @@ Newest entries first. Short: what was done, what was decided, what's next.
 ### Next
 - PR 1d: wire it (listener, server timeouts like the metrics one, token
   from env, store Open/Migrate with deadlines), compose, binary size.
+- PR 1d: the admin http.Server sets DisableGeneralOptionsHandler: true,
+  so OPTIONS * gets the handler's 401 instead of net/http's 200.
 - Give LogThrottle a package of its own (keys and admin both use it).
 - Per-operator admin credentials and a rate limit on admin, when needed
   (ADR 0005 known limits).
+- ListTenants and ListKeys have no paging yet; add it (keyset on
+  created_at, id) before tenant or key counts make a list response big.
+
+### After review (go-reviewer), tests first
+- Store calls get 5 s (storeTimeout). Changes use
+  WithTimeout(WithoutCancel(r.Context())), so a client that disconnects
+  can't cancel a change Postgres has committed and lose its audit line;
+  reads use WithTimeout(r.Context()).
+- Only a store error that is context.Canceled while r.Context() is done
+  (a read the client canceled) writes nothing and logs WARN "admin client
+  closed request" with status 499. A change's error is always ERROR and a
+  500, client gone or not, since its context can't be canceled by the
+  client. A synctest test checks a hung store: 500 and ERROR after exactly
+  5 s, for a read and a change.
+- The unauthorized WARN logs EscapedPath() (ASCII), cut at 256 bytes,
+  with path_truncated and path_len when cut.
+- Content-Type is checked only for a non-empty body, so an empty chunked
+  body without one is no body. DELETE with a non-empty body is a 400.
+  The clean-path check uses EscapedPath(), as Go 1.27's ServeMux does:
+  %2F and %2e are part of an ID (a%2Fb is "a/b", %2e%2e is ".."), which
+  the store doesn't find.
+- Whitespace around the token moved to TestOverHTTP over raw TCP: net/http
+  trims it, so it is accepted; whitespace inside is not. New tests: HEAD
+  and OPTIONS on routes, an unauthenticated preflight (401, no CORS
+  headers), escaped IDs, case-variant and duplicate JSON keys, null
+  bodies, an empty chunked body, DELETE with a body, Expect: 100-continue
+  (401 at once without the token, 100 then 201 with it).
+- ADR 0005: the preflight gets 401, not 405; OPTIONS * is net/http's;
+  JSON field matching and the escaped-path rule are documented.
 
 ## 2026-10-27: Postgres key store (Postgres keys, PR 1b)
 
