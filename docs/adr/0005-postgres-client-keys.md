@@ -7,7 +7,7 @@
 
 Client keys come from `SENTINEL_API_KEYS`: one list, fixed at startup, shared by everyone. Adding or revoking a key means editing the environment and restarting every gateway. There is no notion of who a key belongs to, so a key can't be revoked for one customer, or all of a customer's keys at once, and nothing per customer (limits, policies, audit) has anywhere to hang.
 
-PR 1a put `proxy.Auth` behind a `proxy.KeySource` and added `keys.Refreshing`, which fetches SHA-256 digests on an interval and swaps them in. This ADR is about the store behind that fetch: `internal/store`, added in PR 1b. `cmd/gateway` doesn't use it yet; the configuration, the admin API and compose come in PR 1c.
+PR 1a put `proxy.Auth` behind a `proxy.KeySource` and added `keys.Refreshing`, which fetches SHA-256 digests on an interval and swaps them in. This ADR is about the store behind that fetch: `internal/store`, added in PR 1b. `cmd/gateway` doesn't use it yet; the admin API is PR 1c (a package, below), and the configuration, `cmd/gateway` wiring and compose come in PR 1d.
 
 ## Decision
 
@@ -60,22 +60,41 @@ The digest is SHA-256 of the full key, the same as `proxy.DigestKeys`, so `proxy
 
 ### The refresh model
 
-`keys.Refreshing` calls `Store.ActiveDigests` every `Interval` (PR 1c chooses the default) and swaps the whole set in. Consequences:
+`keys.Refreshing` calls `Store.ActiveDigests` every `Interval` (PR 1d chooses the default) and swaps the whole set in. Consequences:
 
 - **Revocation latency is about `Interval` plus the fetch time.** A key revoked just after a fetch read its rows is still accepted until the next fetch, which starts `Interval` after that one returns, finishes. The worst case is `Interval` plus two fetch times, bounded by `Interval + 2 × FetchTimeout`. A request already authenticated is not affected: a stream that began before the revoke runs to its end.
 - **While the database is unreachable, the last good set stays.** Revoked keys keep working and new keys don't work until a refresh succeeds. That is the price of not making Postgres a hard dependency of every request; `sentinel_auth_key_refresh_age_seconds` shows it, and is what to alert on (a `Fetch` that hangs records no failure).
 - **The first fetch must succeed** within `FetchTimeout`, or the gateway doesn't start: it never serves on a set it hasn't loaded. A first fetch that succeeds with **no keys is accepted**: the gateway starts and rejects every request, with one `WARN`. Refusing to start would turn "every key revoked" into "gateway down", and a gateway that starts before its first tenant exists is how a fresh deployment begins.
-- **One key source per process**, so the key metrics have no source label (`proxy.Recorder`). PR 1c chooses between `SENTINEL_API_KEYS` and Postgres; it does not merge them.
+- **One key source per process**, so the key metrics have no source label (`proxy.Recorder`). PR 1d chooses between `SENTINEL_API_KEYS` and Postgres; it does not merge them.
 
 ### Error sanitizing
 
-pgx's errors carry connection details: a connect error reads ``failed to connect to `user=... database=...`: host:port ...``, a parse error quotes the connection string with only the password masked, and the server's own messages name the user or database (`password authentication failed for user "..."`). `keys.Refreshing` logs fetch errors as they are, and PR 1c will log `Open`'s.
+pgx's errors carry connection details: a connect error reads ``failed to connect to `user=... database=...`: host:port ...``, a parse error quotes the connection string with only the password masked, and the server's own messages name the user or database (`password authentication failed for user "..."`). `keys.Refreshing` logs fetch errors as they are, and PR 1d will log `Open`'s.
 
 So no error the store returns holds the connection string, user, password, host or database name. Every pgx error becomes a `*store.Error` whose message is the operation, a fixed description ("cannot connect to postgres", "timed out", "postgres error"...), and for a server error its SQLSTATE code and constraint name, which come from this package's migrations. pgx's message is dropped, not wrapped, so nothing that walks the error chain can print it; `Unwrap` returns only `context.Canceled` or `context.DeadlineExceeded`, so callers can still tell a timeout. The typed errors `ErrNotFound`, `ErrDuplicateName`, `ErrTenantDisabled`, `ErrInvalidName`, `ErrSchemaTooNew` and `ErrSchemaMismatch` are for `errors.Is`. Only an `*Error` itself or a bare sentinel passes through the sanitizer unchanged; an error that merely wraps one is sanitized like any other, since its wrapper's text could hold anything. Tests connect to `127.0.0.1:1` and, with a real Postgres, with a wrong password, using a distinctive user, password and database name, and check that none of them, nor the host, appears.
 
 The cost is debuggability: "postgres error (SQLSTATE 42P01)" says less than the server's message. The code is enough to look up, and the operator can read Postgres's own log.
 
 pgx also reads the libpq environment variables (`PGHOST`, `PGPASSWORD`...) and `~/.pgpass` for anything the connection string leaves out; that is where `pgpassfile` and `pgservicefile` below come from.
+
+### Admin API
+
+`internal/admin` (PR 1c) is the HTTP API over the store: `POST`/`GET /admin/tenants`, `POST /admin/tenants/{id}/disable`, `POST`/`GET /admin/tenants/{id}/keys` and `DELETE /admin/keys/{id}`, JSON in and out, one error shape (`{"error":{"type","message"}}`) for every failure including 404 and 405. It is a package returning an `http.Handler`; PR 1d gives it a listener.
+
+- **Its own listener, never the API port.** PR 1d serves it on a separate address, loopback by default, the same pattern as `SENTINEL_METRICS_ADDR`: refused if it shares the API's port, so no client of the gateway can reach it by path, and an operator can firewall it on its own. Nothing about the admin routes is registered on the API mux.
+- **A bearer token**, `Authorization: Bearer <token>`, checked before anything else: before routing, so without it every path and method gets the same 401 (`WWW-Authenticate: Bearer`, the same body) and nothing reveals which routes exist; and before the body is read, so an unauthenticated client can't make the gateway read or parse anything. Only the token's SHA-256 digest is kept, and the presented token's digest is compared in constant time, so timing reveals neither length nor contents. `ValidateToken` (used at startup in 1d) requires at least 32 characters of printable ASCII, no space: no whitespace or control character that a shell, a `.env` file or a client could send differently from how it was configured. net/http trims whitespace around a header value, so `Authorization:  Bearer <token>  ` is accepted; whitespace inside it (two spaces, a tab) is not. Rejections are logged at WARN at most once per 10 s with a count of the ones held back, as `proxy.Auth` does. The client chooses the path, up to the server's header limit, so the warning logs it escaped (all ASCII) and cut at 256 bytes, with `path_truncated=true` and `path_len` when cut.
+- **Browsers can't use it without the token.** It has no cookies or other ambient credential, so a cross-site request (CSRF) from a page the operator visits carries nothing that authenticates it. A page can't add an `Authorization` header to a cross-origin request without a CORS preflight, which the API never answers with CORS headers: a preflight carries no token, so it gets the 401 (an `OPTIONS` with the token gets a 405), and the browser doesn't send the request. One request never reaches the handler: `OPTIONS *` is answered by net/http itself, with a 200 and none of the headers below. It reveals nothing, but PR 1d sets `http.Server{DisableGeneralOptionsHandler: true}` on the admin listener so that it too gets the handler's 401. DNS rebinding makes the page same-origin with the admin listener, which lifts the CORS barrier, but the page still doesn't have the token. A simple form POST also fails the body rules (`application/json` only, 415 otherwise), though the 401 comes first.
+- **The plaintext key** appears in exactly one response, the 201 to `POST /admin/tenants/{id}/keys`, and never in a list or a log line. Every response is `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+- **Input**: a 4 KiB body limit (413). A non-empty body must be `application/json` (UTF-8 or no charset; 415), with unknown fields and anything after the first JSON value rejected (400); an empty or all-whitespace body is no body, whatever its `Content-Type` or framing (an empty chunked body included). `DELETE` takes no body (400). encoding/json matches field names ignoring case (`{"NAME":"x"}` is a name) and lets a repeated field's last value win; with one field, which the store validates, that is accepted rather than worked around with a stricter decoder. A path that isn't clean is a 400, checked on the escaped path as ServeMux matches it: an escaped `/` or `.` (`%2F`, `%2e`) is part of an ID, so `/admin/keys/a%2Fb` reaches the store as the ID `a/b`, which isn't a UUID, so not found.
+- **Errors**: the store's typed errors map to 400 (`ErrInvalidName`), 404 (`ErrNotFound`, also for a malformed ID), 409 (`ErrDuplicateName`, `ErrTenantDisabled`); anything else is a 500 that says only "internal error", while the store's sanitized error goes to the log at ERROR. A read the client canceled by going away (`context.Canceled` while the request's context is done) gets nothing written and is logged at WARN as 499, as the gateway does. A change can't be canceled so, so any error from it is the store's: ERROR and a 500, even if the client has gone. A store call that hits the 5 s deadline is an ERROR and a 500 too.
+- **Store deadlines**: every store call has 5 s. A read also ends when the client disconnects. A change doesn't (`context.WithoutCancel`): once it has started, a client that disconnects can't cancel it after Postgres has committed it, which would leave a committed change logged as a failure and without its audit line.
+- **Audit**: each successful change logs one INFO line, `msg=admin`, with the action (`create_tenant`, `disable_tenant`, `create_key`, `revoke_key`), the tenant ID, key ID and key prefix where known, the remote address, and `actor=admin-token`. Never the key or the token. Reads aren't logged. These are log lines until the audit log exists, and go to it then.
+
+Known limits, on purpose for now:
+
+- **One shared secret.** Every operator holds the same token, so the audit log's actor can say only "admin-token", not who; rotating it means changing it everywhere and restarting; and anyone with it can do everything, including issuing keys for any tenant. Per-operator credentials (or mTLS, or an identity provider) come when there is more than one operator to tell apart.
+- **No rate limit on the admin API.** A long random token (32 characters is the floor, not a recommendation; generate it, for example with `openssl rand -base64 32`) can't be guessed at any request rate, and the throttled WARN keeps a flood of bad tokens from flooding the log, but nothing slows down a client that has the token, or bounds the store calls it causes. The listener is meant to be reachable only by operators.
+- No TLS of its own: on loopback, or behind something that terminates TLS.
 
 ### How #1 and #24 fit
 
@@ -94,7 +113,7 @@ The loop stays for now: PR 1a's `Auth` is unchanged and tested, and at the expec
 
 ### Modules added
 
-Direct: `github.com/jackc/pgx/v5` v5.11.0. Indirect: `github.com/jackc/puddle/v2` (pgxpool's resource pool), `github.com/jackc/pgpassfile` and `github.com/jackc/pgservicefile` (libpq's `.pgpass` and service file), `golang.org/x/sync` and `golang.org/x/text`. All are maintained by pgx's author or the Go project. The binary size is measured in PR 1c, when `cmd/gateway` imports the store; until then nothing links it.
+Direct: `github.com/jackc/pgx/v5` v5.11.0. Indirect: `github.com/jackc/puddle/v2` (pgxpool's resource pool), `github.com/jackc/pgpassfile` and `github.com/jackc/pgservicefile` (libpq's `.pgpass` and service file), `golang.org/x/sync` and `golang.org/x/text`. All are maintained by pgx's author or the Go project. The binary size is measured in PR 1d, when `cmd/gateway` imports the store; until then nothing links it.
 
 ### Testing
 
@@ -102,8 +121,8 @@ Unit tests need no database: the sanitizing (an unreachable server, bad connecti
 
 ## Consequences
 
-- A second stateful service to run in production once PR 1c lands, and the first whose loss matters for keys: the gateway can't start without it, and runs on its last good key set while it is down.
+- A second stateful service to run in production once PR 1d lands, and the first whose loss matters for keys: the gateway can't start without it, and runs on its last good key set while it is down.
 - Revocation takes up to a refresh interval; anyone needing a key dead at once still has to restart the gateways.
 - Five more modules in `go.mod`.
-- Schema changes are forward-only migrations in this repository, applied by the gateway at startup (PR 1c decides whether that is automatic or a separate command).
+- Schema changes are forward-only migrations in this repository, applied by the gateway at startup (PR 1d decides whether that is automatic or a separate command).
 - `SENTINEL_API_KEYS` stays for development and small deployments.

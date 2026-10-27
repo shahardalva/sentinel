@@ -41,7 +41,20 @@ tool policies, and writes an audit log.
   no CREATE right), forward only. Every error is a
   sanitized *store.Error (op, SQLSTATE, constraint; never pgx's text,
   which names user, database or host) or a typed error. Not wired into
-  cmd/gateway until PR 1c.
+  cmd/gateway until PR 1d.
+- Admin API: internal/admin, New(Config{Store, Token, Logger})
+  http.Handler over an admin.Store interface (*store.Store satisfies it),
+  for its own listener (PR 1d, like the metrics one), never the API port.
+  Bearer token checked first (constant-time over SHA-256 digests; same
+  401 for every path; before the body is read), ValidateToken (>= 32
+  printable ASCII, no space). JSON in and out, one error shape
+  {"error":{"type","message"}}, 4 KiB bodies, application/json only,
+  unknown fields and trailing values rejected; 500s say only "internal
+  error". Store calls get 5 s; changes ignore the client's cancellation
+  (WithoutCancel); a read the client canceled is a WARN 499, any other
+  store error ERROR and 500. The plaintext key is only in the create-key 201; every response
+  is no-store. One INFO "admin" line per change (action, ids, prefix,
+  actor "admin-token"), never the key or token.
 - Later: Kafka (franz-go), ClickHouse, Python detector service over gRPC
 
 ## Principles

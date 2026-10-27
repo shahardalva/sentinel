@@ -65,8 +65,9 @@ func (f fixedKeys) Keys() *KeySet { return f.set }
 // LogThrottle lets a repeated log line through at most once per interval
 // and counts the ones it holds back, as the gateway's own warnings do. The
 // zero value is ready to use. It is for packages outside proxy, such as
-// internal/keys; see logThrottle. Exporting it from proxy is a stopgap
-// while internal/keys is its only outside user.
+// internal/keys and internal/admin; see logThrottle. Exporting it from
+// proxy is a stopgap; with two outside users it is due a package of its
+// own.
 type LogThrottle struct{ t logThrottle }
 
 // Allow reports whether to log at now, and if so how many lines were held
