@@ -79,7 +79,19 @@ jobs:
           cp .env.example .env
           mkdir certs
           docker compose config --quiet
-          docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock config --quiet
+          # The mock gateway's admin token has no default: without one in
+          # .env (empty in .env.example) the mock files must not load.
+          if out="$(docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock config --quiet 2>&1)"; then
+            echo "docker-compose.mock.yml loaded without SENTINEL_ADMIN_TOKEN"
+            exit 1
+          fi
+          if ! printf '%s\n' "$out" | grep -q SENTINEL_ADMIN_TOKEN; then
+            echo "docker-compose.mock.yml failed, but not for the missing SENTINEL_ADMIN_TOKEN:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          SENTINEL_ADMIN_TOKEN=ci-config-check-only-not-a-real-token \
+            docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock config --quiet
 
       - name: Build images
         run: |

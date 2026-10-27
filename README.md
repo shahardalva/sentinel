@@ -8,7 +8,7 @@ The goal is a single control point for LLM traffic: who is calling, what is bein
 
 [![CI](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shahardalva/sentinel/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-go--redis%20%2B%20OpenTelemetry-informational)
+![Dependencies](https://img.shields.io/badge/dependencies-go--redis%20%2B%20OpenTelemetry%20%2B%20pgx-informational)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 
@@ -58,6 +58,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 **Security**
 - Per-client gateway keys, accepted as `x-api-key` or `Authorization: Bearer`. Keys are compared as SHA-256 digests in constant time.
+- Client keys per tenant in Postgres, issued, listed and revoked through an admin API on its own loopback listener with a bearer token, and picked up by every gateway within a refresh interval, without a restart. The database holds only digests; a key is shown once. Or a fixed list from `SENTINEL_API_KEYS`. See [Client keys in Postgres](#client-keys-in-postgres).
 - The upstream provider key never leaves the gateway. Client credential headers are stripped before the request is forwarded.
 - The gateway never follows an upstream redirect. On a redirect to another host Go's HTTP client keeps every header except `Authorization`, so following one would hand the gateway's `x-api-key` to whatever host the upstream named. A redirect is answered with `502` and logged as `upstream redirect refused`.
 - On the OpenAI route no client header is forwarded at all. `OpenAI-Organization` and `OpenAI-Project` choose who is billed, so a client never gets to set them; `OpenAI-Beta` and the SDKs' `X-Stainless-*` headers are dropped too.
@@ -87,7 +88,7 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 - OpenTelemetry metrics on a separate loopback listener (`GET /metrics` on `127.0.0.1:9464`): requests, latency, the gateway's own overhead, per-stage durations, rate-limit outcomes, auth rejections, concurrency and the Redis breaker. Labels come only from closed sets. The compose stack adds Prometheus and a provisioned Grafana dashboard. See [Observability](#observability).
 
 **Engineering**
-- Two third-party dependencies with a reason each: `go-redis` for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)), and OpenTelemetry with its Prometheus exporter for metrics ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)), which brings `prometheus/client_golang` with it. The core in `internal/proxy` imports neither.
+- Three third-party dependencies with a reason each: `go-redis` for rate limiting ([ADR 0002](docs/adr/0002-rate-limiting.md)), OpenTelemetry with its Prometheus exporter for metrics ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)), which brings `prometheus/client_golang` with it, and `pgx` for the key store ([ADR 0005](docs/adr/0005-postgres-client-keys.md)). The core in `internal/proxy` imports none of them.
 - Provider-agnostic core. The handler knows nothing about Anthropic or OpenAI; provider-specific behavior lives behind a `Provider` interface. Adding the OpenAI provider changed no file in the core.
 - Tests cover the behavior above and pass under the race detector. Rate-limit tests run against an in-process Redis (`miniredis`), so CI needs no Redis server.
 
@@ -101,17 +102,17 @@ Sentinel addresses these at the network layer, so applications don't need to cha
 
 ### Run with Docker Compose
 
-The compose stack runs the gateway, a mock upstream over HTTPS, Redis, which the gateway uses for rate limiting, and Prometheus and Grafana for metrics. The gateway is published on `127.0.0.1:8081` and Grafana on `127.0.0.1:3000`, both loopback only.
+The compose stack runs the gateway, a mock upstream over HTTPS, Postgres, which holds the client keys, Redis, which the gateway uses for rate limiting, and Prometheus and Grafana for metrics. The gateway is published on `127.0.0.1:8081`, its admin API on `127.0.0.1:9465` and Grafana on `127.0.0.1:3000`, all loopback only. Postgres is not published.
 
 ```bash
 cp .env.example .env   # then fill it in; .env is gitignored
-openssl rand -hex 32   # a client key of your own; put it in SENTINEL_API_KEYS
+openssl rand -hex 32   # an admin token; put it in SENTINEL_ADMIN_TOKEN
 make up                # gateway -> mockupstream over HTTPS; Grafana on http://127.0.0.1:3000
 make logs
 make down
 ```
 
-`.env.example` ships with empty keys. Choose your own client key for `SENTINEL_API_KEYS` (the gateway refuses to start without one), and set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` only if you will run `make up-real`. Clients then send that key as `x-api-key` or `Authorization: Bearer`.
+`.env.example` ships with empty keys. `make up` needs `SENTINEL_ADMIN_TOKEN` (compose refuses to start without it): issue a client key with the [admin API](#admin-api), and the gateway accepts it within 30 seconds. Clients then send that key as `x-api-key` or `Authorization: Bearer`. `make up-real` takes client keys from `SENTINEL_API_KEYS` instead: choose your own (the gateway refuses to start without one), and set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
 
 `make up` serves both protocols, with both upstreams pointed at the mock (`https://mockupstream:9090` and `https://mockupstream:9090/v1`), and trusts the dev CA from `./certs`. It first runs `make certs`, which writes the certificates (valid for 30 days) when they are missing or expire within 7 days, and recreates the containers so they load the current ones. It replaces `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` with dummies, so your real keys never reach the mock. `make up-real` starts the gateway against the real APIs with the keys from `.env`; it serves the upstreams in `SENTINEL_UPSTREAMS` from `.env`, Anthropic only by default.
 
@@ -259,7 +260,11 @@ All configuration comes from environment variables. Secrets are never read from 
 | `SENTINEL_UPSTREAMS` | No | `anthropic` | Comma-separated upstreams to serve: the built-in `anthropic` (`POST /v1/messages`) and `openai` (`POST /v1/chat/completions`), and any [named upstreams](#named-upstreams). A name that breaks the naming rule, a duplicate, or a list with no names stops startup. The gateway logs one line per enabled upstream with its name, protocol and base URL, as `scheme://host[:port]` only, since a path may hold a token. |
 | `ANTHROPIC_API_KEY` | When `anthropic` is listed | | The gateway's own key for the Anthropic API. Clients never see it. |
 | `OPENAI_API_KEY` | When `openai` is listed | | The gateway's own key for the OpenAI-compatible API. Clients never see it. |
-| `SENTINEL_API_KEYS` | Yes | | Comma-separated client keys, shared by every route. The gateway refuses to start without at least one. |
+| `SENTINEL_API_KEYS` | Unless `SENTINEL_DATABASE_URL` is set | | Comma-separated client keys, shared by every route. Without a database the gateway refuses to start without at least one; with one it must be empty, since the gateway never merges the two. |
+| `SENTINEL_DATABASE_URL` | No | | Postgres connection string for the [client keys in Postgres](#client-keys-in-postgres), such as `postgres://user:password@host:5432/db?sslmode=verify-full`. Set, the keys come from the database only, and the [admin API](#admin-api) manages them. Unset or empty, they come from `SENTINEL_API_KEYS`. Blank (only spaces) stops startup. No error or log line ever holds the URL or any part of it. |
+| `SENTINEL_KEYS_REFRESH` | No | `30s` | How often the key set is fetched from the database, as a Go duration (`30s`, `2m`); at least `1s`. This is how long a revoked key keeps working. Ignored, with a `WARN`, without a database. |
+| `SENTINEL_ADMIN_ADDR` | No | `127.0.0.1:9465` with a database | Listen address of the admin API, on its own listener, never on the API port. Loopback only by default. `off` turns it off. Same rules as `SENTINEL_METRICS_ADDR`, and its port must differ from both the API's and the metrics' (port 0 exempt). Set to anything but `off` without a database, it stops startup. A bind failure stops startup; an admin server that fails later is logged at `ERROR` and the API keeps serving. |
+| `SENTINEL_ADMIN_TOKEN` | While the admin API is on | | The admin API's bearer token: at least 32 printable ASCII characters, no spaces. Generate it: `openssl rand -hex 32`. The error for a bad one never repeats it. Ignored, with a `WARN`, while the admin API is off. |
 | `SENTINEL_ADDR` | No | `127.0.0.1:8081` | Listen address. Loopback only by default. |
 | `SENTINEL_METRICS_ADDR` | No | `127.0.0.1:9464` | Listen address for metrics, which serves only `GET /metrics`, on its own listener, never on the API port. Loopback only by default. `off` turns metrics off entirely. Must be `host:port` with a numeric port other than `SENTINEL_ADDR`'s, on any host (ports compare as numbers; port 0, any free port, is exempt); the gateway refuses to start otherwise, or if the address can't be bound. Once running, a metrics server that fails is logged at `ERROR` and the API keeps serving. See [Observability](#observability). |
 | `ANTHROPIC_BASE_URL` | No | `https://api.anthropic.com` | Anthropic upstream override. Must be `https`, except for a loopback host. |
@@ -272,7 +277,7 @@ All configuration comes from environment variables. Secrets are never read from 
 
 An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
 
-With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9464` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
+With Docker Compose, the gateway reads these from `.env` (copy `.env.example`; `.env` is gitignored), named upstreams' variables included. Compose sets `SENTINEL_ADDR=0.0.0.0:8081` inside the container and publishes the port on `127.0.0.1` only. It sets `SENTINEL_METRICS_ADDR=0.0.0.0:9464` for the gateway and `gateway-bench`, for Prometheus on the compose network, and doesn't publish that port. `make up` also sets `SENTINEL_UPSTREAMS=anthropic,openai,mockcompat`, `ANTHROPIC_BASE_URL=https://mockupstream:9090`, `OPENAI_BASE_URL=https://mockupstream:9090/v1`, the `mockcompat` upstream (protocol `openai`, base URL `https://mockupstream:9090/v1`), `SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem` and dummy upstream keys. Named upstreams in `.env` are then unlisted, so they are not used. The gateway and k6 mount only `certs/ca.pem`; the server key goes only to mockupstream. Compose also points the gateway at its Redis with `SENTINEL_REDIS_URL=redis://redis:6379/0`. For `make up` it takes the client keys from the `postgres` service (`SENTINEL_DATABASE_URL`, with the service's dev-only password), sets `SENTINEL_API_KEYS` to empty so a key in `.env` doesn't clash, and serves the admin API on `0.0.0.0:9465` inside the container, published on `127.0.0.1:9465` only, with `SENTINEL_ADMIN_TOKEN` from `.env`, which has no default: compose refuses to start the stack without it. `make up-real` keeps `SENTINEL_API_KEYS` from `.env`, and blanks `SENTINEL_ADMIN_TOKEN` and `SENTINEL_KEYS_REFRESH`, which only the mock run's gateway uses: the token never reaches a gateway without an admin API. The mock run sets `SENTINEL_KEYS_REFRESH` from `.env`, default `30s`. `BENCH_API_KEY` in `.env` (optional, default `bench`) is the only key the `gateway-bench` service accepts and the one `make bench-gateway` sends. `gateway-bench` serves the same three upstreams from the mock, and `make bench-gateway` refuses to run unless every base URL it logs at startup is the mock's. It rate limits through Redis database 1 with a limit of 1,000,000 a minute, so load tests include the Redis call but never get a `429`.
 
 Built-in limits:
 
@@ -287,6 +292,9 @@ Built-in limits:
 | Stream idle timeout | 60 s | Aborts a stream that stops producing data |
 | Header read timeout | 10 s | Bounds slow request headers |
 | Auth read timeout | 5 s | Bounds reads while a request is unauthenticated |
+| Key refresh | 30 s (`SENTINEL_KEYS_REFRESH`) | How long a revoked or new key takes to count, with a database |
+| Database startup | 10 s to connect, 30 s to migrate | A database that can't be reached, or a migration lock held by a stuck gateway, stops startup instead of hanging it |
+| Admin store call | 5 s | Bounds each admin request's database call |
 | Shutdown grace period | 30 s | Lets in-flight streams finish |
 
 ### Named upstreams
@@ -328,6 +336,45 @@ Rules:
 - Every upstream shares the client keys, the rate limit and the concurrency cap. `SENTINEL_UPSTREAM_CA_FILE` applies to all of them.
 
 The design is in [ADR 0003](docs/adr/0003-named-upstreams.md).
+
+### Client keys in Postgres
+
+With `SENTINEL_DATABASE_URL` set, the client keys live in Postgres, per tenant, and are issued and revoked through the [admin API](#admin-api) without a restart. At startup the gateway connects (10 s deadline), applies its migrations (30 s; they are embedded in the binary, forward only, and gateways starting at once take turns on an advisory lock), and loads the active keys. Any of these failing stops startup with a sanitized error: an operation and a code, never the URL, user, host or database name. A signal (Ctrl-C, `SIGTERM`) while one of them waits stops the gateway cleanly: an `INFO` line, `startup interrupted`, and exit status 0, not a failure. Then it fetches the active keys every `SENTINEL_KEYS_REFRESH` and swaps the whole set in; no request ever waits on the database. A failed refresh keeps the last good set and logs a `WARN`. The design, including why digests are plain SHA-256, is in [ADR 0005](docs/adr/0005-postgres-client-keys.md).
+
+Keys look like `snl_` followed by 43 base64url characters (256 random bits). The database holds only their SHA-256 digests and a 12-character prefix to tell them apart; the key itself is shown once, in the admin API's response that created it.
+
+The gateway applies migrations itself, so its database role needs to create tables on the first start and after an upgrade that adds a migration. An up-to-date database needs only `SELECT` on the gateway's tables and `INSERT`/`UPDATE` for the admin API, so production can run the gateways as a role without CREATE and migrate with another (ADR 0005, Database roles). The connection string is passed to pgx as is: anything it leaves out comes from the libpq environment variables (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`...) and from `~/.pgpass`, which pgx reads too. See [Known limitations](#known-limitations).
+
+### Admin API
+
+On its own listener (`SENTINEL_ADMIN_ADDR`, default `127.0.0.1:9465`), only with a database. Every request needs `Authorization: Bearer <SENTINEL_ADMIN_TOKEN>`; without it every path and method, `OPTIONS *` included, gets the same `401`. JSON in and out, errors as `{"error":{"type","message"}}`. Each change is logged at `INFO` as `admin`, without the key or the token.
+
+| Route | Does |
+| --- | --- |
+| `POST /admin/tenants` `{"name"}` | Creates a tenant: `201` |
+| `GET /admin/tenants` | Lists tenants, disabled ones too |
+| `POST /admin/tenants/{id}/disable` | Disables a tenant: its keys stop working at the next refresh. `204` |
+| `POST /admin/tenants/{id}/keys` | Issues a key: `201` with `"key"`, the only time it is shown |
+| `GET /admin/tenants/{id}/keys` | Lists a tenant's keys, metadata only |
+| `DELETE /admin/keys/{id}` | Revokes a key: it stops working at the next refresh. `204` |
+
+```bash
+# make up: the token is SENTINEL_ADMIN_TOKEN in .env. Load .env into this
+# shell, so the token is never typed, echoed or saved in the history.
+set -a; . ./.env; set +a
+# printf is a shell builtin and curl reads the header from stdin, so the
+# token doesn't show in the process list either.
+admin() { printf 'Authorization: Bearer %s\n' "$SENTINEL_ADMIN_TOKEN" | curl -s -H @- "$@"; }
+
+admin -H 'Content-Type: application/json' -d '{"name":"acme"}' http://127.0.0.1:9465/admin/tenants
+admin -X POST http://127.0.0.1:9465/admin/tenants/<tenant id>/keys   # prints the key once
+# within SENTINEL_KEYS_REFRESH (30 s), clients can use it on the API
+admin -X DELETE http://127.0.0.1:9465/admin/keys/<key id>
+```
+
+`set -a; . ./.env` loads every variable in `.env`, upstream keys included, into that shell, and needs `.env` to be valid shell (`NAME=value` lines, values with spaces quoted); close the shell when done. `curl -H @-` needs curl 7.55 or later.
+
+Nothing is ever deleted: a disabled tenant and a revoked key keep their rows, with the time.
 
 ## Request lifecycle
 
@@ -428,6 +475,9 @@ curl -s http://127.0.0.1:9464/metrics | grep '^sentinel_'
 | `sentinel_auth_rejections_total` | counter | | Requests rejected with `401`. |
 | `sentinel_admission_in_use`, `sentinel_admission_limit` | gauge | | Concurrency slots taken, and `SENTINEL_MAX_CONCURRENT`. |
 | `sentinel_ratelimit_breaker_open` | gauge | | `1` while the Redis circuit breaker is open. Only a request's probe closes it, so on an idle gateway it stays `1` after Redis recovers, until the next request. Absent with rate limiting off. |
+| `sentinel_auth_keys` | gauge | | Client keys in the set the gateway accepts; `0` rejects every request. |
+| `sentinel_auth_key_refresh_age_seconds` | gauge | | Time since the key set was last fetched from the database. The one to alert on: a fetch that hangs records no error. Absent for keys from `SENTINEL_API_KEYS`. |
+| `sentinel_auth_key_refresh_errors_total` | counter | | Failed refreshes, each of which kept the last good set. |
 
 The OpenTelemetry names are dotted (`sentinel.request.duration`); the exporter turns dots into underscores and adds the unit and `_total` suffixes. Every series also carries `otel_scope_name`, and `target_info` names the service.
 
@@ -447,6 +497,7 @@ The `unauthorized` `WARN` that a rejected key produces is logged at most once ev
 - rate-limit call duration, p50 and p99
 - Redis breaker state, 0 (closed) or 1 (open)
 - rate limit decisions per second by outcome: allowed, limited, fail_open, fail_closed, not_checked
+- client keys in the set, key refresh age (with a line at 90 s, three default intervals), and failed key refreshes
 
 A **Gateway** selector at the top picks `gateway`, `gateway-bench` or both. `gateway-bench` is in the `bench` profile, so its scrape target shows as `DOWN` in Prometheus unless `make bench-gateway` is running; that is expected.
 
@@ -466,7 +517,7 @@ Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see
 
 ## Design decisions
 
-**Standard library first.** `net/http` covers routing, streaming and per-request deadlines. Fewer dependencies mean a smaller attack surface for a security component. There are two exceptions. `go-redis` for rate limiting, since a Redis client is not something to hand-roll; see [ADR 0002](docs/adr/0002-rate-limiting.md). And OpenTelemetry for metrics, a vendor-neutral API whose SDK will carry traces too, with its Prometheus exporter, which is built on `prometheus/client_golang`; it adds 19 modules to the binary, a cost weighed in [ADR 0004](docs/adr/0004-opentelemetry-metrics.md).
+**Standard library first.** `net/http` covers routing, streaming and per-request deadlines. Fewer dependencies mean a smaller attack surface for a security component. There are three exceptions. `go-redis` for rate limiting, since a Redis client is not something to hand-roll; see [ADR 0002](docs/adr/0002-rate-limiting.md). OpenTelemetry for metrics, a vendor-neutral API whose SDK will carry traces too, with its Prometheus exporter, which is built on `prometheus/client_golang`; it adds 19 modules to the binary, a cost weighed in [ADR 0004](docs/adr/0004-opentelemetry-metrics.md). And `pgx` for the key store in Postgres, used without a query generator or a migration library; see [ADR 0005](docs/adr/0005-postgres-client-keys.md).
 
 **Fail open on a Redis outage, by default.** If Redis can't answer within 50 ms, the request goes through and the gateway logs a warning. An outage then loses rate limiting rather than all traffic. `SENTINEL_RATE_LIMIT_FAIL_MODE=closed` reverses that choice.
 
@@ -508,6 +559,9 @@ sentinel/
 │   ├── handler.go            #   rate limit, intake, admission, forwarding, stream relay, logging
 │   └── recorder.go           #   the Recorder seam for metrics
 ├── internal/telemetry/       # OpenTelemetry metrics behind proxy.Recorder, Prometheus exporter
+├── internal/keys/            # client key sources: Static (SENTINEL_API_KEYS) and Refreshing (a fetch on an interval)
+├── internal/store/           # Postgres tenants and keys (pgx), embedded migrations and their runner
+├── internal/admin/           # admin API over the store, for its own listener
 ├── internal/provider/
 │   ├── anthropic/            # Anthropic Messages API provider and its error shape
 │   ├── openai/               # OpenAI-compatible Chat Completions provider and its error shape
@@ -518,10 +572,10 @@ sentinel/
 │   ├── adr/                  # architecture decision records
 │   ├── notes.md              # dev log: what was done, decided, learned, next
 │   └── *.svg, *.png          # current and target architecture diagrams
-├── .github/workflows/ci.yml  # gofmt, vet, race tests with real Redis, docker build
+├── .github/workflows/ci.yml  # gofmt, vet, race tests with real Redis and Postgres, docker build
 ├── Dockerfile                # gateway and mockupstream images
 ├── docker-compose.yml        # local stack with Redis, Prometheus and Grafana; real upstream by default
-├── docker-compose.mock.yml   # override: gateway -> mockupstream over HTTPS
+├── docker-compose.mock.yml   # override: gateway -> mockupstream over HTTPS, keys from Postgres, admin API
 ├── Makefile                  # dev tasks
 ├── .env.example              # required environment variables, no secrets
 ├── CLAUDE.md                 # conventions and git workflow for Claude Code
@@ -561,6 +615,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - the bench guard: anything but exactly `https://mockupstream:9090` (a path, another port, a look-alike host) is refused, as are duplicate or differently-cased `base_url` keys and unreadable lines
 - refused upstream redirects (both protocols: the redirect target never sees a request) and unclean paths answered `400` over a raw connection instead of hanging
 - an upstream signed by a CA from `SENTINEL_UPSTREAM_CA_FILE` accepted, one from an unknown CA rejected, and a bad CA file stopping startup
+- client keys from Postgres: every new configuration rule (a database and `SENTINEL_API_KEYS` together, a blank URL, the refresh interval, the admin address against the API's and the metrics' ports, the token rule, the admin address without a database), and no error holding the URL or the token; startup failing before any listener binds when the store can't be opened (no part of the URL in the error or the log, with the real `store.Open`), can't be migrated or misses its deadline, or the first fetch fails, the store closed each time; on an in-memory store, a key issued through the admin API working on the API after a refresh and rejected after it is revoked, the admin API absent from the API port, `OPTIONS *` answered `401`, the admin listener binding between metrics and the API, an admin server failure leaving the API serving, and the store closed only after the refresh and the admin API have stopped; and the same issue, use and revoke end to end on a real Postgres
 - metrics: each path (success, a stream and a stream broken after its `200`, `400`, `408`, `413` declared and read, `415`, `429`, `499` at the rate limiter and waiting for upstream, `503` at capacity and fail closed, fail open, `502` for an unreachable upstream, its rejected key and a broken contract, an upstream `5xx` passed through, `504`, a provider panic, and a `401`) recorded exactly once with its status, phase, rate-limit outcome and stages; the instruments, values and attributes through a manual reader; the overhead arithmetic; 1,000 requests with distinct models and client keys, accepted and rejected, adding no series; every metric name and label value the Grafana dashboard queries present in a real scrape; `/metrics` answering on its own listener and `404` on the API port, nothing served with `off`, and a bad or taken address stopping startup, a metrics server failure leaving the API serving, and an API bind failure closing the metrics listener; the `unauthorized` `WARN` rate-limited across routes with a `suppressed` count, and the throttle's counts adding up under 32 concurrent goroutines; and the bench guard reading a log that includes the metrics listener's lines
 
 ## Known limitations
@@ -581,6 +636,11 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - Query strings are not forwarded upstream.
 - Streaming has not been load-tested yet.
 - The Grafana in compose is for local development. Its anonymous `Viewer` can run any PromQL against Prometheus, not only the dashboard's queries; the data is metrics only. Grafana doesn't check the `Host` header, so it has no protection against DNS rebinding beyond listening on loopback (tracked in #20). The Prometheus and Grafana images are pinned by tag, not by digest (tracked in #19).
+- With keys in Postgres, a revoked key, or every key of a disabled tenant, keeps working until the next refresh: up to `SENTINEL_KEYS_REFRESH` (30 s) plus the time of two fetches. A request already accepted, such as a long stream, runs to its end. While the database is unreachable the gateway keeps its last good set, so revoked keys keep working and new keys don't work until a refresh succeeds; watch `sentinel_auth_key_refresh_age_seconds`. Only a restart takes a key out at once.
+- One admin secret. Every operator shares `SENTINEL_ADMIN_TOKEN`, so the audit line can only say `actor=admin-token`; anyone with it can issue keys for any tenant; rotating it means a restart. There is no rate limit on the admin API and no TLS of its own: keep it on loopback or behind something that terminates TLS and limits who reaches it.
+- pgx honors the libpq environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and the rest) and `~/.pgpass` (or `PGPASSFILE`) for anything `SENTINEL_DATABASE_URL` leaves out, as well as a service file (`PGSERVICEFILE`). A gateway started with any of them in its environment uses them; put the whole connection in the URL to avoid surprises. `sslmode` defaults to `prefer`, which doesn't verify the server: use `sslmode=verify-full` outside a private network.
+- The gateway connects to Postgres as one role that also runs the migrations. In the compose stack that role is the image's superuser, which is fine only for local development. In production, use a migration role that owns the schema and a runtime role without CREATE (SELECT, INSERT, UPDATE) for the gateways; see [ADR 0005](docs/adr/0005-postgres-client-keys.md), Database roles. There is no separate migrate command yet.
+- The admin API and the key refresh share one database connection pool, so a burst of admin requests can make refreshes time out (the last good set stays). The admin API has no rate limit.
 - No traces yet: metrics and the log line are all there is. Traces are planned on the same OpenTelemetry SDK ([ADR 0004](docs/adr/0004-opentelemetry-metrics.md)). There are no Go runtime metrics (goroutines, memory, GC) either.
 
 The ones marked "Tracked as an issue" have a fix planned; the rest are deliberate scope limits for now.

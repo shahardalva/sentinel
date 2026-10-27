@@ -3,7 +3,9 @@
 #   real upstream:  docker compose up -d --build
 #   mock upstream:  docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build
 #
-# The mock run needs certificates first: go run ./cmd/devcerts (make certs).
+# The mock run needs certificates first: go run ./cmd/devcerts (make certs),
+# and SENTINEL_ADMIN_TOKEN in .env: its gateway takes client keys from the
+# postgres service, managed through the admin API (http://127.0.0.1:9465).
 # Both runs include Prometheus and Grafana (http://127.0.0.1:3000).
 
 x-hardening: &hardening
@@ -56,6 +58,13 @@ services:
       # Metrics on all interfaces inside the container, for Prometheus on
       # the compose network. Not published on the host.
       SENTINEL_METRICS_ADDR: 0.0.0.0:9464
+      # .env holds these for the mock run's gateway, which has a database
+      # and an admin API (docker-compose.mock.yml sets them again). This
+      # gateway has neither: blank, so the admin token never reaches its
+      # container and nothing logs them as set but ignored. environment
+      # overrides env_file.
+      SENTINEL_ADMIN_TOKEN: ""
+      SENTINEL_KEYS_REFRESH: ""
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:
@@ -146,6 +155,49 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+
+  # Tenants and client keys for the gateway of the mock run
+  # (docker-compose.mock.yml), managed through its admin API. Not published
+  # on the host: only the gateway reaches it, on the compose network.
+  #
+  # The password is a dev-only default, not a secret: it is in this file,
+  # the gateway's SENTINEL_DATABASE_URL repeats it, and it is set only when
+  # the volume is first initialized (changing it later needs ALTER ROLE or
+  # make down and docker volume rm on sentinel_postgres-data). Never use
+  # this service, or this password, for anything but local development.
+  postgres:
+    image: postgres:18.6-alpine3.24
+    profiles: [mock]
+    <<: *hardening
+    # The image's own postgres user (uid 70 on Alpine), so the entrypoint
+    # needs no capability. Started as root it would chown the data
+    # directory and drop to postgres with su-exec, which needs CHOWN,
+    # DAC_OVERRIDE, FOWNER, SETUID and SETGID. The image ships the data
+    # directory owned by postgres, and a new volume copies that.
+    user: postgres
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_DB: sentinel
+      POSTGRES_PASSWORD: sentinel-dev-only
+    tmpfs:
+      # The socket and lock file directory, and scratch space: the root
+      # filesystem is read-only.
+      - /var/run/postgresql
+      - /tmp
+    volumes:
+      # Postgres 18 images keep PGDATA in /var/lib/postgresql/18/docker and
+      # declare the volume one level up, at /var/lib/postgresql.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: while the entrypoint initializes a new volume, its
+      # temporary server listens on the unix socket alone, so this passes
+      # only once the real server accepts the gateway's connections.
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-U", "sentinel", "-d", "sentinel"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
 
   # Rate-limit buckets for the gateway. Not published on the host.
   redis:
@@ -267,5 +319,6 @@ services:
 
 volumes:
   mockupstream-key:
+  postgres-data:
   prometheus-data:
   grafana-data:

@@ -25,7 +25,7 @@ tool policies, and writes an audit log.
   request, as an immutable proxy.KeySet of SHA-256 digests (constant-time
   compare over every digest; clientID is the hex digest). A nil or empty
   set rejects everything. internal/keys implements it: Static (from
-  SENTINEL_API_KEYS, used today) and Refreshing (a Fetch of digests on an
+  SENTINEL_API_KEYS, without a database) and Refreshing (a Fetch of digests on an
   interval, atomic swap, last good set kept on failure, first fetch must
   succeed within FetchTimeout). A Fetch must honor ctx and return errors
   safe to log. internal/proxy never imports internal/keys or a DB package.
@@ -40,11 +40,22 @@ tool policies, and writes an audit log.
   ErrSchemaMismatch for a different applied name; an up-to-date DB needs
   no CREATE right), forward only. Every error is a
   sanitized *store.Error (op, SQLSTATE, constraint; never pgx's text,
-  which names user, database or host) or a typed error. Not wired into
-  cmd/gateway until PR 1d.
+  which names user, database or host) or a typed error.
+- cmd/gateway with SENTINEL_DATABASE_URL: startKeys does store.Open (10 s)
+  and Migrate (30 s, automatic on every start), then keys.NewRefreshing
+  on ActiveDigests with the Recorder, all before any listener binds; any
+  failure stops startup, except that a signal during them logs INFO
+  "startup interrupted" and returns nil. It sees the store as a keyStore
+  interface (openStore is a var, so tests use a fake). The refresh ctx is not the
+  signal's; shutdown: API, admin (5 s, WARN if cut), metrics, then cancel
+  the refresh, wait for Done (5 s; if it doesn't stop, WARN and leave the
+  pool open), close the pool. Compose connects as the image's superuser;
+  production: a migration role and a runtime role without CREATE (ADR
+  0005, Database roles). Admin and refresh share one pool.
 - Admin API: internal/admin, New(Config{Store, Token, Logger})
   http.Handler over an admin.Store interface (*store.Store satisfies it),
-  for its own listener (PR 1d, like the metrics one), never the API port.
+  on its own listener (SENTINEL_ADMIN_ADDR, like the metrics one; its
+  http.Server has DisableGeneralOptionsHandler), never the API port.
   Bearer token checked first (constant-time over SHA-256 digests; same
   401 for every path; before the body is read), ValidateToken (>= 32
   printable ASCII, no space). JSON in and out, one error shape
@@ -78,14 +89,19 @@ tool policies, and writes an audit log.
   CI sets it too). Each store test uses a schema of its own.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis for rate limiting, and Prometheus and Grafana (127.0.0.1:3000,
+  postgres for the client keys (admin API on 127.0.0.1:9465; needs
+  SENTINEL_ADMIN_TOKEN in .env), redis for rate limiting, and Prometheus
+  and Grafana (127.0.0.1:3000,
   anonymous Viewer, provisioned from observability/) for metrics. The gateway serves both protocols there, with
   anthropic, openai and the named upstream mockcompat (openai) all on the
   mock. Runs make certs first, which rewrites ./certs when a
   file is missing or server.pem expires within 7 days, and recreates the
   containers. Gateway on 127.0.0.1:8081 only. make up-real: gateway
   against the real APIs in SENTINEL_UPSTREAMS from .env (default
-  anthropic). make down, make logs.
+  anthropic). make down, make logs. Every target but make up passes a
+  placeholder SENTINEL_ADMIN_TOKEN when the shell has none, so they work
+  without one in .env (compose checks ${SENTINEL_ADMIN_TOKEN:?} on any
+  command reading docker-compose.mock.yml; CI's config check sets one).
 - make bench: k6 in a container against the mock directly (after make up).
   make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
   the mock for all its upstreams (anthropic, openai, mockcompat) with dummy
@@ -137,9 +153,26 @@ tool policies, and writes an audit log.
   used, and a WARN at startup says so. An enabled upstream's key with
   leading or trailing whitespace or a control character stops startup; the
   error names the variable, never the key.
-- SENTINEL_API_KEYS (required): comma-separated client keys. The gateway
-  refuses to start without at least one. Clients send a key as `x-api-key`
+- SENTINEL_API_KEYS (required without SENTINEL_DATABASE_URL):
+  comma-separated client keys. The gateway refuses to start without at
+  least one; with a database it must be empty (never both). Clients send a key as `x-api-key`
   or `Authorization: Bearer <key>`; anything else gets a 401.
+- SENTINEL_DATABASE_URL (optional): Postgres for the client keys. Unset or
+  empty: keys from SENTINEL_API_KEYS. Set: keys from Postgres only. Blank
+  (spaces) stops startup. No error or log ever holds the URL. pgx also
+  honors PG* variables and ~/.pgpass.
+- SENTINEL_KEYS_REFRESH (optional): key fetch interval with a database,
+  Go duration, default 30s, at least 1s (revocation latency). Set without
+  a database: one WARN, ignored.
+- SENTINEL_ADMIN_ADDR (optional): admin API listener, default
+  127.0.0.1:9465 with a database, "off" disables. Same parsing as the
+  metrics addr; port must differ from the API's and the metrics' (port 0
+  exempt). Anything but off without a database stops startup. Binds after
+  metrics, before the API, logs "admin listening"; a later Serve error is
+  ERROR and the API keeps serving.
+- SENTINEL_ADMIN_TOKEN (required while the admin API is on):
+  admin.ValidateToken; errors never hold it. Set while admin is off: one
+  WARN, ignored.
 - SENTINEL_ADDR (optional): listen address, default 127.0.0.1:8081
   (loopback only). Set it explicitly to expose the gateway on a network.
 - SENTINEL_METRICS_ADDR (optional): metrics listener, default
@@ -191,7 +224,8 @@ tool policies, and writes an audit log.
   during the check is logged as 499, not as a Redis failure.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY, OPENAI_API_KEY,
-OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_* and SENTINEL_API_KEYS from .env
+OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_*, SENTINEL_API_KEYS (make
+up-real only), SENTINEL_ADMIN_TOKEN and SENTINEL_KEYS_REFRESH from .env
 (copy .env.example, which leaves the keys empty; .env is gitignored), and
 SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
@@ -211,7 +245,16 @@ SENTINEL_UPSTREAMS=anthropic,openai,mockcompat, ANTHROPIC_BASE_URL=
 https://mockupstream:9090, OPENAI_BASE_URL=https://mockupstream:9090/v1,
 mockcompat as protocol openai on https://mockupstream:9090/v1,
 SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and dummy keys for all three
-(mock-not-a-real-key), so load tests never reach a real API. The gateway, gateway-bench and k6 mount only
+(mock-not-a-real-key), so load tests never reach a real API. The mock
+override also gives the gateway SENTINEL_DATABASE_URL on the postgres
+service (postgres:18.6-alpine3.24, mock profile, no host port, volume
+postgres-data, TCP pg_isready healthcheck the gateway waits on, hardened,
+user postgres, dev-only password sentinel-dev-only in the compose file),
+SENTINEL_API_KEYS="", SENTINEL_ADMIN_ADDR=0.0.0.0:9465 published on
+127.0.0.1:9465 only, and SENTINEL_ADMIN_TOKEN=${SENTINEL_ADMIN_TOKEN:?} and
+SENTINEL_KEYS_REFRESH=${SENTINEL_KEYS_REFRESH:-30s}; the base gateway
+blanks both, so make up-real never gets the token. gateway-bench keeps
+env keys. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
 copies the server key into a volume as a file owned by the nonroot user
 (65532) with mode 0400, since devcerts writes it 0600 for the host user; the

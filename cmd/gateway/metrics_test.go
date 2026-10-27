@@ -119,6 +119,7 @@ type running struct {
 	logs        *syncBuffer
 	api         string // host:port of the API listener
 	metrics     string // host:port of the metrics listener; empty if off
+	admin       string // host:port of the admin listener; empty if none
 	done        chan error
 	stop        context.CancelFunc
 	msgsInOrder []string
@@ -127,6 +128,14 @@ type running struct {
 // startServe runs serve for vars, with both listeners on free ports unless
 // vars says otherwise, and waits for the API's "listening" line.
 func startServe(t *testing.T, vars map[string]string) *running {
+	t.Helper()
+	return startServeWith(t, vars, nil)
+}
+
+// startServeWith is startServe with a hook that changes the config after
+// loadConfig, for settings tests need that the variables can't express,
+// such as a refresh interval under the minimum.
+func startServeWith(t *testing.T, vars map[string]string, change func(*config)) *running {
 	t.Helper()
 	all := map[string]string{
 		"ANTHROPIC_API_KEY":     "sk",
@@ -141,6 +150,9 @@ func startServe(t *testing.T, vars map[string]string) *running {
 	cfg, err := loadConfig(env(all))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if change != nil {
+		change(&cfg)
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	r := &running{logs: &syncBuffer{}, done: make(chan error, 1), stop: stop}
@@ -169,6 +181,8 @@ func startServe(t *testing.T, vars map[string]string) *running {
 			switch msg {
 			case "metrics listening":
 				r.metrics = addr
+			case "admin listening":
+				r.admin = addr
 			case "listening":
 				r.api = addr
 			}
