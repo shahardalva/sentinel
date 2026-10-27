@@ -24,6 +24,10 @@ var (
 	// ErrSchemaTooNew: the database has a schema version newer than this
 	// binary knows. An older gateway must not run against it.
 	ErrSchemaTooNew = errors.New("store: database schema is newer than this binary")
+	// ErrSchemaMismatch: a migration the database has applied is not the
+	// one this binary has under that version, for example one from another
+	// branch. Nothing is changed.
+	ErrSchemaMismatch = errors.New("store: database schema does not match this binary's migrations")
 )
 
 // Error is a sanitized database error. Its message holds only the
@@ -62,19 +66,19 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.ctxErr }
 
 // sanitize turns any error from pgx into an *Error safe to log. A nil err
-// stays nil; an error this package made already passes through.
+// stays nil. Only an *Error itself or a bare sentinel passes through as is;
+// an error that merely wraps one may carry other text, so it is sanitized
+// like any other.
 func sanitize(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var se *Error
-	if errors.As(err, &se) {
+	if _, ok := err.(*Error); ok {
 		return err
 	}
-	for _, typed := range []error{ErrNotFound, ErrDuplicateName, ErrTenantDisabled, ErrInvalidName, ErrSchemaTooNew} {
-		if errors.Is(err, typed) {
-			return err
-		}
+	switch err {
+	case ErrNotFound, ErrDuplicateName, ErrTenantDisabled, ErrInvalidName, ErrSchemaTooNew, ErrSchemaMismatch:
+		return err
 	}
 	e := &Error{Op: op, desc: "database error"}
 	switch {

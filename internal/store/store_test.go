@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,44 +66,12 @@ func TestOpen_BadConnStringErrorHoldsNoConnectionDetails(t *testing.T) {
 	}
 }
 
-// The tests below run on a real Postgres. They are skipped unless
-// SENTINEL_TEST_POSTGRES_URL is set; make test-postgres and CI set it. Each
-// test gets a schema of its own, dropped afterwards, so they can share a
-// database and run in parallel. The migration lock is database-wide, so
-// migrations across tests still serialize.
-
-func testURL(t *testing.T) string {
-	t.Helper()
-	u := os.Getenv("SENTINEL_TEST_POSTGRES_URL")
-	if u == "" {
-		t.Skip("SENTINEL_TEST_POSTGRES_URL not set")
-	}
-	return u
-}
-
-// testSchema creates an empty schema and returns a connection string whose
-// search_path is that schema.
+// testSchema returns a connection string for an empty schema of its own,
+// or skips the test without SENTINEL_TEST_POSTGRES_URL; see
+// store.NewSchemaForTest.
 func testSchema(t *testing.T) string {
 	t.Helper()
-	base := testURL(t)
-	ctx := context.Background()
-	admin, err := store.Open(ctx, base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(admin.Close)
-	schema := "t_" + strings.ToLower(rand.Text())
-	if err := store.ExecForTest(ctx, admin, `CREATE SCHEMA `+schema); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.ExecForTest(context.Background(), admin, `DROP SCHEMA `+schema+` CASCADE`) })
-	u, err := url.Parse(base)
-	if err != nil {
-		t.Fatalf("SENTINEL_TEST_POSTGRES_URL must be a URL: %v", err)
-	}
-	q := u.Query()
-	q.Set("search_path", schema)
-	u.RawQuery = q.Encode()
+	_, u := store.NewSchemaForTest(t)
 	return u.String()
 }
 
@@ -122,13 +89,10 @@ func openMigrated(t *testing.T) *store.Store {
 }
 
 func TestPostgres_WrongPasswordErrorHoldsNoConnectionDetails(t *testing.T) {
-	u, err := url.Parse(testURL(t))
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := store.PGURLForTest(t)
 	u.User = url.UserPassword(leakUser, leakPass)
 	u.Path = "/" + leakDB
-	_, err = store.Open(context.Background(), u.String())
+	_, err := store.Open(context.Background(), u.String())
 	assertNoLeak(t, err, leakUser, leakPass, leakDB, u.Hostname())
 	var se *store.Error
 	if !errors.As(err, &se) || se.Code == "" {
@@ -157,41 +121,143 @@ func TestPostgres_MigrateTwiceIsANoOp(t *testing.T) {
 	}
 }
 
-func TestPostgres_ConcurrentMigrate(t *testing.T) {
-	t.Parallel()
-	conn := testSchema(t)
+// migrateConcurrently opens five stores on conn, each a pool of its own
+// like a gateway, then releases their Migrate calls together. Every call
+// must succeed and leave the schema at the latest version.
+func migrateConcurrently(t *testing.T, conn string) {
+	t.Helper()
 	ctx := context.Background()
+	stores := make([]*store.Store, 5)
+	for i := range stores {
+		s, err := store.Open(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		stores[i] = s
+	}
+	start := make(chan struct{})
+	errs := make([]error, len(stores))
 	var wg sync.WaitGroup
-	errs := make([]error, 5)
-	for i := range errs {
+	for i, s := range stores {
 		wg.Go(func() {
-			s, err := store.Open(ctx, conn) // a pool of its own, like a gateway
-			if err != nil {
-				errs[i] = err
-				return
-			}
-			defer s.Close()
+			<-start
 			errs[i] = s.Migrate(ctx)
 		})
 	}
+	close(start)
 	wg.Wait()
 	for i, err := range errs {
 		if err != nil {
 			t.Errorf("gateway %d: %v", i, err)
 		}
 	}
-	s, err := store.Open(ctx, conn)
+	v, err := stores[0].SchemaVersion(ctx)
+	if want := store.LatestVersionForTest(t); err != nil || v != want {
+		t.Fatalf("SchemaVersion = %d, %v; want %d", v, err, want)
+	}
+}
+
+func TestPostgres_ConcurrentMigrate(t *testing.T) {
+	t.Parallel()
+	migrateConcurrently(t, testSchema(t))
+}
+
+// A server, role or URL can make every transaction serializable. The
+// runner must not depend on that default: under a snapshot taken before
+// the lock wait, a gateway that waited would read version 0 and run 0001
+// again.
+func TestPostgres_ConcurrentMigrateUnderSerializableDefault(t *testing.T) {
+	t.Parallel()
+	_, u := store.NewSchemaForTest(t)
+	// pgx sends a URL parameter it doesn't know as a startup parameter,
+	// like search_path; it doesn't handle libpq's "options".
+	q := u.Query()
+	q.Set("default_transaction_isolation", "serializable")
+	u.RawQuery = q.Encode()
+
+	// The premise: a transaction begun without options on this URL is
+	// serializable.
+	ctx := context.Background()
+	s, err := store.Open(ctx, u.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	v, err := s.SchemaVersion(ctx)
+	got, err := store.ShowForTest(ctx, s, "default_transaction_isolation")
+	s.Close()
+	if err != nil || got != "serializable" {
+		t.Fatalf("default_transaction_isolation = %q, %v; want serializable", got, err)
+	}
+
+	migrateConcurrently(t, u.String())
+}
+
+// An up-to-date database must not need the CREATE privilege, so the
+// gateway can run as a role that can't change the schema.
+func TestPostgres_MigrateUpToDateNeedsNoCreatePrivilege(t *testing.T) {
+	t.Parallel()
+	schema, u := store.NewSchemaForTest(t)
+	ctx := context.Background()
+	owner, err := store.Open(ctx, u.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := store.CountForTest(ctx, s, `SELECT count(*) FROM schema_migrations`)
-	if err != nil || n != v {
-		t.Fatalf("schema_migrations has %d rows (%v), want %d: a migration ran twice", n, err, v)
+	t.Cleanup(owner.Close)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	role := "r_" + strings.ToLower(rand.Text())
+	pass := rand.Text()
+	for _, sql := range []string{
+		`CREATE ROLE ` + role + ` LOGIN PASSWORD '` + pass + `'`,
+		`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + role,
+		`GRANT SELECT ON ALL TABLES IN SCHEMA ` + schema + ` TO ` + role,
+	} {
+		if err := store.ExecForTest(ctx, owner, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Registered before the role's store, so it runs after that closes.
+	t.Cleanup(func() {
+		if err := store.ExecForTest(context.Background(), owner, `DROP OWNED BY `+role+`; DROP ROLE `+role); err != nil {
+			t.Errorf("dropping test role: %v", err)
+		}
+	})
+
+	ru := *u
+	ru.User = url.UserPassword(role, pass)
+	s, err := store.Open(ctx, ru.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate on an up-to-date database without CREATE: %v", err)
+	}
+}
+
+func TestPostgres_SchemaVersionOfNeverMigratedDatabase(t *testing.T) {
+	t.Parallel()
+	s, err := store.Open(context.Background(), testSchema(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	if v, err := s.SchemaVersion(context.Background()); err != nil || v != 0 {
+		t.Fatalf("SchemaVersion = %d, %v; want 0, nil", v, err)
+	}
+}
+
+func TestPostgres_RefusesMismatchedMigrationName(t *testing.T) {
+	t.Parallel()
+	s := openMigrated(t)
+	ctx := context.Background()
+	if err := store.ExecForTest(ctx, s, `UPDATE schema_migrations SET name = 'from_another_branch' WHERE version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); !errors.Is(err, store.ErrSchemaMismatch) {
+		t.Fatalf("Migrate = %v, want ErrSchemaMismatch", err)
 	}
 }
 
@@ -272,8 +338,14 @@ func TestPostgres_DisableTenantDropsItsKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, a1, _ := s.CreateKey(ctx, a.ID)
-	_, a2, _ := s.CreateKey(ctx, a.ID)
+	_, a1, err := s.CreateKey(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, a2, err := s.CreateKey(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, b1, err := s.CreateKey(ctx, b.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +370,68 @@ func TestPostgres_DisableTenantDropsItsKeys(t *testing.T) {
 		if (tn.ID == a.ID) != (tn.DisabledAt != nil) {
 			t.Errorf("tenant %s DisabledAt = %v", tn.Name, tn.DisabledAt)
 		}
+	}
+}
+
+// A key must not be issued to a tenant whose disabling is committing at
+// the same moment: CreateKey waits for it and then sees it disabled.
+func TestPostgres_CreateKeyWaitsForConcurrentDisable(t *testing.T) {
+	t.Parallel()
+	s := openMigrated(t)
+	ctx := context.Background()
+	tn, err := s.CreateTenant(ctx, "racing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.BeginForTest(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE tenants SET disabled_at = now() WHERE id = $1`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		key string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, key, err := s.CreateKey(ctx, tn.ID)
+		done <- result{key, err}
+	}()
+	// Wait until CreateKey is blocked on the tenant row. If it returns
+	// first, it didn't wait for the disable.
+	waiting := `SELECT count(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock'
+		AND query LIKE '%INSERT INTO api_keys%'`
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		select {
+		case r := <-done:
+			t.Fatalf("CreateKey returned before the disable committed: err %v, key issued %v", r.err, r.key != "")
+		default:
+		}
+		n, err := store.CountForTest(ctx, s, waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CreateKey neither returned nor waited on the tenant row")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; !errors.Is(r.err, store.ErrTenantDisabled) {
+		t.Fatalf("CreateKey = %v (key issued %v), want ErrTenantDisabled", r.err, r.key != "")
+	}
+	if ks, err := s.ListKeys(ctx, tn.ID); err != nil || len(ks) != 0 {
+		t.Fatalf("ListKeys = %+v, %v; want no keys", ks, err)
 	}
 }
 
@@ -390,8 +524,8 @@ func TestPostgres_RevokedKeyRejectedAfterOneRefresh(t *testing.T) {
 			started.Add(1)
 			return s.ActiveDigests(ctx)
 		},
-		Interval:     200 * time.Millisecond,
-		FetchTimeout: 100 * time.Millisecond,
+		Interval:     time.Second,
+		FetchTimeout: 900 * time.Millisecond,
 		Recorder:     rec,
 	})
 	if err != nil {

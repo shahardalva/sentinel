@@ -38,10 +38,31 @@ Newest entries first. Short: what was done, what was decided, what's next.
   per digest (0.2 ms at 10,000 keys) against ~15 ns for a map at any size.
   Switch to a map in KeySet before tens of thousands of keys.
 
+- After review (go-reviewer), tests first: migration transactions are
+  READ COMMITTED whatever the default (a serializable default made a
+  gateway that waited on the lock rerun 0001); schema_migrations is
+  created only when to_regclass finds none, so an up-to-date DB needs no
+  CREATE; SchemaVersion is 0 on a never-migrated DB; an applied migration
+  whose name differs is ErrSchemaMismatch; CreateKey's INSERT ... SELECT
+  takes FOR SHARE on the tenant, so it waits for a concurrent disable and
+  returns ErrTenantDisabled instead of a dead key; the rollback after a
+  failed migration has a 5 s deadline. Migrate calls migrate(ctx, fs.FS),
+  so a test runs a 0002 that fails halfway. sanitize passes through only
+  an *Error or a bare sentinel, never a wrapper. validName rejects
+  anything not unicode.IsPrint and format characters (Cf). The concurrent
+  test opens five pools, then releases them together.
+
 ### Next
 - PR 1c: config (connection string from env, refresh interval), main.go
   choosing Static or the store, the admin API, compose, binary size.
 - Decide whether the gateway migrates at startup or a separate command does.
+- PR 1c: give Open and Migrate a context with a deadline. Ping to a
+  blackholed host waits for the OS TCP timeout, and pg_advisory_xact_lock
+  waits forever behind a stuck migrator (or set lock_timeout).
+- The deny rules in .claude/settings.json match by prefix:
+  Bash(make test-redis:*) and Bash(make test-postgres:*) don't catch
+  "make test test-postgres" or "make -C . test-redis". CLAUDE.md is the
+  real control; consider a hook that checks the targets.
 
 ## 2026-10-27: refreshable key source (Postgres keys, PR 1a)
 

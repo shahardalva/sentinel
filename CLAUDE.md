@@ -35,8 +35,10 @@ tool policies, and writes an audit log.
   Store.ActiveDigests is a keys.Fetch. Keys are "snl_" + base64url of 32
   random bytes, returned once by CreateKey, never stored or logged.
   Migrations: embedded internal/store/migrations/NNNN_name.sql, own runner
-  (schema_migrations, one tx per migration under pg_advisory_xact_lock,
-  ErrSchemaTooNew for a newer DB), forward only. Every error is a
+  (schema_migrations, one READ COMMITTED tx per migration under
+  pg_advisory_xact_lock, ErrSchemaTooNew for a newer DB,
+  ErrSchemaMismatch for a different applied name; an up-to-date DB needs
+  no CREATE right), forward only. Every error is a
   sanitized *store.Error (op, SQLSTATE, constraint; never pgx's text,
   which names user, database or host) or a typed error. Not wired into
   cmd/gateway until PR 1c.

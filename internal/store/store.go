@@ -72,8 +72,9 @@ func Open(ctx context.Context, connString string) (*Store, error) {
 func (s *Store) Close() { s.pool.Close() }
 
 // CreateTenant adds an enabled tenant. A name in use is ErrDuplicateName;
-// an empty or overlong name, or one with a control character or
-// surrounding whitespace, is ErrInvalidName.
+// an empty or overlong name, one with surrounding whitespace, or one with
+// a character that isn't printable or is a format character (Cf), is
+// ErrInvalidName.
 func (s *Store) CreateTenant(ctx context.Context, name string) (Tenant, error) {
 	if !validName(name) {
 		return Tenant{}, ErrInvalidName
@@ -138,10 +139,14 @@ func (s *Store) CreateKey(ctx context.Context, tenantID string) (Key, string, er
 		return Key{}, "", ErrNotFound
 	}
 	key, prefix, digest := newKey()
+	// FOR SHARE waits for a DisableTenant in progress on the row, then
+	// re-checks disabled_at, so no key is issued to a tenant being disabled.
+	// The foreign key's own lock (FOR KEY SHARE) doesn't conflict with that
+	// update.
 	var k Key
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO api_keys (tenant_id, prefix, digest)
-		 SELECT id, $2, $3 FROM tenants WHERE id = $1 AND disabled_at IS NULL
+		 SELECT id, $2, $3 FROM tenants WHERE id = $1 AND disabled_at IS NULL FOR SHARE
 		 RETURNING id, tenant_id, prefix, created_at, revoked_at`,
 		tenantID, prefix, digest[:]).Scan(&k.ID, &k.TenantID, &k.Prefix, &k.CreatedAt, &k.RevokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -260,7 +265,12 @@ func validName(name string) bool {
 	if name == "" || len(name) > maxNameLen || !utf8.ValidString(name) || strings.TrimSpace(name) != name {
 		return false
 	}
-	return !strings.ContainsFunc(name, unicode.IsControl)
+	return !strings.ContainsFunc(name, func(r rune) bool {
+		// IsPrint rules out control characters and every space but U+0020.
+		// Format characters (bidi overrides, zero-width characters) could
+		// make one tenant's name look like another's in a listing.
+		return !unicode.IsPrint(r) || unicode.Is(unicode.Cf, r)
+	})
 }
 
 // validUUID reports whether id is a UUID in its canonical text form, so a

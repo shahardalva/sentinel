@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -105,14 +106,40 @@ func TestLoadMigrations_Embedded(t *testing.T) {
 }
 
 func TestLoadMigrations_Rejects(t *testing.T) {
-	for name, fsys := range map[string]fstest.MapFS{
-		"gap":      {"migrations/0001_a.sql": {}, "migrations/0003_c.sql": {}},
-		"bad name": {"migrations/1_a.sql": {}},
-		"not one":  {"migrations/0002_b.sql": {}},
-		"empty":    {"migrations/.keep": {}},
+	for name, tc := range map[string]struct {
+		fsys fstest.MapFS
+		want string
+	}{
+		"gap":        {fstest.MapFS{"migrations/0001_a.sql": {}, "migrations/0003_c.sql": {}}, "want version 2"},
+		"bad name":   {fstest.MapFS{"migrations/1_a.sql": {}}, "bad migration file name"},
+		"other file": {fstest.MapFS{"migrations/0001_a.sql": {}, "migrations/.keep": {}}, "bad migration file name"},
+		"not one":    {fstest.MapFS{"migrations/0002_b.sql": {}}, "want version 1"},
+		"empty dir":  {fstest.MapFS{"migrations": {Mode: fs.ModeDir}}, "no migrations"},
 	} {
-		if _, err := loadMigrations(fsys); err == nil {
-			t.Errorf("%s: no error", name)
+		_, err := loadMigrations(tc.fsys)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want one containing %q", name, err, tc.want)
+		}
+	}
+}
+
+// Only an *Error or a bare sentinel passes through as is. Anything that
+// merely wraps one could carry other text, so it is sanitized too.
+func TestSanitize_PassesThroughOnlyItsOwnErrors(t *testing.T) {
+	own := &Error{Op: "op", desc: "x"}
+	if got := sanitize("other", own); got != own {
+		t.Errorf("an *Error became %v", got)
+	}
+	if got := sanitize("other", ErrNotFound); got != ErrNotFound {
+		t.Errorf("a bare sentinel became %v", got)
+	}
+	for _, wrapped := range []error{
+		fmt.Errorf("host db.internal user admin: %w", ErrNotFound),
+		fmt.Errorf("host db.internal user admin: %w", own),
+	} {
+		got := sanitize("op", wrapped)
+		if strings.Contains(got.Error(), "db.internal") || strings.Contains(got.Error(), "admin") {
+			t.Errorf("sanitize(%q) = %q, kept the wrapper's text", wrapped, got)
 		}
 	}
 }
@@ -144,9 +171,47 @@ func TestValidName(t *testing.T) {
 		strings.Repeat("a", 200):        true,
 		strings.Repeat("a", 201):        false,
 		string([]byte{0xff, 0xfe, 'a'}): false,
+		"Caf\u00e9 Z\u00fcrich":         true,
+		"\u65e5\u672c":                  true,
+		"acme\u202egnp":                 false, // right-to-left override
+		"ac\u200bme":                    false, // zero-width space
+		"ac\u2060me":                    false, // word joiner
+		"ac\ufeffme":                    false, // byte order mark
+		"ac\u00a0me":                    false, // no-break space, not IsPrint
+		"ac\u2028me":                    false, // line separator
 	} {
 		if got := validName(name); got != want {
 			t.Errorf("validName(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// A migration that fails halfway leaves nothing of itself behind: the
+// database stays at the version before it.
+func TestMigrate_FailedMigrationAppliesNothing(t *testing.T) {
+	_, u := NewSchemaForTest(t)
+	ctx := context.Background()
+	s, err := Open(ctx, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	fsys := fstest.MapFS{
+		"migrations/0001_first.sql":  {Data: []byte(`CREATE TABLE first (x int);`)},
+		"migrations/0002_broken.sql": {Data: []byte(`CREATE TABLE half (x int); INSERT INTO first VALUES (1); SELECT 1/0;`)},
+	}
+	err = s.migrate(ctx, fsys)
+	var se *Error
+	if !errors.As(err, &se) || se.Code != "22012" {
+		t.Fatalf("migrate = %v, want a *Error with SQLSTATE 22012 (division by zero)", err)
+	}
+	if v, err := s.SchemaVersion(ctx); err != nil || v != 1 {
+		t.Fatalf("SchemaVersion = %d, %v; want 1", v, err)
+	}
+	if n, err := CountForTest(ctx, s, `SELECT count(*) FROM first`); err != nil || n != 0 {
+		t.Errorf("first has %d rows (%v): 0002's insert was kept", n, err)
+	}
+	if n, err := CountForTest(ctx, s, `SELECT (to_regclass('half') IS NOT NULL)::int`); err != nil || n != 0 {
+		t.Errorf("table half exists (%d, %v): 0002's create was kept", n, err)
 	}
 }
