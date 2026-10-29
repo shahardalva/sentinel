@@ -31,6 +31,9 @@ services:
       # for the gateway without a database, and this file's environment
       # wins over that one's, key by key.
       SENTINEL_KEYS_REFRESH: ${SENTINEL_KEYS_REFRESH:-30s}
+      # How long the last good key set is served while Postgres can't be
+      # reached, before every request gets a 503; from .env, default 10m.
+      SENTINEL_KEYS_MAX_STALE: ${SENTINEL_KEYS_MAX_STALE:-10m}
       # Empty, so a SENTINEL_API_KEYS in .env (for make up-real) doesn't
       # stop startup: the gateway refuses keys from both places.
       SENTINEL_API_KEYS: ""

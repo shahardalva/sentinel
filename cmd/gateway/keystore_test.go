@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +144,90 @@ func TestLoadConfig_KeysRefresh(t *testing.T) {
 	if cfg.keysRefresh != 0 || len(cfg.keyWarnings) != 1 || !strings.HasPrefix(cfg.keyWarnings[0], "SENTINEL_KEYS_REFRESH is set") {
 		t.Errorf("refresh without a database: %s, warnings %q", cfg.keysRefresh, cfg.keyWarnings)
 	}
+}
+
+func TestParseKeysMaxStale(t *testing.T) {
+	refresh := 30 * time.Second
+	for in, want := range map[string]time.Duration{
+		"":     10 * time.Minute,
+		"0":    0,
+		"0s":   0,
+		"1m":   time.Minute, // twice the refresh
+		" 1h ": time.Hour,
+	} {
+		if got, err := parseKeysMaxStale(in, refresh); err != nil || got != want {
+			t.Errorf("parseKeysMaxStale(%q, 30s) = %s, %v; want %s", in, got, err, want)
+		}
+	}
+	// Under twice the refresh, a set refreshed on time could go stale
+	// between two refreshes.
+	for _, in := range []string{"-1m", "-0.5s", "10", "soon", "10 m", "29s", "30s", "59s"} {
+		if got, err := parseKeysMaxStale(in, refresh); err == nil {
+			t.Errorf("parseKeysMaxStale(%q, 30s) = %s, want an error", in, got)
+		}
+	}
+	if _, err := parseKeysMaxStale("-1m", refresh); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Errorf("parseKeysMaxStale(-1m) = %v, want it called negative", err)
+	}
+	// The default too: a refresh over 5m needs a max stale set.
+	if got, err := parseKeysMaxStale("", 6*time.Minute); err == nil || !strings.Contains(err.Error(), "set SENTINEL_KEYS_MAX_STALE") {
+		t.Errorf("default with a 6m refresh = %s, %v; want an error asking to set it", got, err)
+	}
+	if got, err := parseKeysMaxStale("0", 6*time.Minute); err != nil || got != 0 {
+		t.Errorf("0 with a 6m refresh = %s, %v; want 0", got, err)
+	}
+}
+
+func TestLoadConfig_KeysMaxStale(t *testing.T) {
+	cfg, err := loadConfig(env(dbBase))
+	if err != nil || cfg.keysMaxStale != 10*time.Minute {
+		t.Errorf("default: %s, %v; want 10m", cfg.keysMaxStale, err)
+	}
+	cfg, err = loadConfig(env(with(dbBase, map[string]string{"SENTINEL_KEYS_MAX_STALE": "0"})))
+	if err != nil || cfg.keysMaxStale != 0 {
+		t.Errorf("0: %s, %v; want 0, never expire", cfg.keysMaxStale, err)
+	}
+	for _, v := range []string{"-1m", "45s", "never"} {
+		wantConfigErr(t, with(dbBase, map[string]string{"SENTINEL_KEYS_MAX_STALE": v}), "SENTINEL_KEYS_MAX_STALE")
+	}
+	wantConfigErr(t, with(dbBase, map[string]string{"SENTINEL_KEYS_REFRESH": "10m"}), "SENTINEL_KEYS_MAX_STALE")
+	// Without a database it does nothing, so it is only warned about.
+	cfg, err = loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k", "SENTINEL_KEYS_MAX_STALE": "5m"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.keysMaxStale != 0 || len(cfg.keyWarnings) != 1 || !strings.HasPrefix(cfg.keyWarnings[0], "SENTINEL_KEYS_MAX_STALE is set") {
+		t.Errorf("max stale without a database: %s, warnings %q", cfg.keysMaxStale, cfg.keyWarnings)
+	}
+}
+
+// While the key store can't be reached for longer than the max stale, the
+// API answers 503 to every key, and serves again once it is back.
+func TestServe_StaleKeysAre503(t *testing.T) {
+	f := newFakeStore()
+	var down atomic.Bool
+	f.fetch = func(context.Context) ([][sha256.Size]byte, error) {
+		if down.Load() {
+			return nil, &store.Error{Op: "active digests"}
+		}
+		return [][sha256.Size]byte{sha256.Sum256([]byte("k"))}, nil
+	}
+	useStore(t, f, nil)
+	r := startServeWith(t, dbVars(t, "postgres://fake"), func(cfg *config) {
+		cfg.keysRefresh, cfg.keysMaxStale = 50*time.Millisecond, 300*time.Millisecond
+	})
+	waitStatus(t, r, "k", http.StatusOK)
+	down.Store(true)
+	waitStatus(t, r, "k", http.StatusServiceUnavailable)
+	if code := apiStatus(t, r, "wrong"); code != http.StatusServiceUnavailable {
+		t.Errorf("wrong key while stale: %d, want 503", code)
+	}
+	_, body := get(t, http.MethodGet, "http://"+r.metrics+"/metrics", nil)
+	if !strings.Contains(body, "sentinel_auth_keys_stale{") || !strings.Contains(body, "} 1\n") {
+		t.Errorf("scrape while stale has no sentinel_auth_keys_stale at 1")
+	}
+	down.Store(false)
+	waitStatus(t, r, "k", http.StatusOK)
 }
 
 func TestLoadConfig_AdminAddr(t *testing.T) {

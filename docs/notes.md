@@ -2,6 +2,43 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: v0.6.0 release blockers (review of PR #51)
+
+### Done (each test first, then the fix, then a mutation check)
+- SENTINEL_KEYS_MAX_STALE (default 10m, 0 never): past it since the last
+  good fetch, keys.Refreshing.Keys() returns proxy.UnavailableKeySet()
+  and proxy.Auth answers every request 503 (api_error), not 401. ERROR
+  once on entering, INFO once on recovering, from a request or a refresh,
+  whichever sees it first. Gauge sentinel_auth_keys_stale through a new
+  Recorder.RecordKeysStale. Config: negative, or under twice
+  SENTINEL_KEYS_REFRESH (the default too), stops startup; without a DB
+  only a WARN. Compose passes it like SENTINEL_KEYS_REFRESH.
+- Admin shutdown: the admin server stops accepting when shutdown starts,
+  alongside the API drain; after its 5 s grace and Close, admin.API.Drain
+  waits up to 6 s (StoreTimeout + 1 s) for handlers still in a store
+  call, so a committed change always gets its audit line before the pool
+  closes. A handler past that: WARN, pool left open (stop(closeStore)).
+- Admin in-flight cap: admin.MaxInFlight = store.MaxConns / 2 = 4, 503
+  with Retry-After: 1 at once past it, after the token check.
+  store.MaxConns = 8 set on the pool config, overriding pool_max_conns.
+- startupInterrupted: exit 0 only when the error is Canceled or
+  DeadlineExceeded and the signal ctx is done; ErrSchemaTooNew during a
+  signal is an error exit.
+
+### Decided
+- Stale travels in the KeySet (UnavailableKeySet), not a second
+  KeySource method or an error return: one call per request, one answer,
+  no change to Static or the fakes' Keys.
+- The max-stale floor is 2 x refresh, stricter than "at least the
+  refresh": a healthy refresh comes up to refresh + fetch timeout (<= 1.5
+  x refresh) after the last, so anything less could go stale with nothing
+  failing. keys.NewRefreshing enforces the exact bound.
+- Admin cap is a constant derived from the pool size, not configurable.
+- 503s for stale keys aren't auth rejections; no per-request counter.
+
+### Next
+- Grafana panel and an alert rule for sentinel_auth_keys_stale.
+
 ## 2026-10-27: gateway wiring (Postgres keys, PR 1d)
 
 ### Done

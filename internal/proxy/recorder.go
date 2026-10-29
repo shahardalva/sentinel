@@ -30,6 +30,12 @@ type Recorder interface {
 	// failed refresh, which kept the last good set. A source that never
 	// refreshes never calls it. Nothing about the error is passed on.
 	RecordKeyRefresh(ctx context.Context, ok bool)
+	// RecordKeysStale is called by a key source with a staleness limit
+	// once when it starts, with false, and then on every change: true when
+	// its last good set has grown too old and it serves UnavailableKeySet,
+	// false when a refresh brings a fresh one. A source without a limit
+	// never calls it.
+	RecordKeysStale(ctx context.Context, stale bool)
 }
 
 // RequestInfo summarizes one request for a Recorder. Every field is from a

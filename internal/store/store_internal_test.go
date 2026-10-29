@@ -215,3 +215,25 @@ func TestMigrate_FailedMigrationAppliesNothing(t *testing.T) {
 		t.Errorf("table half exists (%d, %v): 0002's create was kept", n, err)
 	}
 }
+
+// The pool's size is MaxConns whatever the connection string says, so
+// admin.MaxInFlight always leaves connections for the key refresh.
+func TestPoolConfig_MaxConns(t *testing.T) {
+	for _, conn := range []string{
+		"postgres://u@db.invalid/keys",
+		"postgres://u@db.invalid/keys?pool_max_conns=1",
+		"postgres://u@db.invalid/keys?pool_max_conns=100",
+		"host=db.invalid user=u dbname=keys pool_max_conns=2",
+	} {
+		cfg, err := poolConfig(conn)
+		if err != nil {
+			t.Fatalf("%s: %v", conn, err)
+		}
+		if cfg.MaxConns != MaxConns {
+			t.Errorf("%s: MaxConns %d, want %d", conn, cfg.MaxConns, MaxConns)
+		}
+	}
+	if _, err := poolConfig("postgres://u@db.invalid:notaport/keys"); err == nil || strings.Contains(err.Error(), "db.invalid") {
+		t.Errorf("bad connection string: %v, want a sanitized error", err)
+	}
+}

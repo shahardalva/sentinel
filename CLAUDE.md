@@ -16,7 +16,8 @@ tool policies, and writes an audit log.
 - Metrics: OpenTelemetry in internal/telemetry, exposed with the OTel
   Prometheus exporter (built on prometheus/client_golang). The core calls a
   proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401,
-  RecordKeySetSize and RecordKeyRefresh from the key source) and never
+  RecordKeySetSize, RecordKeyRefresh and RecordKeysStale from the key
+  source) and never
   imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only from
   closed sets: never the client key, its digest, the model or the path.
   The key metrics have no labels: one key source per process.
@@ -27,8 +28,11 @@ tool policies, and writes an audit log.
   set rejects everything. internal/keys implements it: Static (from
   SENTINEL_API_KEYS, without a database) and Refreshing (a Fetch of digests on an
   interval, atomic swap, last good set kept on failure, first fetch must
-  succeed within FetchTimeout). A Fetch must honor ctx and return errors
-  safe to log. internal/proxy never imports internal/keys or a DB package.
+  succeed within FetchTimeout; MaxStale: past it since the last good
+  fetch, Keys() returns proxy.UnavailableKeySet() and Auth answers every
+  request 503, ERROR once in, INFO once out). A Fetch must honor ctx and
+  return errors safe to log. internal/proxy never imports internal/keys
+  or a DB package.
 - Key store: internal/store, Postgres via pgx/pgxpool, no sqlc
   (docs/adr/0005-postgres-client-keys.md). Tenants and api_keys (UUID ids,
   only SHA-256 digests, nothing deleted: disabled_at, revoked_at).
@@ -45,15 +49,20 @@ tool policies, and writes an audit log.
   and Migrate (30 s, automatic on every start), then keys.NewRefreshing
   on ActiveDigests with the Recorder, all before any listener binds; any
   failure stops startup, except that a signal during them logs INFO
-  "startup interrupted" and returns nil. It sees the store as a keyStore
+  "startup interrupted" and returns nil (only when the error is Canceled
+  or DeadlineExceeded and the signal ctx is done). It sees the store as a keyStore
   interface (openStore is a var, so tests use a fake). The refresh ctx is not the
-  signal's; shutdown: API, admin (5 s, WARN if cut), metrics, then cancel
-  the refresh, wait for Done (5 s; if it doesn't stop, WARN and leave the
-  pool open), close the pool. Compose connects as the image's superuser;
+  signal's; shutdown: admin stops accepting at once, alongside the API
+  drain (30 s), then admin.API.Drain waits for its handlers (5 s grace,
+  WARN if cut, then up to 6 s; still running: WARN, pool left open);
+  metrics, then cancel the refresh, wait for Done (5 s; if it doesn't
+  stop, WARN and leave the pool open), close the pool. Compose connects as the image's superuser;
   production: a migration role and a runtime role without CREATE (ADR
-  0005, Database roles). Admin and refresh share one pool.
+  0005, Database roles). Admin and refresh share one pool of
+  store.MaxConns = 8 (overrides pool_max_conns); admin.MaxInFlight =
+  MaxConns/2 = 4, past it a 503 with Retry-After at once.
 - Admin API: internal/admin, New(Config{Store, Token, Logger})
-  http.Handler over an admin.Store interface (*store.Store satisfies it),
+  *admin.API (an http.Handler with Drain) over an admin.Store interface (*store.Store satisfies it),
   on its own listener (SENTINEL_ADMIN_ADDR, like the metrics one; its
   http.Server has DisableGeneralOptionsHandler), never the API port.
   Bearer token checked first (constant-time over SHA-256 digests; same
@@ -164,6 +173,11 @@ tool policies, and writes an audit log.
 - SENTINEL_KEYS_REFRESH (optional): key fetch interval with a database,
   Go duration, default 30s, at least 1s (revocation latency). Set without
   a database: one WARN, ignored.
+- SENTINEL_KEYS_MAX_STALE (optional): how long the last good key set is
+  served while refreshes fail, default 10m, 0 never expires. Past it every
+  request gets 503 (sentinel_auth_keys_stale 1). Negative or under twice
+  SENTINEL_KEYS_REFRESH (the default too) stops startup. Set without a
+  database: one WARN, ignored.
 - SENTINEL_ADMIN_ADDR (optional): admin API listener, default
   127.0.0.1:9465 with a database, "off" disables. Same parsing as the
   metrics addr; port must differ from the API's and the metrics' (port 0
@@ -225,7 +239,8 @@ tool policies, and writes an audit log.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY, OPENAI_API_KEY,
 OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_*, SENTINEL_API_KEYS (make
-up-real only), SENTINEL_ADMIN_TOKEN and SENTINEL_KEYS_REFRESH from .env
+up-real only), SENTINEL_ADMIN_TOKEN, SENTINEL_KEYS_REFRESH and SENTINEL_KEYS_MAX_STALE
+from .env
 (copy .env.example, which leaves the keys empty; .env is gitignored), and
 SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
@@ -252,8 +267,9 @@ postgres-data, TCP pg_isready healthcheck the gateway waits on, hardened,
 user postgres, dev-only password sentinel-dev-only in the compose file),
 SENTINEL_API_KEYS="", SENTINEL_ADMIN_ADDR=0.0.0.0:9465 published on
 127.0.0.1:9465 only, and SENTINEL_ADMIN_TOKEN=${SENTINEL_ADMIN_TOKEN:?} and
-SENTINEL_KEYS_REFRESH=${SENTINEL_KEYS_REFRESH:-30s}; the base gateway
-blanks both, so make up-real never gets the token. gateway-bench keeps
+SENTINEL_KEYS_REFRESH=${SENTINEL_KEYS_REFRESH:-30s} and
+SENTINEL_KEYS_MAX_STALE=${SENTINEL_KEYS_MAX_STALE:-10m}; the base gateway
+blanks all three, so make up-real never gets the token. gateway-bench keeps
 env keys. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
 copies the server key into a volume as a file owned by the nonroot user

@@ -65,6 +65,7 @@ services:
       # overrides env_file.
       SENTINEL_ADMIN_TOKEN: ""
       SENTINEL_KEYS_REFRESH: ""
+      SENTINEL_KEYS_MAX_STALE: ""
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:

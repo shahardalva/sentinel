@@ -71,6 +71,7 @@ type fakeRecorder struct {
 	mu        sync.Mutex
 	sizes     []int
 	refreshes []bool
+	stale     []bool
 }
 
 func (f *fakeRecorder) RecordRequest(context.Context, proxy.RequestInfo) {}
@@ -86,6 +87,18 @@ func (f *fakeRecorder) RecordKeyRefresh(_ context.Context, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshes = append(f.refreshes, ok)
+}
+
+func (f *fakeRecorder) RecordKeysStale(_ context.Context, stale bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stale = append(f.stale, stale)
+}
+
+func (f *fakeRecorder) staleReports() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.stale)
 }
 
 func (f *fakeRecorder) got() ([]int, []bool) {
@@ -137,6 +150,11 @@ func (r *recorderTee) RecordKeySetSize(ctx context.Context, n int) {
 func (r *recorderTee) RecordKeyRefresh(ctx context.Context, ok bool) {
 	r.Metrics.RecordKeyRefresh(ctx, ok)
 	r.fake.RecordKeyRefresh(ctx, ok)
+}
+
+func (r *recorderTee) RecordKeysStale(ctx context.Context, stale bool) {
+	r.Metrics.RecordKeysStale(ctx, stale)
+	r.fake.RecordKeysStale(ctx, stale)
 }
 
 // refreshAge scrapes m and returns sentinel_auth_key_refresh_age_seconds.
@@ -584,6 +602,11 @@ func TestNewRefreshing_RejectsBadConfig(t *testing.T) {
 			"timeout equals interval":  {Fetch: fetch, Interval: interval, FetchTimeout: interval},
 			"timeout above interval":   {Fetch: fetch, Interval: interval, FetchTimeout: 2 * interval},
 			"default timeout rounds 0": {Fetch: fetch, Interval: time.Nanosecond},
+			"negative max stale":       {Fetch: fetch, Interval: interval, MaxStale: -time.Second},
+			// A healthy cycle is up to Interval plus FetchTimeout (10 s here)
+			// apart, so a MaxStale within that would go stale between them.
+			"max stale under interval": {Fetch: fetch, Interval: interval, MaxStale: interval / 2},
+			"max stale one cycle":      {Fetch: fetch, Interval: interval, MaxStale: interval + 10*time.Second},
 		} {
 			if r, err := keys.NewRefreshing(t.Context(), cfg); r != nil || err == nil {
 				t.Errorf("%s: NewRefreshing = %v, %v; want an error", name, r, err)
@@ -848,4 +871,173 @@ func TestRefreshing_NoFetchAfterCancel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// logLines returns every line in logs at level, decoded.
+func logLines(t *testing.T, logs *logBuffer, level string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatal(err)
+		}
+		if m["level"] == level {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// Refreshes failing for longer than MaxStale make every request a 503,
+// valid key or not: a revoked key must not stay valid for as long as the
+// key store is down. One ERROR on entering, one INFO on recovering, and
+// the stale gauge follows.
+func TestRefreshing_MaxStale(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var logs logBuffer
+		rec := &fakeRecorder{}
+		f := &fakeFetch{set: digests("k")}
+		const maxStale = 3 * time.Minute
+		r, err := keys.NewRefreshing(ctx, keys.Config{
+			Fetch:    f.fetch,
+			Interval: interval,
+			MaxStale: maxStale,
+			Logger:   slog.New(slog.NewJSONHandler(&logs, nil)),
+			Recorder: rec,
+			Now:      bubbleClock(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := gate(r)
+
+		f.serve(nil, errors.New("store down"))
+		time.Sleep(maxStale) // three failed refreshes; the last success is exactly maxStale ago
+		synctest.Wait()
+		if got := status(h, "k"); got != http.StatusOK {
+			t.Errorf("at max stale: %d, want 200 (the last good set)", got)
+		}
+		time.Sleep(time.Nanosecond)
+		for _, key := range []string{"k", "wrong", ""} {
+			if got := status(h, key); got != http.StatusServiceUnavailable {
+				t.Errorf("past max stale, key %q: %d, want 503", key, got)
+			}
+		}
+		if !r.Keys().Unavailable() {
+			t.Error("Keys() past max stale is not unavailable")
+		}
+		errs := logLines(t, &logs, "ERROR")
+		if len(errs) != 1 || errs[0]["msg"] != "client keys are stale; rejecting every request with 503" ||
+			errs[0]["max_stale"] != maxStale.String() {
+			t.Fatalf("ERROR lines = %v, want one stale line with max_stale", errs)
+		}
+		if got := rec.staleReports(); !slices.Equal(got, []bool{false, true}) {
+			t.Errorf("stale reports %v, want [false true]", got)
+		}
+
+		// Still failing: still 503, and no second ERROR.
+		time.Sleep(5 * interval)
+		synctest.Wait()
+		if got := status(h, "k"); got != http.StatusServiceUnavailable {
+			t.Errorf("still stale: %d, want 503", got)
+		}
+		if n := len(logLines(t, &logs, "ERROR")); n != 1 {
+			t.Errorf("%d ERROR lines, want 1", n)
+		}
+
+		// A refresh that succeeds ends it.
+		f.serve(digests("k2"), nil)
+		time.Sleep(interval)
+		synctest.Wait()
+		if status(h, "k2") != http.StatusOK || status(h, "k") != http.StatusUnauthorized {
+			t.Error("after recovery: want the new set served")
+		}
+		infos := 0
+		for _, l := range logLines(t, &logs, "INFO") {
+			if l["msg"] == "client keys are fresh again; accepting requests" {
+				infos++
+			}
+		}
+		if infos != 1 {
+			t.Errorf("%d recovery INFO lines, want 1:\n%s", infos, logs.String())
+		}
+		if got := rec.staleReports(); !slices.Equal(got, []bool{false, true, false}) {
+			t.Errorf("stale reports %v, want [false true false]", got)
+		}
+
+		cancel()
+		<-r.Done()
+	})
+}
+
+// With no request coming in, a failed refresh is what notices the set has
+// gone stale, so the ERROR and the gauge don't wait for traffic.
+func TestRefreshing_MaxStaleWithoutTraffic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var logs logBuffer
+		rec := &fakeRecorder{}
+		f := &fakeFetch{set: digests("k")}
+		r, err := keys.NewRefreshing(ctx, keys.Config{
+			Fetch: f.fetch, Interval: interval, MaxStale: 3 * time.Minute,
+			Logger: slog.New(slog.NewJSONHandler(&logs, nil)), Recorder: rec, Now: bubbleClock(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.serve(nil, errors.New("store down"))
+		time.Sleep(4 * interval) // the 4th failure is past max stale
+		synctest.Wait()
+		if n := len(logLines(t, &logs, "ERROR")); n != 1 {
+			t.Errorf("%d ERROR lines without traffic, want 1", n)
+		}
+		if got := rec.staleReports(); !slices.Equal(got, []bool{false, true}) {
+			t.Errorf("stale reports %v, want [false true]", got)
+		}
+
+		// Nor does the recovery wait for a request.
+		f.serve(digests("k"), nil)
+		time.Sleep(interval)
+		synctest.Wait()
+		if n := len(logLines(t, &logs, "INFO")); n != 1 {
+			t.Errorf("%d INFO lines without traffic, want the recovery's", n)
+		}
+		if got := rec.staleReports(); !slices.Equal(got, []bool{false, true, false}) {
+			t.Errorf("stale reports %v, want [false true false]", got)
+		}
+		cancel()
+		<-r.Done()
+	})
+}
+
+// MaxStale 0 keeps the last good set however long refreshes fail.
+func TestRefreshing_MaxStaleZeroNeverExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		rec := &fakeRecorder{}
+		f := &fakeFetch{set: digests("k")}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: f.fetch, Interval: interval, Recorder: rec})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.serve(nil, errors.New("store down"))
+		time.Sleep(24 * time.Hour)
+		synctest.Wait()
+		if got := status(gate(r), "k"); got != http.StatusOK {
+			t.Errorf("after a day of failures with MaxStale 0: %d, want 200", got)
+		}
+		if got := rec.staleReports(); len(got) != 0 {
+			t.Errorf("stale reports %v with MaxStale 0, want none", got)
+		}
+		cancel()
+		<-r.Done()
+	})
 }
