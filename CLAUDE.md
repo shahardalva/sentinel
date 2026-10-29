@@ -249,7 +249,14 @@ tool policies, and writes an audit log.
   for 5s and applies the fail mode at once, then lets one request try
   again; opening and closing are logged. Only that probe can close it.
   When every Redis connection stays busy for the 50 ms, the request gets
-  the fail mode but the breaker doesn't count it. A client that disconnects
+  the fail mode but the breaker doesn't count it. The 50 ms is the call's
+  context; new connections are dialed outside it (ratelimit.PoolDialTimeout
+  2 s per attempt), and the pool keeps ratelimit.MinIdleConns (16, at most
+  the pool size) open. At startup, after the ping, ratelimit.WarmUp sets
+  them up (PING on each, at most 5 s): INFO "redis pool warm" ready=N, or
+  WARN "redis pool warm-up incomplete" with ready and want, and startup
+  goes on; a failed ping skips it. NewClient disables go-redis maint
+  notifications (auto mode races across concurrent Conn handshakes). A client that disconnects
   during the check is logged as 499, not as a Redis failure.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY, OPENAI_API_KEY,

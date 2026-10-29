@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
@@ -18,6 +20,23 @@ import (
 // DefaultTimeout bounds each Redis call, so a slow or unreachable Redis
 // adds at most this much to a request.
 const DefaultTimeout = 50 * time.Millisecond
+
+// PoolDialTimeout bounds each attempt to set up a new pool connection: the
+// DNS lookup, TCP and, for rediss://, TLS. go-redis dials on a goroutine of
+// its own, never under a call's context, so this is not part of a call's
+// budget: a call that has to wait for a new connection still gives up at
+// its own timeout, and the dial goes on to fill the pool. 2 s covers a
+// cold dial on a slow network or a retried DNS query; a dead Redis keeps a
+// dial goroutine at most this long per attempt (go-redis tries 5 times).
+const PoolDialTimeout = 2 * time.Second
+
+// MinIdleConns is how many connections the pool keeps open, so a burst of
+// calls finds them dialed instead of setting them up within its timeout.
+// At 1000 req/s and a Redis round trip of about 1 ms, one or two calls are
+// in flight at once; 5 ms under load makes it 5. 16 leaves room for bursts
+// (a load test starting, Poisson arrivals) for 16 idle sockets per gateway.
+// The pool size caps it.
+const MinIdleConns = 16
 
 const keyPrefix = "sentinel:ratelimit:"
 
@@ -123,9 +142,12 @@ func New(cfg Config) (*Limiter, error) {
 
 // NewClient returns a Redis client for url (redis:// or rediss://) whose
 // calls honor context deadlines, so Limiter's timeout bounds every call,
-// including dialing. poolSize caps its connections; zero keeps go-redis's
-// default of 10 per CPU. Pass at least the number of requests expected to
-// check their limit at once, or the extra ones get ErrBusy.
+// including one waiting for a new connection. New connections are dialed
+// outside that budget, under PoolDialTimeout, and the pool keeps
+// MinIdleConns of them open; WarmUp waits for them. poolSize caps its
+// connections; zero keeps go-redis's default of 10 per CPU. Pass at least
+// the number of requests expected to check their limit at once, or the
+// extra ones get ErrBusy.
 func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
@@ -135,15 +157,55 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 		timeout = DefaultTimeout
 	}
 	opts.ContextTimeoutEnabled = true
-	opts.DialTimeout = timeout
+	opts.DialTimeout = PoolDialTimeout
 	opts.ReadTimeout = timeout
 	opts.WriteTimeout = timeout
 	opts.PoolTimeout = timeout
+	opts.MinIdleConns = MinIdleConns
 	if poolSize > 0 {
 		opts.PoolSize = poolSize
+		opts.MinIdleConns = min(MinIdleConns, poolSize)
 	}
 	opts.DisableIdentity = true // skip CLIENT SETINFO on connect
+	// Maintenance notifications are a Redis Cloud and Enterprise feature.
+	// In go-redis's default "auto" mode every new connection asks for them,
+	// and on a Redis without them the first refusal switches the mode off in
+	// the client's Options, which every Conn shares under a lock of its own:
+	// a data race when WarmUp's connections handshake at once.
+	opts.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
 	return redis.NewClient(opts), nil
+}
+
+// WarmUp sets up the client's MinIdleConns connections and sends a PING on
+// each, so they are dialed and past the handshake (HELLO, AUTH, SELECT)
+// before the first request needs them. go-redis starts those dials in the
+// background when the client is created but never waits for them, and the
+// handshake would otherwise run within a request's timeout. It returns how
+// many connections are ready; fewer than MinIdleConns means ctx ended or
+// Redis failed first, and err is the first failure. Call it once at
+// startup, before serving.
+func WarmUp(ctx context.Context, client *redis.Client) (int, error) {
+	// All held at once, so each PING gets a connection of its own; Close
+	// returns them to the pool.
+	conns := make([]*redis.Conn, client.Options().MinIdleConns)
+	errs := make([]error, len(conns))
+	var wg sync.WaitGroup
+	for i := range conns {
+		conns[i] = client.Conn()
+		wg.Go(func() { errs[i] = conns[i].Ping(ctx).Err() })
+	}
+	wg.Wait()
+	var ready int
+	var first error
+	for i, c := range conns {
+		c.Close()
+		if errs[i] == nil {
+			ready++
+		} else if first == nil {
+			first = errs[i]
+		}
+	}
+	return ready, first
 }
 
 // Allow takes a token from client's bucket. client identifies the caller and

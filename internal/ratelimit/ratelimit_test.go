@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
@@ -286,8 +287,12 @@ func TestRouteClientLogs(t *testing.T) {
 	logs := new(syncBuffer)
 	ratelimit.RouteClientLogs(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { ratelimit.RouteClientLogs(slog.New(slog.NewTextHandler(io.Discard, nil))) })
-	l := limiterFor(t, "redis://127.0.0.1:1", 60, 200*time.Millisecond) // nothing listens
-	l.Allow(context.Background(), "client")
+	// NewClient's dials run in the background for up to PoolDialTimeout an
+	// attempt, so a failed dial would log after the test; this client
+	// fails its one dial attempt within the Ping.
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond, DialerRetries: 1}) // nothing listens
+	defer client.Close()
+	client.Ping(context.Background())
 	if out := logs.String(); !strings.Contains(out, `"level":"DEBUG"`) || !strings.Contains(out, `"component":"go-redis"`) {
 		t.Errorf("go-redis output not routed to the logger at DEBUG: %q", out)
 	}
