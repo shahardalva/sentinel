@@ -274,7 +274,7 @@ All configuration comes from environment variables. Secrets are never read from 
 | `SENTINEL_UPSTREAM_CA_FILE` | No | | PEM file of extra CA certificates to trust for the upstream connections, added to the system trust store. For a private or dev CA (see `cmd/devcerts`). Applies to every enabled upstream. Every PEM block must be a valid certificate; the gateway refuses to start if the file is missing, holds none, or holds anything else. The CAs are trusted for whatever hosts the base URLs name, including the defaults; the gateway logs a warning for each enabled upstream left on its public default (`api.anthropic.com`, `api.openai.com`), since anyone holding the CA's key could then impersonate that API. Does not relax the `https` rule. |
 | `SENTINEL_REDIS_URL` | No | | Redis for per-key rate limiting, as `redis://[:password@]host:port/db` or `rediss://` for TLS. Unset turns rate limiting off, and the gateway logs that at startup. A malformed URL stops startup. An unreachable Redis at startup is only a warning. |
 | `SENTINEL_RATE_LIMIT_RPM` | No | `60` | Requests per minute per client key. Also the burst: a full bucket holds a minute's worth. Must be a positive integer. |
-| `SENTINEL_RATE_LIMIT_FAIL_MODE` | No | `open` | What happens when Redis can't answer within 50 ms. `open` lets the request through and logs a `WARN`, at most once per 10 seconds. `closed` answers `503`. After 5 failures in a row, a circuit breaker skips Redis for 5 seconds and applies the fail mode at once, then lets one request try Redis again. See [ADR 0002](docs/adr/0002-rate-limiting.md). |
+| `SENTINEL_RATE_LIMIT_FAIL_MODE` | No | `open` | What happens when Redis can't answer within 50 ms. `open` lets the request through and logs a `WARN`, at most once per 10 seconds. `closed` answers `503`. After 5 failures in a row, a circuit breaker skips Redis for 5 seconds and applies the fail mode at once, then lets one request try Redis again. A call that fails only because a pooled connection was closed, as all of them are after a Redis restart, gets the fail mode but doesn't count. See [ADR 0002](docs/adr/0002-rate-limiting.md). |
 
 An upstream key that is set while its upstream is not listed, such as `OPENAI_API_KEY` with the default list, is not used; the gateway logs a `WARN` saying so at startup.
 
@@ -288,7 +288,7 @@ Built-in limits:
 | Concurrent upstream requests | 128 (`SENTINEL_MAX_CONCURRENT`) | Bounds memory and upstream connections |
 | Rate limit | 60 requests/min per key (`SENTINEL_RATE_LIMIT_RPM`) | Stops one key from using the whole budget. Off without `SENTINEL_REDIS_URL` |
 | Redis call timeout | 50 ms | A slow Redis adds at most this much to a request |
-| Redis pool | 16 idle connections, 2 s per dial | Set up at startup, before serving (at most 5 s), and kept open, so requests don't dial within their 50 ms |
+| Redis warm-up | 16 connections, 2 s per dial | Set up at startup, before serving (at most 5 s), so the first requests don't dial within their 50 ms |
 | Body read timeout | 2 min | Bounds slow uploads |
 | Time to first byte | 10 min | Non-streaming requests send nothing until generation finishes |
 | Stream idle timeout | 60 s | Aborts a stream that stops producing data |
@@ -608,7 +608,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - a mid-stream upstream failure and a client disconnect mid-stream
 - oversized bodies, declared and actual, and a slow body that must not hold a slot
 - the concurrency cap returning `503`
-- rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, a burst right after startup against a Redis whose connections take longer than the timeout to set up (all succeed once the pool is warmed), a warm-up cut off by its bound, and the circuit breaker opening, probing and closing
+- rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, a burst right after startup against a Redis whose connections take longer than the timeout to set up (all succeed once the pool is warmed), a warm-up cut off by its bound or a signal, a Redis restart under a warm TLS pool not opening the breaker, and the circuit breaker opening, probing and closing
 - the upstream rejecting the gateway's key
 - response header filtering and `anthropic-version` validation
 - a stub provider that breaks its contract (no response, no body, a `1xx` or `3xx` status, a status over `599`) answered with `502`, its body closed; `RequestError` statuses outside `4xx`, and `401`, `407`, `429` and `499`, becoming `400`; hop-by-hop headers, including ones named in `Connection`, stripped whatever the provider returns; and a provider's lowercase `x-request-id` never reaching the client beside the gateway's own

@@ -31,7 +31,7 @@ func newLimiter(t *testing.T, perMinute int) (*ratelimit.Limiter, *miniredis.Min
 
 func limiterFor(t *testing.T, url string, perMinute int, timeout time.Duration) *ratelimit.Limiter {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, timeout, 0)
+	client, err := ratelimit.NewClient(url, timeout, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +299,7 @@ func TestRouteClientLogs(t *testing.T) {
 }
 
 func TestNew_Validates(t *testing.T) {
-	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0, 0)
+	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestNew_Validates(t *testing.T) {
 	if _, err := ratelimit.New(ratelimit.Config{PerMinute: 60}); err == nil {
 		t.Error("New with no client: no error")
 	}
-	if _, err := ratelimit.NewClient("http://example.com", 0, 0); err == nil {
+	if _, err := ratelimit.NewClient("http://example.com", 0, 4); err == nil {
 		t.Error("NewClient with an http URL: no error")
 	}
 }

@@ -425,7 +425,7 @@ func TestParseFailMode(t *testing.T) {
 	}
 }
 
-func TestLogRateLimit(t *testing.T) {
+func TestStartRateLimit(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	cfg, err := loadConfig(env(map[string]string{
@@ -437,7 +437,7 @@ func TestLogRateLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cfg.redis.Close()
-	logRateLimit(logger, cfg)
+	startRateLimit(context.Background(), logger, cfg)
 	out := buf.String()
 	for _, want := range []string{"rate limiting enabled", "rpm=60", "fail_mode=open", "redis not reachable"} {
 		if !strings.Contains(out, want) {

@@ -387,7 +387,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		opts.RateLimiter = limiter
 		opts.RateLimitFailClosed = cfg.rateFailClosed
 		breakerOpen = limiter.BreakerOpen
-		logRateLimit(logger, cfg)
+		startRateLimit(ctx, logger, cfg)
 	}
 
 	var metrics *telemetry.Metrics
@@ -1194,16 +1194,18 @@ func parseFailMode(s string) (closed bool, err error) {
 }
 
 // redisWarmUpTimeout bounds the startup warm-up of the Redis pool: two of
-// ratelimit.PoolDialTimeout and some, so a dial can be retried once.
+// ratelimit.PoolDialTimeout and some, so a dial can be retried once. A var
+// so a test can shorten it.
 var redisWarmUpTimeout = 5 * time.Second
 
-// logRateLimit records the rate-limit settings, checks that Redis answers
-// and warms its pool, so the first requests don't have to set up
-// connections within their 50 ms. An unreachable Redis or an incomplete
-// warm-up is only a warning: Redis may still be starting, and the fail mode
-// decides what requests get until it is up. A failed ping skips the warm-up,
-// which could only wait out its timeout.
-func logRateLimit(logger *slog.Logger, cfg config) {
+// startRateLimit records the rate-limit settings, connects to Redis and
+// warms its pool with ratelimit.WarmConns connections, so the first
+// requests don't have to set them up within their 50 ms. An unreachable
+// Redis or an incomplete warm-up is only a warning: Redis may still be
+// starting, and the fail mode decides what requests get until it is up. A
+// failed ping skips the warm-up, which could only wait out its timeout.
+// Both stop when ctx is done, so a signal during startup isn't held up.
+func startRateLimit(ctx context.Context, logger *slog.Logger, cfg config) {
 	mode := "open"
 	if cfg.rateFailClosed {
 		mode = "closed"
@@ -1211,18 +1213,18 @@ func logRateLimit(logger *slog.Logger, cfg config) {
 	// Addr only: the URL may carry a password.
 	logger.Info("rate limiting enabled", "redis", cfg.redis.Options().Addr,
 		"rpm", cfg.rateRPM, "fail_mode", mode)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	pingCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	if err := cfg.redis.Ping(ctx).Err(); err != nil {
+	if err := cfg.redis.Ping(pingCtx).Err(); err != nil {
 		logger.Warn("redis not reachable at startup", "redis", cfg.redis.Options().Addr,
 			"fail_mode", mode, "error", err)
 		return
 	}
 
-	ctx, cancel = context.WithTimeout(context.Background(), redisWarmUpTimeout)
+	warmCtx, cancel := context.WithTimeout(ctx, redisWarmUpTimeout)
 	defer cancel()
-	want := cfg.redis.Options().MinIdleConns
-	if ready, err := ratelimit.WarmUp(ctx, cfg.redis); err != nil {
+	want := min(ratelimit.WarmConns, cfg.redis.Options().PoolSize)
+	if ready, err := ratelimit.WarmUp(warmCtx, cfg.redis, want); err != nil {
 		logger.Warn("redis pool warm-up incomplete", "redis", cfg.redis.Options().Addr,
 			"ready", ready, "want", want, "fail_mode", mode, "error", err)
 	} else {

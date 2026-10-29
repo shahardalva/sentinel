@@ -50,7 +50,7 @@ func breakerLimiter(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer) 
 // breakerLimiterClient is breakerLimiter, also returning its Redis client.
 func breakerLimiterClient(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer, *redis.Client) {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, breakerTimeout, 0)
+	client, err := ratelimit.NewClient(url, breakerTimeout, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,10 +99,9 @@ func TestBreaker_OpensAfterConsecutiveFailures(t *testing.T) {
 func TestBreaker_FewerFailuresStayClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 	addr := mr.Addr()
-	// Down before the client exists, so the pool's idle connections aren't
-	// left over from the first server. Linux drops such dead connections
-	// on Get; go-redis has no such check on Windows, where retrying the
-	// call on them can use up its timeout.
+	// Down before the client exists, so this tests only the count reset:
+	// no connection is left over from the first server. A restart under
+	// connections that are already open is TestBreaker_RestartUnderWarmPool.
 	mr.Close()
 	l, _, client := breakerLimiterClient(t, "redis://"+addr)
 	failN(t, l, ratelimit.BreakerThreshold-1)
@@ -122,6 +121,72 @@ func TestBreaker_FewerFailuresStayClosed(t *testing.T) {
 	}
 	mr.Close()
 	failN(t, l, ratelimit.BreakerThreshold-1)
+	if l.BreakerOpen() {
+		t.Error("breaker open after a success and fewer failures than the threshold")
+	}
+}
+
+// A Redis restart under a warm pool: every idle connection is dead, and
+// over TLS go-redis can't tell before using one (it checks a closed peer
+// only on a raw socket, and not at all on Windows). The calls that land on
+// one fail fast with a connection error, which says that connection is
+// gone, not that Redis is: they get the fail mode, but must not open the
+// breaker, or a healthy Redis would be skipped for a whole cooldown.
+func TestBreaker_RestartUnderWarmPool(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	url, open := tlsRedisConns(t, addr, 0)
+	client, err := ratelimit.NewClient(url, ratelimit.DefaultTimeout, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	logs := new(syncBuffer)
+	l, err := ratelimit.New(ratelimit.Config{Client: client, PerMinute: 1_000_000,
+		Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// go-redis tries a call on up to 4 connections (MaxRetries 3), so it
+	// takes more dead ones than BreakerThreshold calls can use up for
+	// counting them to open the breaker; a pool grown under load has that.
+	warmUp(t, client, 2*ratelimit.WarmConns)
+
+	mr.Close()
+	if err := mr.StartAddr(addr); err != nil {
+		t.Fatal(err)
+	}
+	// Like a Redis that exits: its clients' connections are closed at once.
+	waitFor(t, func() bool { return open.Load() == 0 })
+
+	var failed int
+	var last error
+	for range 4 * ratelimit.WarmConns {
+		if _, last = l.Allow(context.Background(), "client"); last != nil {
+			failed++
+		}
+		time.Sleep(10 * time.Millisecond) // a steady trickle of requests
+	}
+	if failed == 0 {
+		t.Error("no call hit a dead connection; the test did not exercise the restart")
+	}
+	if l.BreakerOpen() || strings.Contains(logs.String(), "redis circuit open") {
+		t.Errorf("breaker opened after a restart (%d calls failed):\n%s", failed, logs)
+	}
+	if last != nil {
+		t.Errorf("last call: %v; want the pool healed", last)
+	}
+}
+
+// waitFor polls cond until it holds, for at most 5 s.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestBreaker_ProbeAfterCooldownCloses(t *testing.T) {
