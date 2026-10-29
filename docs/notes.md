@@ -2,6 +2,39 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: bench results under benchverdict
+
+### Done
+- bench/RESULTS.md rewritten from two make bench / make bench-gateway
+  pairs, the first under the #42 check. Overhead p50 +0.6 to +1.0 ms at
+  100, 500 and 1000 req/s, p99 +1.0 to +2.8 ms, Redis call included.
+  README's Performance section has the p50/p99 table.
+- One of three gateway runs rejected: 2,190 fail_open, 2 breaker
+  openings, 914 dropped iterations. k6 passed every threshold on it.
+
+### Decided
+- Direct runs with only mockupstream up, not the whole make up stack:
+  the rejected run had it in the background, which overloaded the
+  machine. make bench-gateway already brings up only what it needs.
+- The 2026-10-23 tables are dropped from RESULTS.md, kept as a short
+  section with a link to the git history: host runs with another k6 and
+  no check on rate-limit decisions, so side by side they invite a
+  comparison the setups don't support.
+
+### Learned
+- p50 overhead now sits at 0.6 to 0.9 ms at 500 and 1000 req/s, where
+  the 2026-10-23 runs showed about 0. Consistent with the Redis call and
+  the extra Docker-network hop now in the path; not broken down, since
+  rate_limit_us wasn't collected.
+- One fast non-200 at 1000 req/s in an accepted run, counted as allowed:
+  fits a 503 at admission (cap 128, about 100 in flight). Status not
+  confirmed; gateway logs not kept.
+
+### Next
+- Keep gateway-bench's log after a run, so a failure's status and
+  rate_limit_us can be read.
+- #57 (breaker and the load-start stall), then the cap default.
+
 ## 2026-10-29: the load-start fail-open window is not a cold pool (#55)
 
 ### Learned (from a later make bench-gateway run)
