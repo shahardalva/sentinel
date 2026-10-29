@@ -18,6 +18,24 @@ type Recorder interface {
 	// given this Recorder (NewAuth(keys, logger, rec).Require). RequireKey
 	// passes none. Nothing about the presented key is passed on.
 	RecordAuthRejection(ctx context.Context)
+	// RecordKeySetSize is called by a key source with the number of digests
+	// in the set it now serves: once when it is built, and after every
+	// successful refresh. Nothing about the keys themselves is passed on.
+	// A process has one key source, so the key metrics have no source
+	// label, by design: a second source reporting to the same Recorder
+	// would overwrite the first's values.
+	RecordKeySetSize(ctx context.Context, n int)
+	// RecordKeyRefresh is called by a key source that refreshes, after its
+	// initial fetch succeeds and after every refresh; ok is false for a
+	// failed refresh, which kept the last good set. A source that never
+	// refreshes never calls it. Nothing about the error is passed on.
+	RecordKeyRefresh(ctx context.Context, ok bool)
+	// RecordKeysStale is called by a key source with a staleness limit
+	// once when it starts, with false, and then on every change: true when
+	// its last good set has grown too old and it serves UnavailableKeySet,
+	// false when a refresh brings a fresh one. A source without a limit
+	// never calls it.
+	RecordKeysStale(ctx context.Context, stale bool)
 }
 
 // RequestInfo summarizes one request for a Recorder. Every field is from a

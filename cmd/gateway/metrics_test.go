@@ -119,6 +119,7 @@ type running struct {
 	logs        *syncBuffer
 	api         string // host:port of the API listener
 	metrics     string // host:port of the metrics listener; empty if off
+	admin       string // host:port of the admin listener; empty if none
 	done        chan error
 	stop        context.CancelFunc
 	msgsInOrder []string
@@ -127,6 +128,14 @@ type running struct {
 // startServe runs serve for vars, with both listeners on free ports unless
 // vars says otherwise, and waits for the API's "listening" line.
 func startServe(t *testing.T, vars map[string]string) *running {
+	t.Helper()
+	return startServeWith(t, vars, nil)
+}
+
+// startServeWith is startServe with a hook that changes the config after
+// loadConfig, for settings tests need that the variables can't express,
+// such as a refresh interval under the minimum.
+func startServeWith(t *testing.T, vars map[string]string, change func(*config)) *running {
 	t.Helper()
 	all := map[string]string{
 		"ANTHROPIC_API_KEY":     "sk",
@@ -141,6 +150,9 @@ func startServe(t *testing.T, vars map[string]string) *running {
 	cfg, err := loadConfig(env(all))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if change != nil {
+		change(&cfg)
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	r := &running{logs: &syncBuffer{}, done: make(chan error, 1), stop: stop}
@@ -169,6 +181,8 @@ func startServe(t *testing.T, vars map[string]string) *running {
 			switch msg {
 			case "metrics listening":
 				r.metrics = addr
+			case "admin listening":
+				r.admin = addr
 			case "listening":
 				r.api = addr
 			}
@@ -238,10 +252,23 @@ func TestServe_MetricsOnTheirOwnListener(t *testing.T) {
 			t.Errorf("scrape has no %s:\n%s", want, body)
 		}
 	}
+	// The key set size comes from keys.Static through the Recorder: one
+	// key in SENTINEL_API_KEYS. A static source never refreshes, so it has
+	// no refresh age or error series.
+	var keysLine string
 	for line := range strings.SplitSeq(body, "\n") {
 		if strings.HasPrefix(line, "sentinel_auth_rejections_total{") && !strings.HasSuffix(line, "} 1") {
 			t.Errorf("auth rejections: %s, want 1", line)
 		}
+		if strings.HasPrefix(line, "sentinel_auth_keys{") {
+			keysLine = line
+		}
+	}
+	if !strings.HasSuffix(keysLine, "} 1") {
+		t.Errorf("key set size: %q, want a sentinel_auth_keys series at 1", keysLine)
+	}
+	if strings.Contains(body, "sentinel_auth_key_refresh_") {
+		t.Error("refresh age or error series served for a static key source")
 	}
 	if strings.Contains(body, "sentinel_ratelimit_breaker_open") {
 		t.Error("breaker gauge served with rate limiting off")

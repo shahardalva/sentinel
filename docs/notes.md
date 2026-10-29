@@ -2,6 +2,423 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: v0.6.0 polish (review of PR #51)
+
+### Done (behavioral items test first, then a mutation check)
+- Admin bind WARN: a SENTINEL_ADMIN_ADDR host other than localhost or a
+  loopback IP (empty, 0.0.0.0, ::, any other name) logs one WARN: plain
+  HTTP, so the token and new keys cross the network. Expected under
+  compose (0.0.0.0 in the container, published on 127.0.0.1 only).
+- TestServe_DatabaseURLNotLeaked: DNS failure and connection refused in
+  key=value form, which reach the connect path (the old bad port and bad
+  sslmode cases fail at parsing). Wrong user and password against
+  SENTINEL_TEST_POSTGRES_URL, gated on it.
+- SENTINEL_API_KEYS of only commas or spaces: "has no keys", not "is not
+  set".
+- Revocation latency docs: refresh plus up to two fetch timeouts. The
+  fetch timeout is min(refresh/2, 10 s), so at most 2 x refresh, 50 s with
+  the defaults (not 1.5 x / 45 s: the default caps it at 10 s, and the
+  read and the swap can each be a fetch timeout apart).
+- Grafana: "Key set stale" state timeline (0 fresh green, 1 stale red)
+  beside the other key panels, now four across.
+
+### Skipped
+- An extra SchemaVersion call after Migrate: startup only, two queries;
+  not worth folding into Migrate's result.
+
+### Next
+- alert on sentinel_auth_keys_stale; needs alerting infra (none yet).
+
+## 2026-10-29: v0.6.0 release blockers (review of PR #51)
+
+### Done (each test first, then the fix, then a mutation check)
+- SENTINEL_KEYS_MAX_STALE (default 10m, 0 never): past it since the last
+  good fetch, keys.Refreshing.Keys() returns proxy.UnavailableKeySet()
+  and proxy.Auth answers every request 503 (api_error), not 401. ERROR
+  once on entering, INFO once on recovering, from a request or a refresh,
+  whichever sees it first. Gauge sentinel_auth_keys_stale through a new
+  Recorder.RecordKeysStale. Config: negative, or under three times
+  SENTINEL_KEYS_REFRESH (the default too), stops startup; without a DB
+  only a WARN. Compose passes it like SENTINEL_KEYS_REFRESH.
+- Admin shutdown: the admin server stops accepting when shutdown starts,
+  alongside the API drain; after its 5 s grace and Close, admin.API.Drain
+  waits up to 6 s (StoreTimeout + 1 s) for handlers still in a store
+  call, so a committed change always gets its audit line before the pool
+  closes. A handler past that: WARN, pool left open (stop(closeStore)).
+- Admin in-flight cap: admin.MaxInFlight = store.MaxConns / 2 = 4, 503
+  with Retry-After: 1 at once past it, after the token check.
+  store.MaxConns = 8 set on the pool config, overriding pool_max_conns.
+- startupInterrupted: exit 0 only when the error is Canceled or
+  DeadlineExceeded and the signal ctx is done; ErrSchemaTooNew during a
+  signal is an error exit.
+
+### Decided
+- Stale travels in the KeySet (UnavailableKeySet), not a second
+  KeySource method or an error return: one call per request, one answer,
+  no change to Static or the fakes' Keys.
+- The max-stale floor is 3 x refresh (first 2 x, raised after review):
+  the fetch timeout is <= refresh/2, so after one failed refresh the next
+  success lands by 3 x refresh; with 2 x, a single failed refresh puts
+  every request on a 503. keys.NewRefreshing enforces 2 x (Interval +
+  FetchTimeout), the same bound for any fetch timeout.
+- Admin cap is a constant derived from the pool size, not configurable.
+- 503s for stale keys aren't auth rejections; no per-request counter.
+
+### After review (go-reviewer), tests first
+- S2: the stale log and gauge could stick at "stale" while fresh keys
+  were served: a request deciding "stale" under staleMu, paused before
+  recording it, while a refresh succeeded and its lock-free check saw
+  nothing to change. store() and refresh() now always recheck under
+  staleMu (recheckStale); requests keep the lock-free path. Test drives
+  the interleaving with two hooks (export_test.go), no sleeps.
+- S3: TestServe_StaleKeysAre503 reads the sentinel_auth_keys_stale line
+  itself (1 while stale, 0 after recovery); the old check matched the
+  key-count gauge's "} 1".
+- N1: a Drain after one that returned nil returns nil at once; Drain
+  calls are serialized.
+- N5: floor raised to 3 x refresh (above).
+- TestStartupInterrupted covers a real *store.Error from store.Open on a
+  cancelled ctx, wrapped by startupError.
+- S1 (docs only): the "4 connections always free" guarantee holds only
+  while Postgres answers; a timed-out admin call frees its slot at once
+  but pgx keeps its connection up to 15 s to clean up, and Close waits
+  for it, so shutdown can run ~15 s longer.
+
+### Accepted
+- N2: the admin slot is taken before the body is read, so a holder of
+  the token sending slow bodies can keep slots for up to the 10 s read
+  timeout. Token required; the refresh is unaffected.
+- N3: an own-deadline timeout (DeadlineExceeded) can read as "startup
+  interrupted" and exit 0 if a signal arrives between the step returning
+  and the check. The window is tiny and the exit code barely matters
+  there.
+- N4: the stale 503 has no Retry-After and sends Connection: close, so
+  during a stale period every request reconnects. The gateway can't know
+  when the database is back; SDKs back off on 503.
+
+### Next
+- A separate small pool for the key refresh (S1), so admin timeouts
+  against an unresponsive Postgres can never hold its connection.
+- Grafana panel (done in the polish entry above) and an alert rule for
+  sentinel_auth_keys_stale.
+
+## 2026-10-27: gateway wiring (Postgres keys, PR 1d)
+
+### Done
+- loadConfig: SENTINEL_DATABASE_URL (unset/empty: env keys; set: Postgres
+  only, SENTINEL_API_KEYS non-empty is an error; blank is an error),
+  SENTINEL_KEYS_REFRESH (default 30s, >= 1s), SENTINEL_ADMIN_ADDR (default
+  127.0.0.1:9465 with a DB, "off", an error without a DB except "off"),
+  SENTINEL_ADMIN_TOKEN (required while admin is on, ValidateToken).
+  parseMetricsAddr's port rule is now checkOwnPort, shared with admin,
+  which must differ from the API's and the metrics' ports.
+- serve: startKeys (Open 10 s, Migrate + SchemaVersion 30 s,
+  NewRefreshing with the Recorder) before any listener; newMux takes the
+  KeySource. Admin listener between metrics and the API, own http.Server
+  (metrics' timeouts, DisableGeneralOptionsHandler). Shutdown: API, admin,
+  metrics, cancel refresh, wait Done (5 s), close the pool.
+- Compose: postgres in the mock profile (no host port, volume, TCP
+  healthcheck, read_only, cap_drop ALL, no-new-privileges, user postgres,
+  tmpfs for /var/run/postgresql and /tmp, dev-only password). Mock gateway
+  on it with SENTINEL_API_KEYS="", admin on 127.0.0.1:9465, token from .env
+  with ${...:?}. Makefile: a placeholder token for every target but up.
+  CI's compose check: fails without the token, passes with one.
+- Grafana: client keys, refresh age (90 s line), refresh errors.
+- Tests: every config rule, no URL or token in any error; serve on a fake
+  keyStore (issue via admin, 200 after a refresh, 401 after revoke and a
+  refresh; OPTIONS * 401; admin not on the API port; bind and serve
+  failures; startup failures and deadlines; store closed last); real
+  store.Open on bad URLs leaks nothing; the same lifecycle on real
+  Postgres with SENTINEL_TEST_POSTGRES_URL.
+- Binary (linux, -s -w): 13.08 MB -> 17.28 MB (+32%); ADR 0005 has it.
+
+### Decided
+- An admin server failure keeps the API serving, as metrics does: keys
+  loaded keep working and refreshing; only issuing and revoking stops.
+- Migrations run automatically at every start; the role needs CREATE.
+- SENTINEL_KEYS_REFRESH has a 1 s floor (fetch timeout is half of it).
+  SENTINEL_KEYS_REFRESH and SENTINEL_ADMIN_TOKEN without a DB only WARN;
+  SENTINEL_ADMIN_ADDR=off without a DB is accepted.
+- The refresh's context is not the signal's, so keys refresh during the
+  grace period; a signal during the first fetch still stops startup.
+- If the refresh doesn't stop within 5 s, the pool is left open: Close
+  would wait for the stuck fetch's connection.
+
+### Verified
+- 2026-10-27, make up smoke test: the postgres service starts as user
+  postgres on a read-only root; a tenant and key issued through the admin
+  API get 200 on the API after one refresh and 401 after revoke and a
+  refresh; the key is in no log line; three audit lines;
+  sentinel_auth_keys 1 -> 0, refresh errors 0; every Grafana panel shows
+  data.
+
+### After review (go-reviewer), tests first
+- A signal during Open, Migrate or the first fetch: INFO "startup
+  interrupted", serve returns nil (exit 0), not an ERROR exit. Tests for
+  all three fail if the AfterFunc hook or the signal ctx is dropped.
+- Shutdown order test: an admin call held in flight and a fetch blocked
+  until cancelled; it asserts admin drained, refresh cancelled and
+  returned, then Close. Fails if Close moves before the cancel, the wait
+  on Done goes, or stopKeys runs before the admin shutdown.
+- Open and Migrate deadlines tested in synctest (exactly 10 s and 30 s;
+  a step without its WithTimeout deadlocks the bubble).
+- keysStopTimeout and adminShutdownTimeout are vars: a fetch ignoring
+  its ctx leaves the pool open with a WARN and shutdown completes; an
+  admin request open past the admin grace period gets a WARN.
+- The real-Postgres lifecycle test refreshes every 500 ms (fetch timeout
+  250 ms) instead of 50 ms, against CI flakes.
+- The base compose gateway blanks SENTINEL_ADMIN_TOKEN and
+  SENTINEL_KEYS_REFRESH, so make up-real neither receives the token nor
+  warns; the mock override sets the token and the refresh
+  (${SENTINEL_KEYS_REFRESH:-30s}) again.
+- The README admin example loads .env with set -a and sends the token
+  through curl -H @- from a shell function.
+- The DB URL is stored trimmed. CI's negative compose check requires the
+  error to name SENTINEL_ADMIN_TOKEN. Grafana refresh errors panel:
+  axisSoftMax 1.
+- Database roles (ADR 0005): compose connects as the image's superuser;
+  production should use a migration role that owns the schema and a
+  runtime role without CREATE (SELECT, INSERT, UPDATE), which the
+  to_regclass check in the runner allows.
+
+### Next
+- A separate migrate command, so the runtime role never needs CREATE.
+- The admin API and the key refresh share one pgx pool (default size),
+  so a token holder could starve refreshes: a pool of its own for the
+  admin API, or an admin rate limit.
+- Per-operator admin credentials (ADR 0005 limits).
+
+## 2026-10-27: admin API package (Postgres keys, PR 1c)
+
+### Done
+- internal/admin: New(Config{Store, Token, Logger}) http.Handler; Store
+  is an interface of the six store methods it calls, and a compile-time
+  check holds *store.Store to it. Routes: POST/GET /admin/tenants, POST
+  /admin/tenants/{id}/disable, POST/GET /admin/tenants/{id}/keys, DELETE
+  /admin/keys/{id}. Lists are {"tenants": [...]} and {"keys": [...]},
+  [] when empty. JSON 404/405 (with Allow) via method-less patterns and a
+  "/" catch-all; an unclean path is a 400 before the mux, which would
+  redirect it.
+- Auth wraps the whole mux: bearer token, one Authorization header only,
+  SHA-256 digests compared in constant time, the same 401 with
+  WWW-Authenticate: Bearer and Connection: close for every path. WARN via
+  proxy.LogThrottle (10 s). ValidateToken exported for 1d.
+- Body rules, error mapping, no-store and nosniff on every response, one
+  audit line per change. ADR 0005 has an Admin API section; the wiring
+  references in it moved from 1c to 1d.
+- Tests with a fake store and a JSON log buffer: every route and some
+  unmatched ones against 16 bad Authorization variants (same body, no
+  store call, no body read), the key only in the create response, error
+  mapping on all six routes including an error text that must not leak,
+  body limits at and over 4 KiB, a real httptest server. Mutations
+  (accepting any bearer, a leaking 500, no body limit, logging the key)
+  each fail tests.
+
+### Decided
+- PR 1c is the package only; 1d adds SENTINEL_ADMIN_ADDR (its own port,
+  refused if it equals the API's, as the metrics address is), the token
+  env var, the store, and compose.
+- ValidateToken allows printable ASCII only (0x21-0x7e), stricter than
+  "no whitespace or control": a non-ASCII token can be encoded differently
+  by a client than by the config.
+- Every response is no-store, not only the create-key one, which also
+  sets it itself.
+- New panics on a nil Store or Logger or an invalid token, since it
+  returns no error; 1d validates the token first.
+- POST disable and create-key take no input, but a body if sent must be
+  application/json and decode into an empty object ({} or null).
+- revoke_key's audit line has only key_id: RevokeKey returns no tenant or
+  prefix. Reads are not audited.
+
+### Next
+- PR 1d: wire it (listener, server timeouts like the metrics one, token
+  from env, store Open/Migrate with deadlines), compose, binary size.
+- PR 1d: the admin http.Server sets DisableGeneralOptionsHandler: true,
+  so OPTIONS * gets the handler's 401 instead of net/http's 200.
+- Give LogThrottle a package of its own (keys and admin both use it).
+- Per-operator admin credentials and a rate limit on admin, when needed
+  (ADR 0005 known limits).
+- ListTenants and ListKeys have no paging yet; add it (keyset on
+  created_at, id) before tenant or key counts make a list response big.
+
+### After review (go-reviewer), tests first
+- Store calls get 5 s (storeTimeout). Changes use
+  WithTimeout(WithoutCancel(r.Context())), so a client that disconnects
+  can't cancel a change Postgres has committed and lose its audit line;
+  reads use WithTimeout(r.Context()).
+- Only a store error that is context.Canceled while r.Context() is done
+  (a read the client canceled) writes nothing and logs WARN "admin client
+  closed request" with status 499. A change's error is always ERROR and a
+  500, client gone or not, since its context can't be canceled by the
+  client. A synctest test checks a hung store: 500 and ERROR after exactly
+  5 s, for a read and a change.
+- The unauthorized WARN logs EscapedPath() (ASCII), cut at 256 bytes,
+  with path_truncated and path_len when cut.
+- Content-Type is checked only for a non-empty body, so an empty chunked
+  body without one is no body. DELETE with a non-empty body is a 400.
+  The clean-path check uses EscapedPath(), as Go 1.27's ServeMux does:
+  %2F and %2e are part of an ID (a%2Fb is "a/b", %2e%2e is ".."), which
+  the store doesn't find.
+- Whitespace around the token moved to TestOverHTTP over raw TCP: net/http
+  trims it, so it is accepted; whitespace inside is not. New tests: HEAD
+  and OPTIONS on routes, an unauthenticated preflight (401, no CORS
+  headers), escaped IDs, case-variant and duplicate JSON keys, null
+  bodies, an empty chunked body, DELETE with a body, Expect: 100-continue
+  (401 at once without the token, 100 then 201 with it).
+- ADR 0005: the preflight gets 401, not 405; OPTIONS * is net/http's;
+  JSON field matching and the escaped-path rule are documented.
+
+## 2026-10-27: Postgres key store (Postgres keys, PR 1b)
+
+### Done
+- internal/store on pgx v5.11.0 (pgxpool): Open (parses, pings), Migrate,
+  CreateTenant, ListTenants, DisableTenant, CreateKey (metadata plus the
+  plaintext once), ListKeys, RevokeKey, ActiveDigests (a keys.Fetch: keys
+  not revoked of tenants not disabled). Typed errors: ErrNotFound (also
+  for a malformed UUID), ErrDuplicateName, ErrTenantDisabled,
+  ErrInvalidName, ErrSchemaTooNew. Disable and revoke are idempotent and
+  keep the first time.
+- Migration 0001: tenants and api_keys as specified, plus an index on
+  api_keys.tenant_id. Own runner: one tx per migration, advisory xact
+  lock, newer-version refusal.
+- Key format snl_ + 43 chars base64url (32 bytes); prefix is the first 12;
+  digest is SHA-256 of the whole key, equal to proxy.DigestKeys.
+- Errors: every pgx error becomes *store.Error with op, a fixed
+  description, SQLSTATE and constraint; pgx's text is dropped, not
+  wrapped. Unwrap keeps only context errors.
+- make test-postgres (postgres:18.6-alpine3.24 on 127.0.0.1:5433), denied
+  to Claude Code in .claude/settings.json; CI gets a postgres service on
+  the same image. ADR 0005.
+- Tests: unit (no DB) for sanitizing, key format and digest equality;
+  integration behind SENTINEL_TEST_POSTGRES_URL, each test in its own
+  schema (search_path in the URL): migrate twice, 5 pools migrating at
+  once, newer schema refused, digest length check, lifecycle, disable,
+  typed errors, wrong password leaks nothing, and end to end with
+  keys.Refreshing and proxy.Auth (revoked key 401 after one refresh).
+
+### Decided
+- No sqlc and no goose, against the earlier plan: seven short queries, and
+  a migration runner small enough to read. Revisit sqlc with the admin API.
+- No columns for #1 or #24; ADR 0005 says where they go.
+- The constant-time loop stays; a scratch benchmark put it at about 20 ns
+  per digest (0.2 ms at 10,000 keys) against ~15 ns for a map at any size.
+  Switch to a map in KeySet before tens of thousands of keys.
+
+- After review (go-reviewer), tests first: migration transactions are
+  READ COMMITTED whatever the default (a serializable default made a
+  gateway that waited on the lock rerun 0001); schema_migrations is
+  created only when to_regclass finds none, so an up-to-date DB needs no
+  CREATE; SchemaVersion is 0 on a never-migrated DB; an applied migration
+  whose name differs is ErrSchemaMismatch; CreateKey's INSERT ... SELECT
+  takes FOR SHARE on the tenant, so it waits for a concurrent disable and
+  returns ErrTenantDisabled instead of a dead key; the rollback after a
+  failed migration has a 5 s deadline. Migrate calls migrate(ctx, fs.FS),
+  so a test runs a 0002 that fails halfway. sanitize passes through only
+  an *Error or a bare sentinel, never a wrapper. validName rejects
+  anything not unicode.IsPrint and format characters (Cf). The concurrent
+  test opens five pools, then releases them together.
+
+### Next
+- PR 1c: config (connection string from env, refresh interval), main.go
+  choosing Static or the store, the admin API, compose, binary size.
+- Decide whether the gateway migrates at startup or a separate command does.
+- PR 1c: give Open and Migrate a context with a deadline. Ping to a
+  blackholed host waits for the OS TCP timeout, and pg_advisory_xact_lock
+  waits forever behind a stuck migrator (or set lock_timeout).
+- The deny rules in .claude/settings.json match by prefix:
+  Bash(make test-redis:*) and Bash(make test-postgres:*) don't catch
+  "make test test-postgres" or "make -C . test-redis". CLAUDE.md is the
+  real control; consider a hook that checks the targets.
+
+## 2026-10-27: refreshable key source (Postgres keys, PR 1a)
+
+### Done
+- proxy.KeySource returns a *proxy.KeySet, an immutable set of SHA-256
+  digests (NewKeySet copies). Auth asks it once per request, so a request
+  is checked against one whole set. Digest compare, the constant-time loop
+  over every digest and clientID (hex digest, so rate-limit buckets) are
+  unchanged. A nil or empty set rejects every request. NewAuthSource takes
+  a KeySource; NewAuth and RequireKey keep taking []string and wrap it.
+  internal/proxy imports neither internal/keys nor any DB package.
+- internal/keys: Parse (SENTINEL_API_KEYS's rules, moved from main.go) and
+  Static; Refreshing, which fetches digests on an interval and swaps them
+  in with an atomic.Pointer. The first fetch must succeed or the
+  constructor returns its error and starts nothing. A failed refresh keeps
+  the last good set, is recorded and logged at WARN through
+  proxy.LogThrottle (10 s). A fetch cut off by
+  shutdown is not a failure. Done() closes when the loop stops on ctx
+  cancel. Becoming empty logs one WARN.
+- proxy.Recorder gained RecordKeySetSize and RecordKeyRefresh. Telemetry:
+  sentinel_auth_keys, sentinel_auth_key_refresh_errors_total and
+  sentinel_auth_key_refresh_age_seconds, no labels. Static reports only the
+  size, so it has no age or error series; a refreshing source's error
+  series exists at 0 from its first success.
+- main.go uses keys.Static; Refreshing has no caller until PR 1b.
+- Tests under -race: a removed key rejected after the next refresh, swaps
+  racing concurrent requests, a failed refresh keeping the set, empty sets,
+  cancel (also mid-fetch) stopping the loop, a failed first fetch starting
+  nothing. The refresh tests run in testing/synctest, which also fails on a
+  leaked goroutine. Existing auth tests unchanged.
+
+- After review (go-reviewer): the ticker is now a timer reset after each
+  refresh returns, so a hung fetch is followed by a full Interval of rest,
+  not another fetch at once. Config.FetchTimeout (default
+  min(Interval/2, 10s), must be positive and below Interval) bounds every
+  fetch, the first too: a hung store fails startup with "the key store did
+  not answer in time". refresh checks ctx before fetching; a ctx already
+  done fails NewRefreshing before any fetch. Keys() on a nil Static or
+  Refreshing returns nil and rejects. Config.Now drives the warning
+  throttle, so synctest tests run it after its base. proxy.DigestKeys is
+  the one place keys become digests. Tests added for each, written to fail
+  first for the hung fetches and the fetch after cancel.
+
+### Decided
+- logThrottle stays in internal/proxy; LogThrottle exports it with Allow
+  for internal/keys, which already imports proxy. Moving it to a package
+  of its own would have meant changing the existing auth tests. A known
+  smell: revisit if a third user appears.
+- An empty first fetch is accepted: the gateway starts and fails closed,
+  rejecting every request, with one WARN. Refusing to start would turn
+  "every key revoked" into "gateway down".
+- One key source per process, so the key gauges have no source label by
+  design; a second source would overwrite the first's values.
+- Review: go-reviewer with a focused brief on every PR; the multi-agent
+  code-review skill on each dev->main release diff.
+
+### Next
+- PR 1b: Postgres fetch (pgx, sqlc, goose) behind keys.Refreshing, ADR 0005.
+  - Sanitize pgx errors in the Fetch (connect errors carry user, database
+    and host:port) and test that no connection string reaches a log line.
+  - With a large key set, look the digest up in a map instead of the
+    linear constant-time loop; record the trade-off in the ADR.
+  - Alert on sentinel_auth_key_refresh_age_seconds, not only on refresh
+    errors: a Fetch that ignores ctx records no failure.
+- Dashboard panels for the key metrics.
+
+## 2026-10-25: fail-open windows in a bench
+
+### Done
+- bench/RESULTS.md has a caveat: a make bench-gateway run, watched with
+  the new metrics, had 4,058 of about 47k requests (8.6%) fail_open.
+  gateway-bench logged "redis not reachable at startup" and the breaker
+  opened four times during the 100 and 500 req/s stages. The log's
+  fail-open WARN lines plus their suppressed counts give 4,054; the last
+  batch is never logged. Tracked in #42.
+
+### Learned
+- HTTP statuses don't show a fail-open window: a fail-open request goes
+  ahead and is answered like any other, and while the breaker is open it
+  skips the Redis call. Earlier overhead figures may be optimistic, mostly
+  at 100 req/s.
+- Grafana's runtime plugin preinstall broke the dashboard on a read-only
+  root: its update removed the bundled Prometheus plugin and couldn't
+  write the new one. Preinstall is now off; the image's copy loads.
+
+### Next
+- After every bench, check
+  sentinel_ratelimit_decisions_total{outcome="fail_open"}, not only HTTP
+  statuses. #42 is to make make bench-gateway check it and reject the run.
+
 ## 2026-10-25: OpenTelemetry metrics
 
 ### Done

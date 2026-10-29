@@ -38,6 +38,10 @@ func scrape(t *testing.T) string {
 		m.RecordRequest(ctx, info)
 	}
 	m.RecordAuthRejection(ctx)
+	m.RecordKeySetSize(ctx, 2)
+	m.RecordKeyRefresh(ctx, true)
+	m.RecordKeyRefresh(ctx, false)
+	m.RecordKeysStale(ctx, true)
 
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
@@ -145,6 +149,7 @@ func TestDashboard_QueriesExportedNames(t *testing.T) {
 		"sentinel_stage_duration_seconds_bucket", "sentinel_gateway_overhead_seconds_bucket",
 		"sentinel_ratelimit_decisions_total", "sentinel_auth_rejections_total",
 		"sentinel_admission_in_use", "sentinel_admission_limit", "sentinel_ratelimit_breaker_open",
+		"sentinel_auth_keys", "sentinel_auth_key_refresh_errors_total", "sentinel_auth_key_refresh_age_seconds",
 	} {
 		if !names[want] {
 			t.Errorf("scrape has no %s", want)
@@ -184,5 +189,13 @@ func TestDashboard_QueriesExportedNames(t *testing.T) {
 	}
 	if used == 0 {
 		t.Error("dashboard uses no sentinel_ metric")
+	}
+}
+
+// The stale gauge's Prometheus name, for alerts: no unit, no suffix.
+func TestKeysStale_PrometheusName(t *testing.T) {
+	exposition := scrape(t)
+	if !metricNames(exposition)["sentinel_auth_keys_stale"] {
+		t.Errorf("scrape has no sentinel_auth_keys_stale:\n%s", exposition)
 	}
 }

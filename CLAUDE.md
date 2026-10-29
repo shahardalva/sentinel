@@ -15,19 +15,74 @@ tool policies, and writes an audit log.
   are never read. The core strips hop-by-hop headers as a backstop.
 - Metrics: OpenTelemetry in internal/telemetry, exposed with the OTel
   Prometheus exporter (built on prometheus/client_golang). The core calls a
-  proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401) and
-  never imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only
-  from closed sets: never the client key, its digest, the model or the path.
+  proxy.Recorder (RequestInfo per request, RecordAuthRejection per 401,
+  RecordKeySetSize, RecordKeyRefresh and RecordKeysStale from the key
+  source) and never
+  imports OTel (docs/adr/0004-opentelemetry-metrics.md). Labels only from
+  closed sets: never the client key, its digest, the model or the path.
+  The key metrics have no labels: one key source per process.
   Traces come later on the same SDK.
-- Later: Redis, Postgres (pgx, sqlc, goose), Kafka (franz-go), ClickHouse,
-  Python detector service over gRPC
+- Client keys: proxy.Auth reads them from a proxy.KeySource, once per
+  request, as an immutable proxy.KeySet of SHA-256 digests (constant-time
+  compare over every digest; clientID is the hex digest). A nil or empty
+  set rejects everything. internal/keys implements it: Static (from
+  SENTINEL_API_KEYS, without a database) and Refreshing (a Fetch of digests on an
+  interval, atomic swap, last good set kept on failure, first fetch must
+  succeed within FetchTimeout; MaxStale: past it since the last good
+  fetch, Keys() returns proxy.UnavailableKeySet() and Auth answers every
+  request 503, ERROR once in, INFO once out). A Fetch must honor ctx and
+  return errors safe to log. internal/proxy never imports internal/keys
+  or a DB package.
+- Key store: internal/store, Postgres via pgx/pgxpool, no sqlc
+  (docs/adr/0005-postgres-client-keys.md). Tenants and api_keys (UUID ids,
+  only SHA-256 digests, nothing deleted: disabled_at, revoked_at).
+  Store.ActiveDigests is a keys.Fetch. Keys are "snl_" + base64url of 32
+  random bytes, returned once by CreateKey, never stored or logged.
+  Migrations: embedded internal/store/migrations/NNNN_name.sql, own runner
+  (schema_migrations, one READ COMMITTED tx per migration under
+  pg_advisory_xact_lock, ErrSchemaTooNew for a newer DB,
+  ErrSchemaMismatch for a different applied name; an up-to-date DB needs
+  no CREATE right), forward only. Every error is a
+  sanitized *store.Error (op, SQLSTATE, constraint; never pgx's text,
+  which names user, database or host) or a typed error.
+- cmd/gateway with SENTINEL_DATABASE_URL: startKeys does store.Open (10 s)
+  and Migrate (30 s, automatic on every start), then keys.NewRefreshing
+  on ActiveDigests with the Recorder, all before any listener binds; any
+  failure stops startup, except that a signal during them logs INFO
+  "startup interrupted" and returns nil (only when the error is Canceled
+  or DeadlineExceeded and the signal ctx is done). It sees the store as a keyStore
+  interface (openStore is a var, so tests use a fake). The refresh ctx is not the
+  signal's; shutdown: admin stops accepting at once, alongside the API
+  drain (30 s), then admin.API.Drain waits for its handlers (5 s grace,
+  WARN if cut, then up to 6 s; still running: WARN, pool left open);
+  metrics, then cancel the refresh, wait for Done (5 s; if it doesn't
+  stop, WARN and leave the pool open), close the pool. Compose connects as the image's superuser;
+  production: a migration role and a runtime role without CREATE (ADR
+  0005, Database roles). Admin and refresh share one pool of
+  store.MaxConns = 8 (overrides pool_max_conns); admin.MaxInFlight =
+  MaxConns/2 = 4, past it a 503 with Retry-After at once.
+- Admin API: internal/admin, New(Config{Store, Token, Logger})
+  *admin.API (an http.Handler with Drain) over an admin.Store interface (*store.Store satisfies it),
+  on its own listener (SENTINEL_ADMIN_ADDR, like the metrics one; its
+  http.Server has DisableGeneralOptionsHandler), never the API port.
+  Bearer token checked first (constant-time over SHA-256 digests; same
+  401 for every path; before the body is read), ValidateToken (>= 32
+  printable ASCII, no space). JSON in and out, one error shape
+  {"error":{"type","message"}}, 4 KiB bodies, application/json only,
+  unknown fields and trailing values rejected; 500s say only "internal
+  error". Store calls get 5 s; changes ignore the client's cancellation
+  (WithoutCancel); a read the client canceled is a WARN 499, any other
+  store error ERROR and 500. The plaintext key is only in the create-key 201; every response
+  is no-store. One INFO "admin" line per change (action, ids, prefix,
+  actor "admin-token"), never the key or token.
+- Later: Kafka (franz-go), ClickHouse, Python detector service over gRPC
 
 ## Principles
 - The hot path must be fast and measurable. Every stage records its latency.
 - Keep it simple: stdlib first, add a dependency only with a reason. So
   far: go-redis (docs/adr/0002-rate-limiting.md) and OpenTelemetry with its
-  Prometheus exporter (docs/adr/0004-opentelemetry-metrics.md); miniredis
-  is test-only.
+  Prometheus exporter (docs/adr/0004-opentelemetry-metrics.md), pgx
+  (docs/adr/0005-postgres-client-keys.md); miniredis is test-only.
 - Every change comes with tests.
 - Never commit secrets. API keys come only from environment variables.
 - Claude Code never runs docker, docker compose, or make targets that start
@@ -37,17 +92,25 @@ tool policies, and writes an audit log.
 - go run ./cmd/gateway (needs the env vars below), or make run
 - go test ./... (make test adds -race; make vet, make fmt). make test-redis
   also runs the rate-limit tests on a throwaway redis:7-alpine container;
-  SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it.
+  SENTINEL_TEST_REDIS_URL enables them by hand, and CI sets it. make
+  test-postgres does the same for the store tests on a throwaway
+  postgres:18.6-alpine3.24 on 127.0.0.1:5433 (SENTINEL_TEST_POSTGRES_URL;
+  CI sets it too). Each store test uses a schema of its own.
 - make (or make help) lists the targets.
 - make up: compose stack with gateway -> mockupstream over HTTPS, plus
-  redis for rate limiting, and Prometheus and Grafana (127.0.0.1:3000,
+  postgres for the client keys (admin API on 127.0.0.1:9465; needs
+  SENTINEL_ADMIN_TOKEN in .env), redis for rate limiting, and Prometheus
+  and Grafana (127.0.0.1:3000,
   anonymous Viewer, provisioned from observability/) for metrics. The gateway serves both protocols there, with
   anthropic, openai and the named upstream mockcompat (openai) all on the
   mock. Runs make certs first, which rewrites ./certs when a
   file is missing or server.pem expires within 7 days, and recreates the
   containers. Gateway on 127.0.0.1:8081 only. make up-real: gateway
   against the real APIs in SENTINEL_UPSTREAMS from .env (default
-  anthropic). make down, make logs.
+  anthropic). make down, make logs. Every target but make up passes a
+  placeholder SENTINEL_ADMIN_TOKEN when the shell has none, so they work
+  without one in .env (compose checks ${SENTINEL_ADMIN_TOKEN:?} on any
+  command reading docker-compose.mock.yml; CI's config check sets one).
 - make bench: k6 in a container against the mock directly (after make up).
   make bench-gateway: k6 through gateway-bench, a separate gateway fixed to
   the mock for all its upstreams (anthropic, openai, mockcompat) with dummy
@@ -99,9 +162,36 @@ tool policies, and writes an audit log.
   used, and a WARN at startup says so. An enabled upstream's key with
   leading or trailing whitespace or a control character stops startup; the
   error names the variable, never the key.
-- SENTINEL_API_KEYS (required): comma-separated client keys. The gateway
-  refuses to start without at least one. Clients send a key as `x-api-key`
+- SENTINEL_API_KEYS (required without SENTINEL_DATABASE_URL):
+  comma-separated client keys. The gateway refuses to start without at
+  least one; with a database it must be empty (never both). Clients send a key as `x-api-key`
   or `Authorization: Bearer <key>`; anything else gets a 401.
+- SENTINEL_DATABASE_URL (optional): Postgres for the client keys. Unset or
+  empty: keys from SENTINEL_API_KEYS. Set: keys from Postgres only. Blank
+  (spaces) stops startup. No error or log ever holds the URL. pgx also
+  honors PG* variables and ~/.pgpass.
+- SENTINEL_KEYS_REFRESH (optional): key fetch interval with a database,
+  Go duration, default 30s, at least 1s. Revocation latency: within it
+  plus up to two fetch timeouts (min(refresh/2, 10s) each), so at most 2x
+  the refresh, 50 s with the defaults. Set without a database: one WARN,
+  ignored.
+- SENTINEL_KEYS_MAX_STALE (optional): how long the last good key set is
+  served while refreshes fail, default 10m, 0 never expires. Past it every
+  request gets 503 (sentinel_auth_keys_stale 1). Negative or under three
+  times SENTINEL_KEYS_REFRESH (the default too) stops startup;
+  keys.NewRefreshing needs MaxStale >= 2 x (Interval + FetchTimeout). Set without a
+  database: one WARN, ignored.
+- SENTINEL_ADMIN_ADDR (optional): admin API listener, default
+  127.0.0.1:9465 with a database, "off" disables. Same parsing as the
+  metrics addr; port must differ from the API's and the metrics' (port 0
+  exempt). A host other than localhost or a loopback IP (empty, 0.0.0.0
+  too) gets one WARN: plain HTTP. Anything but off without a database
+  stops startup. Binds after
+  metrics, before the API, logs "admin listening"; a later Serve error is
+  ERROR and the API keeps serving.
+- SENTINEL_ADMIN_TOKEN (required while the admin API is on):
+  admin.ValidateToken; errors never hold it. Set while admin is off: one
+  WARN, ignored.
 - SENTINEL_ADDR (optional): listen address, default 127.0.0.1:8081
   (loopback only). Set it explicitly to expose the gateway on a network.
 - SENTINEL_METRICS_ADDR (optional): metrics listener, default
@@ -153,7 +243,9 @@ tool policies, and writes an audit log.
   during the check is logged as 499, not as a Redis failure.
 
 Under Docker Compose the gateway reads ANTHROPIC_API_KEY, OPENAI_API_KEY,
-OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_* and SENTINEL_API_KEYS from .env
+OPENAI_BASE_URL, SENTINEL_UPSTREAM_<NAME>_*, SENTINEL_API_KEYS (make
+up-real only), SENTINEL_ADMIN_TOKEN, SENTINEL_KEYS_REFRESH and SENTINEL_KEYS_MAX_STALE
+from .env
 (copy .env.example, which leaves the keys empty; .env is gitignored), and
 SENTINEL_UPSTREAMS too, defaulting to anthropic. Compose sets SENTINEL_ADDR=0.0.0.0:8081 and
 SENTINEL_REDIS_URL=redis://redis:6379/0 in the container and publishes the
@@ -173,7 +265,17 @@ SENTINEL_UPSTREAMS=anthropic,openai,mockcompat, ANTHROPIC_BASE_URL=
 https://mockupstream:9090, OPENAI_BASE_URL=https://mockupstream:9090/v1,
 mockcompat as protocol openai on https://mockupstream:9090/v1,
 SENTINEL_UPSTREAM_CA_FILE=/certs/ca.pem and dummy keys for all three
-(mock-not-a-real-key), so load tests never reach a real API. The gateway, gateway-bench and k6 mount only
+(mock-not-a-real-key), so load tests never reach a real API. The mock
+override also gives the gateway SENTINEL_DATABASE_URL on the postgres
+service (postgres:18.6-alpine3.24, mock profile, no host port, volume
+postgres-data, TCP pg_isready healthcheck the gateway waits on, hardened,
+user postgres, dev-only password sentinel-dev-only in the compose file),
+SENTINEL_API_KEYS="", SENTINEL_ADMIN_ADDR=0.0.0.0:9465 published on
+127.0.0.1:9465 only, and SENTINEL_ADMIN_TOKEN=${SENTINEL_ADMIN_TOKEN:?} and
+SENTINEL_KEYS_REFRESH=${SENTINEL_KEYS_REFRESH:-30s} and
+SENTINEL_KEYS_MAX_STALE=${SENTINEL_KEYS_MAX_STALE:-10m}; the base gateway
+blanks all three, so make up-real never gets the token. gateway-bench keeps
+env keys. The gateway, gateway-bench and k6 mount only
 certs/ca.pem; certs-init and mockupstream mount certs/ read-only. certs-init
 copies the server key into a volume as a file owned by the nonroot user
 (65532) with mode 0400, since devcerts writes it 0600 for the host user; the

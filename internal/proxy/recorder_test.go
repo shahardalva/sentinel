@@ -40,6 +40,12 @@ func (f *fakeRecorder) RecordAuthRejection(context.Context) {
 	f.auth++
 }
 
+func (f *fakeRecorder) RecordKeySetSize(context.Context, int) {}
+
+func (f *fakeRecorder) RecordKeyRefresh(context.Context, bool) {}
+
+func (f *fakeRecorder) RecordKeysStale(context.Context, bool) {}
+
 // only returns the one RequestInfo recorded, failing unless there is
 // exactly one.
 func (f *fakeRecorder) only(t *testing.T) proxy.RequestInfo {

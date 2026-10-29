@@ -1,10 +1,19 @@
 COMPOSE         := docker compose
-COMPOSE_MOCK    := $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml --profile mock
+COMPOSE_MOCK_UP := $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml --profile mock
+# docker-compose.mock.yml requires SENTINEL_ADMIN_TOKEN (${...:?}) for the
+# mock gateway, and compose checks it on every command that reads the
+# file. Only make up starts that gateway, with COMPOSE_MOCK_UP; the other
+# targets get a placeholder when the shell has no token, so they work
+# without one in .env. It is too short for the gateway's token rule, so a
+# gateway started with it would refuse to start.
+COMPOSE_MOCK    := SENTINEL_ADMIN_TOKEN="$${SENTINEL_ADMIN_TOKEN:-unused-by-this-target}" $(COMPOSE_MOCK_UP)
 COMPOSE_BENCH   := $(COMPOSE_MOCK) --profile bench
 MOCK_URL        := https://mockupstream:9090
+# Pinned exactly; CI's postgres service uses the same tag.
+POSTGRES_IMAGE  := postgres:18.6-alpine3.24
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt vet test test-redis certs run up up-real down logs bench bench-gateway
+.PHONY: help fmt vet test test-redis test-postgres certs run up up-real down logs bench bench-gateway
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -23,6 +32,14 @@ test-redis: ## Run the tests with the race detector, the rate-limit ones also on
 	docker run -d --rm --name sentinel-test-redis -p 127.0.0.1:6390:6379 redis:7-alpine
 	SENTINEL_TEST_REDIS_URL=redis://127.0.0.1:6390/0 go test -race ./...; status=$$?; 	docker stop sentinel-test-redis >/dev/null; exit $$status
 
+# A throwaway Postgres on 127.0.0.1:5433, removed afterwards. The password
+# is for this container only. pg_isready over TCP: during the image's first
+# start it listens on the unix socket alone, then restarts.
+test-postgres: ## Run the tests with the race detector, the store and gateway key ones also on a real Postgres (needs Docker)
+	docker run -d --rm --name sentinel-test-postgres -p 127.0.0.1:5433:5432 		-e POSTGRES_PASSWORD=sentinel-test-only -e POSTGRES_DB=sentinel_test $(POSTGRES_IMAGE)
+	@i=0; until docker exec sentinel-test-postgres pg_isready -q -h 127.0.0.1 -U postgres; do 		i=$$((i + 1)); 		if [ $$i -ge 60 ]; then echo "test-postgres: postgres did not start" >&2; docker stop sentinel-test-postgres >/dev/null; exit 1; fi; 		sleep 0.5; 	done
+	SENTINEL_TEST_POSTGRES_URL='postgres://postgres:sentinel-test-only@127.0.0.1:5433/sentinel_test?sslmode=disable' go test -race ./...; status=$$?; 	docker stop sentinel-test-postgres >/dev/null; exit $$status
+
 certs: ## Write a dev CA and server cert to ./certs if missing or expiring within 7 days
 	go run ./cmd/devcerts -hosts localhost,127.0.0.1,mockupstream -renew-within 168h
 
@@ -30,8 +47,8 @@ run: ## Run the gateway on the host (needs the env vars from CLAUDE.md)
 	go run ./cmd/gateway
 
 # --force-recreate so mockupstream and the gateway pick up renewed certs.
-up: certs ## Start gateway, mockupstream, redis, Prometheus and Grafana (127.0.0.1:3000); the gateway uses the mock over HTTPS
-	$(COMPOSE_MOCK) up -d --build --force-recreate
+up: certs ## Start gateway, mockupstream, postgres, redis, Prometheus and Grafana (127.0.0.1:3000); the gateway uses the mock over HTTPS and keys from postgres (needs SENTINEL_ADMIN_TOKEN in .env)
+	$(COMPOSE_MOCK_UP) up -d --build --force-recreate
 
 up-real: ## Start gateway, redis, Prometheus and Grafana; the gateway uses the real APIs in SENTINEL_UPSTREAMS
 	$(COMPOSE) up -d --build

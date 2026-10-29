@@ -1,5 +1,6 @@
-# Points the gateway at the mockupstream service over HTTPS. Use with the
-# mock profile:
+# Points the gateway at the mockupstream service over HTTPS, with client
+# keys from the postgres service and the admin API on 127.0.0.1:9465.
+# Needs SENTINEL_ADMIN_TOKEN in .env. Use with the mock profile:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.mock.yml --profile mock up -d --build
 
@@ -21,6 +22,30 @@ services:
       ANTHROPIC_API_KEY: mock-not-a-real-key
       OPENAI_API_KEY: mock-not-a-real-key
       SENTINEL_UPSTREAM_MOCKCOMPAT_API_KEY: mock-not-a-real-key
+      # Client keys come from the postgres service, issued and revoked
+      # through the admin API below. The password is the service's
+      # dev-only one (docker-compose.yml).
+      SENTINEL_DATABASE_URL: postgres://sentinel:sentinel-dev-only@postgres:5432/sentinel?sslmode=disable
+      # How often the gateway fetches the keys; from .env, default 30s.
+      # Set here, by interpolation, because docker-compose.yml blanks it
+      # for the gateway without a database, and this file's environment
+      # wins over that one's, key by key.
+      SENTINEL_KEYS_REFRESH: ${SENTINEL_KEYS_REFRESH:-30s}
+      # How long the last good key set is served while Postgres can't be
+      # reached, before every request gets a 503; from .env, default 10m.
+      SENTINEL_KEYS_MAX_STALE: ${SENTINEL_KEYS_MAX_STALE:-10m}
+      # Empty, so a SENTINEL_API_KEYS in .env (for make up-real) doesn't
+      # stop startup: the gateway refuses keys from both places.
+      SENTINEL_API_KEYS: ""
+      # The admin API on all interfaces inside the container; the host port
+      # below is bound to loopback only. The gateway's startup WARN that
+      # this address is not loopback is expected here: the port is
+      # published on 127.0.0.1 only, so only the host's loopback reaches it.
+      SENTINEL_ADMIN_ADDR: 0.0.0.0:9465
+      # From .env, never defaulted: generate one with openssl rand -hex 32.
+      SENTINEL_ADMIN_TOKEN: ${SENTINEL_ADMIN_TOKEN:?set SENTINEL_ADMIN_TOKEN in .env, for example to the output of openssl rand -hex 32 (see .env.example)}
+    ports:
+      - "127.0.0.1:9465:9465"
     # Only the CA certificate; the server key stays with mockupstream.
     volumes:
       - type: bind
@@ -32,3 +57,5 @@ services:
     depends_on:
       mockupstream:
         condition: service_started
+      postgres:
+        condition: service_healthy

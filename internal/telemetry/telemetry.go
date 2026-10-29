@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -137,6 +138,20 @@ type Metrics struct {
 	overhead        metric.Float64Histogram
 	decisions       metric.Int64Counter
 	authRejections  metric.Int64Counter
+	keyRefreshErrs  metric.Int64Counter
+
+	// keySetSize is the last size reported plus one; zero until a key
+	// source reports, so the gauge has no point before then.
+	keySetSize atomic.Int64
+	// lastRefresh is the offset from base of the last successful key
+	// refresh plus one; zero until one, so a source that never refreshes
+	// (keys.Static) has no age point.
+	lastRefresh atomic.Int64
+	// keysStale is 0 until a source with a staleness limit reports, then
+	// 1 for fresh and 2 for stale.
+	keysStale atomic.Int64
+	base      time.Time        // origin of lastRefresh, on the monotonic clock
+	now       func() time.Time // time.Now; tests replace it
 
 	routes   map[route]*routeAttrs
 	other    *routeAttrs
@@ -199,7 +214,7 @@ func newMetrics(cfg Config, reader sdkmetric.Reader) (*Metrics, error) {
 		sdkmetric.WithResource(resource.NewSchemaless(attribute.String("service.name", "sentinel"))),
 	)
 	meter := provider.Meter(scope)
-	m := &Metrics{provider: provider}
+	m := &Metrics{provider: provider, base: time.Now(), now: time.Now}
 	var errs []error
 	check := func(err error) { errs = append(errs, err) }
 
@@ -224,6 +239,36 @@ func newMetrics(cfg Config, reader sdkmetric.Reader) (*Metrics, error) {
 	check(err)
 	m.authRejections, err = meter.Int64Counter("sentinel.auth.rejections", metric.WithUnit("{request}"),
 		metric.WithDescription("Requests rejected for a missing or unknown client key."))
+	check(err)
+	m.keyRefreshErrs, err = meter.Int64Counter("sentinel.auth.key_refresh.errors", metric.WithUnit("{refresh}"),
+		metric.WithDescription("Failed refreshes of the client key set; each kept the last good set."))
+	check(err)
+	_, err = meter.Int64ObservableGauge("sentinel.auth.keys", metric.WithUnit("{key}"),
+		metric.WithDescription("Client keys in the set the gateway accepts. 0 rejects every request."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if n := m.keySetSize.Load(); n > 0 {
+				o.Observe(n - 1)
+			}
+			return nil
+		}))
+	check(err)
+	_, err = meter.Float64ObservableGauge("sentinel.auth.key_refresh.age", metric.WithUnit("s"),
+		metric.WithDescription("Time since the client key set was last fetched successfully. Only for a key source that refreshes."),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			if last := m.lastRefresh.Load(); last > 0 {
+				o.Observe(max(m.now().Sub(m.base)-time.Duration(last-1), 0).Seconds())
+			}
+			return nil
+		}))
+	check(err)
+	_, err = meter.Int64ObservableGauge("sentinel.auth.keys.stale",
+		metric.WithDescription("1 while the client key set is older than SENTINEL_KEYS_MAX_STALE and every request gets a 503, else 0. Only for a key source with that limit."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if v := m.keysStale.Load(); v > 0 {
+				o.Observe(v - 1)
+			}
+			return nil
+		}))
 	check(err)
 
 	if a := cfg.Admission; a != nil {
@@ -342,6 +387,32 @@ func (m *Metrics) RecordRequest(ctx context.Context, info proxy.RequestInfo) {
 // RecordAuthRejection implements proxy.Recorder.
 func (m *Metrics) RecordAuthRejection(ctx context.Context) {
 	m.authRejections.Add(ctx, 1)
+}
+
+// RecordKeySetSize implements proxy.Recorder.
+func (m *Metrics) RecordKeySetSize(_ context.Context, n int) {
+	m.keySetSize.Store(int64(max(n, 0)) + 1)
+}
+
+// RecordKeyRefresh implements proxy.Recorder.
+func (m *Metrics) RecordKeyRefresh(ctx context.Context, ok bool) {
+	if !ok {
+		m.keyRefreshErrs.Add(ctx, 1)
+		return
+	}
+	// Adding 0 makes the error series exist, at 0, as soon as a refreshing
+	// source runs, so rate() over it works before the first failure.
+	m.keyRefreshErrs.Add(ctx, 0)
+	m.lastRefresh.Store(int64(m.now().Sub(m.base)) + 1)
+}
+
+// RecordKeysStale implements proxy.Recorder.
+func (m *Metrics) RecordKeysStale(_ context.Context, stale bool) {
+	v := int64(1)
+	if stale {
+		v = 2
+	}
+	m.keysStale.Store(v)
 }
 
 // Overhead is the time the gateway itself added to a request: the total

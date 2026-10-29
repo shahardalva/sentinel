@@ -22,29 +22,35 @@ const authWarnInterval = 10 * time.Second
 
 // Auth checks client keys. One Auth is meant to guard every route, so the
 // rate limit on its warnings holds across all of them. Create one with
-// NewAuth.
+// NewAuth or NewAuthSource.
 type Auth struct {
-	// SHA-256 digests of the keys. Comparing digests means every comparison
-	// is over the same length, and timing reveals nothing about a key's
-	// length or contents.
-	digests  [][sha256.Size]byte
+	// keys supplies SHA-256 digests of the keys. Comparing digests means
+	// every comparison is over the same length, and timing reveals nothing
+	// about a key's length or contents.
+	keys     KeySource
 	logger   *slog.Logger
 	recorder Recorder // may be nil
 	warn     logThrottle
 	now      func() time.Time // time.Now; tests replace it
 }
 
-// NewAuth returns an Auth accepting keys; empty keys are dropped, and with
-// none left every request is rejected. rec, if not nil, is told of every
-// rejection.
+// NewAuth returns an Auth accepting keys, which never change; empty keys
+// are dropped, and with none left every request is rejected. rec, if not
+// nil, is told of every rejection.
 func NewAuth(keys []string, logger *slog.Logger, rec Recorder) *Auth {
-	a := &Auth{logger: logger, recorder: rec, now: time.Now}
-	for _, k := range keys {
-		if k != "" {
-			a.digests = append(a.digests, sha256.Sum256([]byte(k)))
-		}
+	return NewAuthSource(fixedKeys{&KeySet{digests: DigestKeys(keys)}}, logger, rec)
+}
+
+// NewAuthSource returns an Auth accepting the keys src supplies, asking it
+// for them on every request, so a request is checked against the set
+// current when it arrives. A nil or empty KeySet rejects every request.
+// rec, if not nil, is told of every rejection. NewAuthSource panics if src
+// is nil.
+func NewAuthSource(src KeySource, logger *slog.Logger, rec Recorder) *Auth {
+	if src == nil {
+		panic("proxy: NewAuthSource needs a non-nil KeySource")
 	}
-	return a
+	return &Auth{keys: src, logger: logger, recorder: rec, now: time.Now}
 }
 
 // RequireKey rejects requests that don't present one of keys. It is
@@ -69,10 +75,20 @@ func (a *Auth) Require(errs ErrorFormatter, next http.Handler) http.Handler {
 		rc := http.NewResponseController(w)
 		_ = rc.SetReadDeadline(time.Now().Add(authReadTimeout))
 
+		// One snapshot per request: a refresh during the loop can't mix two
+		// sets.
+		set := a.keys.Keys()
+		if set.Unavailable() {
+			// Not a rejection of the key: the gateway can't check any. The
+			// source logs and records it; per request it is only the 503.
+			rejectEarly(w, errs, http.StatusServiceUnavailable, ErrAPI, "client keys cannot be verified")
+			return
+		}
 		presented := clientKey(r.Header)
 		got := sha256.Sum256([]byte(presented))
+		// Every digest is compared, whether or not one already matched.
 		match := 0
-		for _, d := range a.digests {
+		for _, d := range set.list() {
 			match |= subtle.ConstantTimeCompare(got[:], d[:])
 		}
 		if presented == "" || match != 1 {

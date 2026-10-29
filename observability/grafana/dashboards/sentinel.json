@@ -1,7 +1,7 @@
 {
   "uid": "sentinel-gateway",
   "title": "Sentinel gateway",
-  "description": "Requests, latency, gateway overhead, admission and rate limiting. Provisioned from observability/grafana/dashboards/sentinel.json.",
+  "description": "Requests, latency, gateway overhead, admission, rate limiting and client keys. Provisioned from observability/grafana/dashboards/sentinel.json.",
   "tags": [
     "sentinel"
   ],
@@ -591,6 +591,260 @@
           },
           "expr": "sum by (outcome) (rate(sentinel_ratelimit_decisions_total{service=~\"$service\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Client keys",
+      "description": "Keys in the set each gateway accepts; 0 rejects every request. Fixed for keys from SENTINEL_API_KEYS; with SENTINEL_DATABASE_URL, the active keys at the last successful refresh.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service) (sentinel_auth_keys{service=~\"$service\"})",
+          "legendFormat": "{{service}}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Key refresh age",
+      "description": "Time since the key set was last fetched from Postgres. It climbs to SENTINEL_KEYS_REFRESH (30 s by default) and drops back. Far beyond that (the red line is three default intervals), refreshes are failing or a fetch hangs, which records no error, and revoked keys keep working: alert on this. No data for keys from SENTINEL_API_KEYS, which never refresh.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 40,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service) (sentinel_auth_key_refresh_age_seconds{service=~\"$service\"})",
+          "legendFormat": "{{service}}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Key refresh errors",
+      "description": "Failed refreshes of the key set from Postgres; each kept the last good set. The gateway's WARN \"key refresh failed\" has the error. No data for keys from SENTINEL_API_KEYS.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisSoftMax": 1
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (service) (increase(sentinel_auth_key_refresh_errors_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} failed",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "state-timeline",
+      "title": "Key set stale",
+      "description": "1 (red) while the gateway is past SENTINEL_KEYS_MAX_STALE since its last successful key refresh: it can't vouch for its keys and answers every API request with 503 until a refresh succeeds. 0 (green) while the set is fresh. No data for keys from SENTINEL_API_KEYS.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 40,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 70
+          },
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "fresh",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "stale",
+                  "color": "red"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (service) (sentinel_auth_keys_stale{service=~\"$service\"})",
+          "legendFormat": "{{service}}",
           "refId": "A",
           "range": true
         }
