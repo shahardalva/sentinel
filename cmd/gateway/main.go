@@ -1200,7 +1200,9 @@ var redisWarmUpTimeout = 5 * time.Second
 
 // startRateLimit records the rate-limit settings, connects to Redis and
 // warms its pool with ratelimit.WarmConns connections, so the first
-// requests don't have to set them up within their 50 ms. An unreachable
+// requests don't have to dial and handshake within their 50 ms (they can
+// still time out on a slow Redis; the breaker decides what follows). An
+// unreachable
 // Redis or an incomplete warm-up is only a warning: Redis may still be
 // starting, and the fail mode decides what requests get until it is up. A
 // failed ping skips the warm-up, which could only wait out its timeout.

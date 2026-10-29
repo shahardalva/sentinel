@@ -28,12 +28,16 @@ const DefaultTimeout = 50 * time.Millisecond
 // its own timeout, and the dial goes on to fill the pool. 2 s covers a
 // cold dial on a slow network or a retried DNS query; a dead Redis keeps a
 // dial goroutine at most this long per attempt (go-redis tries 5 times).
-// WarmUp's reads get it too.
+// It used to be the call's 50 ms, which cut off every slower dial, the
+// background ones that fill the pool included. WarmUp's reads get it too.
 const PoolDialTimeout = 2 * time.Second
 
 // WarmConns is how many connections the gateway sets up with WarmUp before
-// serving, so a burst of calls at load start finds them ready instead of
-// setting them up within its timeout. At 1000 req/s and a Redis round trip
+// serving, so a burst of calls at load start finds them dialed and past the
+// handshake instead of setting them up within its timeout. That removes
+// the cold pool, not every way a call at load start can take 50 ms: a
+// stall of Redis or the host fails warm connections as well. At 1000 req/s
+// and a Redis round trip
 // of about 1 ms, one or two calls are in flight at once; 5 ms under load
 // makes it 5. 16 leaves room for bursts (a load test starting, Poisson
 // arrivals). The pool keeps them open while idle, but doesn't keep a

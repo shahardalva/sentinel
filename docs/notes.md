@@ -2,15 +2,41 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
-## 2026-10-29: review of the warm pool (#55): no MinIdleConns
+## 2026-10-29: the load-start fail-open window is not a cold pool (#55)
+
+### Learned (from a later make bench-gateway run)
+- With the warm-up in place ("redis pool warm" ready=16), the load-start
+  window came back: 5 concurrent rate-limit calls, all on warm
+  connections, hit the 50 ms ceiling at load start (rate_limit_us about
+  50,100 each, against about 200 mid-run), and the breaker opened for
+  5 s. No connection was being set up; the pool had 16 ready.
+- So the cause of #55 is a global stall over 50 ms at load start (Redis,
+  the host or the Docker VM busy as k6 starts), which hits every call in
+  flight at once and counts as 5 consecutive failures. The cold pool was
+  a second, smaller problem with the same symptom, and the earlier
+  entries below took it for the cause.
+- What the warm-up and PoolDialTimeout do fix: DialTimeout was the call's
+  50 ms, which cut off every slower dial, the background ones that fill
+  the pool included, so a pool could stay cold under load; and the first
+  calls had to dial and handshake within their 50 ms. Both are gone: dials
+  get 2 s off any call's clock, and 16 connections are ready before
+  serving. They do not fix #55.
+- The fix for #55 belongs to the breaker issue, #57: a stall that fails
+  every call in flight together should not count as 5 independent
+  failures in a row.
+
+### Next
+- #55 stays open; carry this evidence to #57.
+
+## 2026-10-29: review of the warm pool: no MinIdleConns
 
 ### Done (test first, then a mutation check per item)
 - MinIdleConns dropped. It doubled the warm-up to 32 (every Get refills
   it, and WarmUp's 16 held count as missing), dialed from loadConfig on,
   held pool turns so a pool of 16 or less failed the startup ping
   ("connection pool timeout") and skipped the warm-up, and tripped the
-  pool's dial-error gate 16x sooner in an outage. WarmUp alone fixes the
-  cold start; the pool keeps what it set up while idle (go-redis closes an
+  pool's dial-error gate 16x sooner in an outage. WarmUp alone removes the
+  cold pool; the pool keeps what it set up while idle (go-redis closes an
   idle connection only after ConnMaxIdleTime, 30 min).
 - ratelimit.WarmUp(ctx, client, n): n explicit, at most the pool size
   (the caller caps it; WarmUp holds all n at once). Through
@@ -44,7 +70,8 @@ Newest entries first. Short: what was done, what was decided, what's next.
   -race (the review saw 6 of 20 fail at 1 and 2 with reads capped).
 
 ### Decided
-- Scope: this PR ships the cold-start fix only. The breaker change below
+- Scope: this PR ships the warm-up and dial timeout only (a cold pool,
+  not the cause of #55, see the entry above). The breaker change below
   (connection errors not counted, zero retry backoff) was built, reviewed
   and taken out again; it is on branch wip/breaker-conn-errors, for the
   circuit-breaker PR.
@@ -78,14 +105,16 @@ Newest entries first. Short: what was done, what was decided, what's next.
   and a clean verdict, as before.
 - The breaker issue above, from wip/breaker-conn-errors.
 
-## 2026-10-29: warm Redis pool, dials outside the 50 ms (#55)
+## 2026-10-29: warm Redis pool, dials outside the 50 ms
 
 ### Done (test first, then a mutation check per part)
 - Evidence (#55): a bench-gateway run at 100 req/s, startup ping OK; the
   first 5 rate-limit calls failed with "context deadline exceeded"
   within ~50 ms of the first request, the breaker opened for 5 s, and
   ~490 requests failed open. The pool had one connection, the ping's;
-  every other one had to be dialed inside the 50 ms.
+  every other one had to be dialed inside the 50 ms. (Taken for the
+  cause; a later bench with a warm pool showed the same window, see the
+  top entry: the cold pool was real but not the cause.)
 - ratelimit.NewClient: DialTimeout is PoolDialTimeout (2 s), no longer the
   call's timeout; MinIdleConns 16, at most the pool size. Read, write and
   pool timeouts and the 50 ms call context are unchanged.
@@ -124,7 +153,8 @@ Newest entries first. Short: what was done, what was decided, what's next.
 
 ### Learned
 - The breaker turned 5 failures into ~490 fail-opens: 5 calls in a row
-  failing on a cold pool opened it, and for its 5 s cooldown every request
+  failing at load start opened it (blamed here on the cold pool; the top
+  entry corrects that), and for its 5 s cooldown every request
   (~100 req/s) got the fail mode with Redis healthy. A ~100x amplifier of
   a startup transient; breaker behavior unchanged here, for the upstream
   circuit breaker work next.
