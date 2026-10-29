@@ -51,9 +51,11 @@ const (
 	// key database: the admin API manages it.
 	defaultAdminAddr = "127.0.0.1:9465"
 	// defaultKeysRefresh is how often the key set is fetched from the
-	// database: the revocation latency (ADR 0005). minKeysRefresh keeps
-	// the fetch timeout, half the interval, long enough for a round trip to
-	// a database over a network, and keeps a typo such as 30ms from
+	// database. A revoked key stops working within it plus up to two fetch
+	// timeouts (min(refresh/2, 10s) each): at most 2x the refresh, 50 s
+	// with the defaults (ADR 0005). minKeysRefresh keeps the fetch
+	// timeout, half the interval below 20 s, long enough for a round trip
+	// to a database over a network, and keeps a typo such as 30ms from
 	// querying it 30 times a second per gateway.
 	defaultKeysRefresh = 30 * time.Second
 	minKeysRefresh     = time.Second
@@ -1009,8 +1011,14 @@ func loadKeyConfig(getenv func(string) string) (config, error) {
 	rawMaxStale := getenv("SENTINEL_KEYS_MAX_STALE")
 	if rawURL == "" {
 		clientKeys, err := keys.Parse(rawKeys)
-		if err != nil {
+		switch {
+		case err == nil:
+		case rawKeys == "":
 			return config{}, errors.New("SENTINEL_API_KEYS is not set; it is required unless SENTINEL_DATABASE_URL is set")
+		case errors.Is(err, keys.ErrNoKeys):
+			return config{}, errors.New("SENTINEL_API_KEYS has no keys, only commas or spaces; it needs at least one unless SENTINEL_DATABASE_URL is set")
+		default:
+			return config{}, fmt.Errorf("SENTINEL_API_KEYS: %w", err)
 		}
 		kc.clientKeys = clientKeys
 		if rawRefresh != "" {
@@ -1091,9 +1099,10 @@ func parseKeysMaxStale(s string, refresh time.Duration) (time.Duration, error) {
 // loadAdminConfig reads SENTINEL_ADMIN_ADDR and SENTINEL_ADMIN_TOKEN into
 // kc, which loadKeyConfig filled. The admin API exists only with a
 // database: by default on defaultAdminAddr, "off" disables it, and any
-// other address must be host:port on a port of its own (checkOwnPort).
-// Without a database, an address other than "off" is an error. The token
-// is required while the admin API is on; no error holds it.
+// other address must be host:port on a port of its own (checkOwnPort);
+// one off loopback is warned about. Without a database, an address other
+// than "off" is an error. The token is required while the admin API is
+// on; no error holds it.
 func loadAdminConfig(getenv func(string) string, kc *config, apiAddr, metricsAddr string) error {
 	addr := strings.TrimSpace(getenv("SENTINEL_ADMIN_ADDR"))
 	token := getenv("SENTINEL_ADMIN_TOKEN")
@@ -1130,8 +1139,28 @@ func loadAdminConfig(getenv func(string) string, kc *config, apiAddr, metricsAdd
 	if err := admin.ValidateToken(token); err != nil {
 		return fmt.Errorf("SENTINEL_ADMIN_TOKEN: %w", err)
 	}
+	if !isLoopbackAddr(addr) {
+		kc.keyWarnings = append(kc.keyWarnings, fmt.Sprintf("SENTINEL_ADMIN_ADDR %q is not a loopback address; "+
+			"the admin API is plain HTTP, so the admin token and newly created keys cross the network unencrypted "+
+			"unless only loopback can reach the port", addr))
+	}
 	kc.adminAddr, kc.adminToken = addr, token
 	return nil
+}
+
+// isLoopbackAddr reports whether host:port s listens on loopback only: a
+// loopback IP or "localhost". An empty host, an unspecified address and
+// any other hostname are not.
+func isLoopbackAddr(s string) bool {
+	host, _, err := net.SplitHostPort(s)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // parseMaxConcurrent reads the concurrency cap. Empty means

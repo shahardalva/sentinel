@@ -59,6 +59,23 @@ var dbBase = map[string]string{
 	"SENTINEL_ADMIN_TOKEN":  testToken,
 }
 
+// SENTINEL_API_KEYS unset (or empty) and set to only commas and spaces get
+// different errors: the second is a list with no keys in it.
+func TestLoadConfig_APIKeysMissingOrEmpty(t *testing.T) {
+	for raw, want := range map[string]string{
+		"":         "SENTINEL_API_KEYS is not set",
+		",":        "SENTINEL_API_KEYS has no keys",
+		" , ,  ":   "SENTINEL_API_KEYS has no keys",
+		"   ":      "SENTINEL_API_KEYS has no keys",
+		"\t,\n, ,": "SENTINEL_API_KEYS has no keys",
+	} {
+		_, err := loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": raw}))
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("SENTINEL_API_KEYS=%q: %v, want %q", raw, err, want)
+		}
+	}
+}
+
 func TestLoadConfig_KeySource(t *testing.T) {
 	cfg, err := loadConfig(env(map[string]string{"ANTHROPIC_API_KEY": "sk", "SENTINEL_API_KEYS": "k1,k2"}))
 	if err != nil {
@@ -346,6 +363,29 @@ func TestLoadConfig_AdminToken(t *testing.T) {
 	if err != nil || cfg.adminToken != "" || len(cfg.keyWarnings) != 1 ||
 		!strings.Contains(cfg.keyWarnings[0], "SENTINEL_DATABASE_URL is not") || strings.Contains(cfg.keyWarnings[0], testToken) {
 		t.Errorf("token without a database: %q, %v", cfg.keyWarnings, err)
+	}
+}
+
+// An admin address that more than loopback can reach gets one WARN: the
+// admin API is plain HTTP. "localhost" counts as loopback, any other
+// hostname does not.
+func TestLoadConfig_AdminNonLoopbackWarns(t *testing.T) {
+	for _, addr := range []string{"", "127.0.0.1:9465", "127.0.0.2:9465", "[::1]:9465", "localhost:9465", "LocalHost:9465"} {
+		cfg, err := loadConfig(env(with(dbBase, map[string]string{"SENTINEL_ADMIN_ADDR": addr})))
+		if err != nil || cfg.keyWarnings != nil {
+			t.Errorf("%q: warnings %q, %v", addr, cfg.keyWarnings, err)
+		}
+	}
+	for _, addr := range []string{":9465", "0.0.0.0:9465", "[::]:9465", "10.0.0.5:9465", "[fd00::1]:9465", "admin.example:9465", "localhost.example:9465"} {
+		cfg, err := loadConfig(env(with(dbBase, map[string]string{"SENTINEL_ADMIN_ADDR": addr})))
+		if err != nil || len(cfg.keyWarnings) != 1 {
+			t.Errorf("%q: warnings %q, %v", addr, cfg.keyWarnings, err)
+			continue
+		}
+		w := cfg.keyWarnings[0]
+		if !strings.Contains(w, "SENTINEL_ADMIN_ADDR") || !strings.Contains(w, "plain HTTP") || strings.Contains(w, testToken) {
+			t.Errorf("%q: warning %q", addr, w)
+		}
 	}
 }
 
@@ -924,24 +964,61 @@ func TestServe_DatabaseStartupFailures(t *testing.T) {
 // The real store.Open, on a server that isn't there and on a URL that
 // doesn't parse: no part of the URL reaches the error or the log.
 func TestServe_DatabaseURLNotLeaked(t *testing.T) {
-	for _, u := range []string{
-		"postgres://" + leakUser + ":" + leakPass + "@127.0.0.1:1/" + leakDB + "?sslmode=disable",
-		"postgres://" + leakUser + ":" + leakPass + "@" + leakHost + ":notaport/" + leakDB,
-		"host=" + leakHost + " user=" + leakUser + " password=" + leakPass + " dbname=" + leakDB + " sslmode=bogus",
+	for _, c := range []struct {
+		name, url string
+		connect   bool // parses, and fails at connect rather than at parsing
+	}{
+		{"refused", "postgres://" + leakUser + ":" + leakPass + "@127.0.0.1:1/" + leakDB + "?sslmode=disable", true},
+		{"bad port", "postgres://" + leakUser + ":" + leakPass + "@" + leakHost + ":notaport/" + leakDB, false},
+		{"bad sslmode", "host=" + leakHost + " user=" + leakUser + " password=" + leakPass + " dbname=" + leakDB + " sslmode=bogus", false},
+		// leakHost is under .invalid, which never resolves.
+		{"DNS failure", "postgres://" + leakUser + ":" + leakPass + "@" + leakHost + ":5432/" + leakDB + "?sslmode=disable", true},
+		{"refused key=value", "host=127.0.0.1 port=1 user=" + leakUser + " password=" + leakPass + " dbname=" + leakDB + " sslmode=disable", true},
 	} {
-		logs, err := serveErr(t, map[string]string{"SENTINEL_DATABASE_URL": u})
-		if !strings.HasPrefix(err.Error(), "SENTINEL_DATABASE_URL: store: open: ") {
-			t.Errorf("serve = %q, want a store open error", err)
-		}
-		logs.mu.Lock()
-		all := err.Error() + logs.buf.String()
-		logs.mu.Unlock()
-		for _, s := range []string{leakUser, leakPass, leakHost, leakDB, "127.0.0.1:1", testToken} {
-			if strings.Contains(all, s) {
-				t.Errorf("error or log holds %q: %s", s, all)
+		t.Run(c.name, func(t *testing.T) {
+			logs, err := serveErr(t, map[string]string{"SENTINEL_DATABASE_URL": c.url})
+			if !strings.HasPrefix(err.Error(), "SENTINEL_DATABASE_URL: store: open: ") {
+				t.Errorf("serve = %q, want a store open error", err)
 			}
+			if got := strings.Contains(err.Error(), "invalid connection string"); got == c.connect {
+				t.Errorf("serve = %q, want it to fail at connect: %v", err, c.connect)
+			}
+			assertNoLeak(t, err, logs, leakUser, leakPass, leakHost, leakDB, "127.0.0.1:1", testToken)
+		})
+	}
+}
+
+// assertNoLeak fails if err or the logs hold any of secrets.
+func assertNoLeak(t *testing.T, err error, logs *syncBuffer, secrets ...string) {
+	t.Helper()
+	logs.mu.Lock()
+	all := err.Error() + logs.buf.String()
+	logs.mu.Unlock()
+	for _, s := range secrets {
+		if strings.Contains(all, s) {
+			t.Errorf("error or log holds %q: %s", s, all)
 		}
 	}
+}
+
+// On a real Postgres, the right host with a wrong user and password fails
+// startup with an error that names neither, nor the host: the server's
+// own message ("password authentication failed for user ...") is dropped.
+func TestServe_DatabaseAuthFailureNotLeaked(t *testing.T) {
+	raw := os.Getenv("SENTINEL_TEST_POSTGRES_URL")
+	if raw == "" {
+		t.Skip("SENTINEL_TEST_POSTGRES_URL not set")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		t.Fatal("SENTINEL_TEST_POSTGRES_URL must be a postgres:// URL")
+	}
+	u.User = url.UserPassword(leakUser, leakPass)
+	logs, err := serveErr(t, map[string]string{"SENTINEL_DATABASE_URL": u.String()})
+	if !strings.HasPrefix(err.Error(), "SENTINEL_DATABASE_URL: store: open: cannot connect to postgres") {
+		t.Errorf("serve = %q, want a connect error", err)
+	}
+	assertNoLeak(t, err, logs, leakUser, leakPass, u.Host, testToken)
 }
 
 func TestServe_AdminBindFailureStopsStartup(t *testing.T) {

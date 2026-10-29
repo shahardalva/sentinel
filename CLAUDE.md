@@ -171,8 +171,10 @@ tool policies, and writes an audit log.
   (spaces) stops startup. No error or log ever holds the URL. pgx also
   honors PG* variables and ~/.pgpass.
 - SENTINEL_KEYS_REFRESH (optional): key fetch interval with a database,
-  Go duration, default 30s, at least 1s (revocation latency). Set without
-  a database: one WARN, ignored.
+  Go duration, default 30s, at least 1s. Revocation latency: within it
+  plus up to two fetch timeouts (min(refresh/2, 10s) each), so at most 2x
+  the refresh, 50 s with the defaults. Set without a database: one WARN,
+  ignored.
 - SENTINEL_KEYS_MAX_STALE (optional): how long the last good key set is
   served while refreshes fail, default 10m, 0 never expires. Past it every
   request gets 503 (sentinel_auth_keys_stale 1). Negative or under three
@@ -182,7 +184,9 @@ tool policies, and writes an audit log.
 - SENTINEL_ADMIN_ADDR (optional): admin API listener, default
   127.0.0.1:9465 with a database, "off" disables. Same parsing as the
   metrics addr; port must differ from the API's and the metrics' (port 0
-  exempt). Anything but off without a database stops startup. Binds after
+  exempt). A host other than localhost or a loopback IP (empty, 0.0.0.0
+  too) gets one WARN: plain HTTP. Anything but off without a database
+  stops startup. Binds after
   metrics, before the API, logs "admin listening"; a later Serve error is
   ERROR and the API keeps serving.
 - SENTINEL_ADMIN_TOKEN (required while the admin API is on):
