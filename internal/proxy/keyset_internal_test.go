@@ -105,3 +105,16 @@ func TestNewAuthSource_NilPanics(t *testing.T) {
 	}()
 	NewAuthSource(nil, slog.New(slog.DiscardHandler), nil)
 }
+
+func TestUnavailableKeySet(t *testing.T) {
+	u := UnavailableKeySet()
+	if !u.Unavailable() || u.Len() != 0 || u.list() != nil {
+		t.Errorf("UnavailableKeySet: unavailable %v, len %d; want true, 0, no digests", u.Unavailable(), u.Len())
+	}
+	var nilSet *KeySet
+	for name, s := range map[string]*KeySet{"nil": nilSet, "empty": NewKeySet(nil), "one": NewKeySet(DigestKeys([]string{"k"}))} {
+		if s.Unavailable() {
+			t.Errorf("%s set is unavailable", name)
+		}
+	}
+}

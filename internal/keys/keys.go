@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,9 +103,19 @@ type Config struct {
 	// Recorder, if not nil, is told the set's size and every refresh's
 	// outcome.
 	Recorder proxy.Recorder
-	// Now is the clock for the warning throttle; nil selects time.Now.
-	// Tests in a testing/synctest bubble pass a time offset from one taken
-	// outside it (see proxy.LogThrottle).
+	// MaxStale bounds how long the last good set is served while refreshes
+	// fail. Once the last successful fetch is longer ago than this, Keys
+	// returns proxy.UnavailableKeySet and every request gets a 503, so a
+	// key revoked while the key store is unreachable stops working after
+	// MaxStale at most, rather than never. Zero never expires the set. It
+	// must be at least two cycles, 2 x (Interval + FetchTimeout): a
+	// successful refresh comes up to one cycle after the last, and after
+	// one failed refresh up to two, so anything less would turn a single
+	// failed refresh into a 503 for every request.
+	MaxStale time.Duration
+	// Now is the clock for the warning throttle and MaxStale; nil selects
+	// time.Now. Tests in a testing/synctest bubble pass a time offset from
+	// one taken outside it (see proxy.LogThrottle).
 	Now func() time.Time
 }
 
@@ -122,6 +133,18 @@ type Refreshing struct {
 	now      func() time.Time
 	warn     proxy.LogThrottle
 	done     chan struct{}
+
+	maxStale time.Duration // 0: never stale
+	// base is the origin of lastOK, from now, so ages use the monotonic
+	// clock.
+	base time.Time
+	// lastOK is the offset from base of the last successful fetch.
+	lastOK atomic.Int64
+	// stale is whether the set was last found stale, and staleMu orders
+	// its changes, so each is logged and recorded once.
+	stale   atomic.Bool
+	staleMu sync.Mutex
+	hooks   staleHooks
 }
 
 var _ proxy.KeySource = (*Refreshing)(nil)
@@ -134,6 +157,17 @@ var _ proxy.KeySource = (*Refreshing)(nil)
 // loaded. A first fetch that succeeds with no keys is accepted, and every
 // request is rejected until a refresh brings some.
 func NewRefreshing(ctx context.Context, cfg Config) (*Refreshing, error) {
+	return newRefreshing(ctx, cfg, staleHooks{})
+}
+
+// staleHooks let tests stop a stale check at a chosen point; nil in
+// production.
+type staleHooks struct {
+	beforeRecheck func() // a refresh is about to recheck under staleMu
+	afterDecide   func() // a check under staleMu has decided, not recorded
+}
+
+func newRefreshing(ctx context.Context, cfg Config, hooks staleHooks) (*Refreshing, error) {
 	if cfg.Fetch == nil {
 		return nil, errors.New("keys: nil Fetch")
 	}
@@ -145,6 +179,9 @@ func NewRefreshing(ctx context.Context, cfg Config) (*Refreshing, error) {
 	}
 	if cfg.FetchTimeout <= 0 || cfg.FetchTimeout >= cfg.Interval {
 		return nil, fmt.Errorf("keys: FetchTimeout must be positive and less than Interval (%s), got %s", cfg.Interval, cfg.FetchTimeout)
+	}
+	if two := 2 * (cfg.Interval + cfg.FetchTimeout); cfg.MaxStale < 0 || (cfg.MaxStale > 0 && cfg.MaxStale < two) {
+		return nil, fmt.Errorf("keys: MaxStale must be 0 or at least 2 x (Interval + FetchTimeout) (%s), got %s", two, cfg.MaxStale)
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -163,6 +200,9 @@ func NewRefreshing(ctx context.Context, cfg Config) (*Refreshing, error) {
 		rec:      cfg.Recorder,
 		now:      cfg.Now,
 		done:     make(chan struct{}),
+		maxStale: cfg.MaxStale,
+		base:     cfg.Now(),
+		hooks:    hooks,
 	}
 	fctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -174,17 +214,86 @@ func NewRefreshing(ctx context.Context, cfg Config) (*Refreshing, error) {
 		return nil, fmt.Errorf("keys: initial fetch: %w", err)
 	}
 	r.store(ctx, digests)
+	if r.maxStale > 0 && r.rec != nil {
+		r.rec.RecordKeysStale(ctx, false)
+	}
 	go r.run(ctx)
 	return r, nil
 }
 
 // Keys implements proxy.KeySource. A nil Refreshing has no keys, so it
-// rejects every request rather than panicking.
+// rejects every request rather than panicking. Past MaxStale it returns
+// proxy.UnavailableKeySet.
 func (r *Refreshing) Keys() *proxy.KeySet {
 	if r == nil {
 		return nil
 	}
+	if r.maxStale > 0 && r.checkStale(context.Background()) {
+		return proxy.UnavailableKeySet()
+	}
 	return r.cur.Load()
+}
+
+// checkStale reports whether the last good set is older than maxStale, and
+// logs and records a change since the last check, for a request. Without a
+// change it costs a clock read and two atomic loads; with one it is
+// syncStale.
+func (r *Refreshing) checkStale(ctx context.Context) bool {
+	stale := r.age() > r.maxStale
+	if stale == r.stale.Load() {
+		return stale
+	}
+	return r.syncStale(ctx)
+}
+
+// recheckStale is a refresh's check, so a change is noticed without
+// traffic too. It always takes staleMu, never checkStale's lock-free path:
+// a request may hold the lock having decided "stale" just before this
+// refresh succeeded, and is about to record it. Seen lock-free, the flag
+// still reads fresh, as the age now does, so the refresh would return and
+// the request would then leave the log and gauge at "stale" while fresh
+// keys are served. Under the lock the refresh waits for the request and
+// records the recovery. Once per interval, so the lock costs nothing.
+func (r *Refreshing) recheckStale(ctx context.Context) {
+	if h := r.hooks.beforeRecheck; h != nil {
+		h()
+	}
+	r.syncStale(ctx)
+}
+
+// syncStale decides staleness under staleMu, with a fresh age, and logs
+// and records it if it changed: ERROR on going stale, INFO on recovering.
+func (r *Refreshing) syncStale(ctx context.Context) bool {
+	r.staleMu.Lock()
+	defer r.staleMu.Unlock()
+	// The age is read under the lock: a refresh may have succeeded since
+	// the caller looked, and a concurrent check may have logged the change.
+	age := r.age()
+	stale := age > r.maxStale
+	if h := r.hooks.afterDecide; h != nil {
+		h()
+	}
+	if stale == r.stale.Load() {
+		return stale
+	}
+	r.stale.Store(stale)
+	if stale {
+		r.logger.LogAttrs(ctx, slog.LevelError, "client keys are stale; rejecting every request with 503",
+			slog.String("last_refresh_age", age.Round(time.Millisecond).String()),
+			slog.String("max_stale", r.maxStale.String()),
+		)
+	} else {
+		r.logger.LogAttrs(ctx, slog.LevelInfo, "client keys are fresh again; accepting requests")
+	}
+	if r.rec != nil {
+		r.rec.RecordKeysStale(ctx, stale)
+	}
+	return stale
+}
+
+// age is the time since the last successful fetch.
+func (r *Refreshing) age() time.Duration {
+	return r.now().Sub(r.base) - time.Duration(r.lastOK.Load())
 }
 
 // Done is closed once the refresh loop has stopped, after ctx is done. A
@@ -234,6 +343,9 @@ func (r *Refreshing) refresh(ctx context.Context) {
 				slog.Int64("suppressed", suppressed),
 			)
 		}
+		if r.maxStale > 0 {
+			r.recheckStale(ctx)
+		}
 		return
 	}
 	r.store(ctx, digests)
@@ -243,6 +355,10 @@ func (r *Refreshing) refresh(ctx context.Context) {
 func (r *Refreshing) store(ctx context.Context, digests [][sha256.Size]byte) {
 	set := proxy.NewKeySet(digests)
 	prev := r.cur.Swap(set)
+	r.lastOK.Store(int64(r.now().Sub(r.base)))
+	if r.maxStale > 0 {
+		r.recheckStale(ctx)
+	}
 	if set.Len() == 0 && (prev == nil || prev.Len() > 0) {
 		r.logger.LogAttrs(ctx, slog.LevelWarn, "client key set is empty; every request is rejected")
 	}

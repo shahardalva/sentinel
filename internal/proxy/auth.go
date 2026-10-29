@@ -75,12 +75,20 @@ func (a *Auth) Require(errs ErrorFormatter, next http.Handler) http.Handler {
 		rc := http.NewResponseController(w)
 		_ = rc.SetReadDeadline(time.Now().Add(authReadTimeout))
 
+		// One snapshot per request: a refresh during the loop can't mix two
+		// sets.
+		set := a.keys.Keys()
+		if set.Unavailable() {
+			// Not a rejection of the key: the gateway can't check any. The
+			// source logs and records it; per request it is only the 503.
+			rejectEarly(w, errs, http.StatusServiceUnavailable, ErrAPI, "client keys cannot be verified")
+			return
+		}
 		presented := clientKey(r.Header)
 		got := sha256.Sum256([]byte(presented))
-		// One snapshot per request: a refresh during the loop can't mix two
-		// sets. Every digest is compared, whether or not one already matched.
+		// Every digest is compared, whether or not one already matched.
 		match := 0
-		for _, d := range a.keys.Keys().list() {
+		for _, d := range set.list() {
 			match |= subtle.ConstantTimeCompare(got[:], d[:])
 		}
 		if presented == "" || match != 1 {

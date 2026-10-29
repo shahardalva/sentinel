@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -56,6 +57,12 @@ const (
 	// querying it 30 times a second per gateway.
 	defaultKeysRefresh = 30 * time.Second
 	minKeysRefresh     = time.Second
+	// defaultKeysMaxStale is how long the gateway serves its last good key
+	// set while the database can't be reached, before it answers 503 to
+	// every request (ADR 0005): the longest a revoked key keeps working
+	// through an outage. 10 minutes rides out a database failover or a
+	// short network outage, 20 refreshes at the default interval.
+	defaultKeysMaxStale = 10 * time.Minute
 )
 
 // Deadlines for the key database and the admin API; vars so tests can
@@ -76,9 +83,18 @@ const (
 // on a gateway's startup, and the deadline rolls it back whole rather
 // than leaving startup hanging.
 //
-// adminShutdownTimeout bounds the admin server's graceful shutdown: an
-// admin request is one store call of at most 5 s (admin's own timeout),
-// and nothing on the admin port streams.
+// adminShutdownTimeout bounds the admin server's graceful shutdown, for a
+// client to get the answer to a request in flight: an admin request is one
+// store call of at most admin.StoreTimeout (5 s), and nothing on the admin
+// port streams. Shorter than shutdownTimeout, which is for streams; it
+// runs alongside the API's drain, so it adds nothing to it.
+//
+// adminDrainTimeout bounds the wait for admin handlers once their
+// connections are cut. All that is left of a handler then is its store
+// call, which admin.StoreTimeout bounds (the body read fails at once on
+// the closed connection), and its audit line; the extra second is for
+// those. A handler past it is stuck in a store call that ignores its
+// context.
 //
 // keysStopTimeout bounds the wait for the refresh loop at shutdown. A
 // fetch honors its context, so it returns at once when cancelled.
@@ -87,6 +103,7 @@ var (
 	storeMigrateTimeout  = 30 * time.Second
 	adminShutdownTimeout = 5 * time.Second
 	keysStopTimeout      = 5 * time.Second
+	adminDrainTimeout    = admin.StoreTimeout + time.Second
 )
 
 func main() {
@@ -194,7 +211,10 @@ type config struct {
 	// a password: never log it or put it in an error.
 	databaseURL string
 	keysRefresh time.Duration // with a database only
-	adminAddr   string        // empty without a database or when "off"
+	// keysMaxStale is how old the key set may get while refreshes fail
+	// before every request gets a 503; 0 never. With a database only.
+	keysMaxStale time.Duration
+	adminAddr    string // empty without a database or when "off"
 	// adminToken is SENTINEL_ADMIN_TOKEN, set when adminAddr is. Never log
 	// it.
 	adminToken string
@@ -314,6 +334,7 @@ func loadConfig(getenv func(string) string, environ func() []string) (config, er
 		clientKeys:     kc.clientKeys,
 		databaseURL:    kc.databaseURL,
 		keysRefresh:    kc.keysRefresh,
+		keysMaxStale:   kc.keysMaxStale,
 		adminAddr:      kc.adminAddr,
 		adminToken:     kc.adminToken,
 		keyWarnings:    kc.keyWarnings,
@@ -381,7 +402,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 
 	src, db, stopKeys, err := startKeys(ctx, logger, cfg, opts.Recorder)
 	if err != nil {
-		if ctx.Err() != nil {
+		if startupInterrupted(ctx, err) {
 			// A signal while startup waited on the database: a stop that
 			// was asked for, not a failure, so no error exit.
 			logger.Info("startup interrupted", "error", err)
@@ -389,7 +410,10 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		}
 		return err
 	}
-	defer stopKeys()
+	// storeIdle turns false if an admin handler is still running at the
+	// end; the store is then left open (see stopAdmin).
+	storeIdle := true
+	defer func() { stopKeys(storeIdle) }()
 
 	mux := newMux(cfg, logger, opts, src)
 
@@ -428,7 +452,7 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 	// the admin API. Keys keep refreshing and the API keeps serving; an
 	// operator who can't issue or revoke a key for a while is better off
 	// than every client losing the gateway.
-	var adminSrv *http.Server
+	var stopAdminAPI func() bool // nil without an admin API
 	switch {
 	case db == nil:
 	case cfg.adminAddr == "":
@@ -438,13 +462,18 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("SENTINEL_ADMIN_ADDR: %w", err)
 		}
-		adminSrv = newAdminServer(admin.New(admin.Config{Store: db, Token: cfg.adminToken, Logger: logger}), logger)
+		api := admin.New(admin.Config{Store: db, Token: cfg.adminToken, Logger: logger})
+		adminSrv := newAdminServer(api, logger)
 		go func() {
 			if err := adminSrv.Serve(aln); !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("admin server stopped; the API keeps serving without the admin API", "error", err)
 			}
 		}()
-		defer adminSrv.Close()
+		// Every return from here stops the admin API, and waits for its
+		// handlers, before the deferred stopKeys closes the store they use.
+		// At shutdown it starts at once (below); this then waits for it.
+		stopAdminAPI = sync.OnceValue(func() bool { return stopAdmin(logger, adminSrv, api) })
+		defer func() { storeIdle = stopAdminAPI() }()
 	}
 
 	ln, err := listen(logger, cfg.addr)
@@ -464,24 +493,20 @@ func serve(ctx context.Context, logger *slog.Logger, cfg config) error {
 	// Give in-flight requests, including streams, a grace period to finish,
 	// then cut whatever is still open.
 	logger.Info("shutting down", "grace_period", shutdownTimeout.String())
+	// The admin API stops alongside the API's drain, not after it: no
+	// change starts once shutdown has begun. The deferred stopAdminAPI
+	// waits for it before the store is closed.
+	if stopAdminAPI != nil {
+		go stopAdminAPI()
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("grace period expired; closing open connections", "error", err)
 		_ = srv.Close()
 	}
-	// After the API, so a scrape during the grace period still answers,
-	// and the admin API before the key store it uses is closed (the
-	// deferred stopKeys). The deferred Closes cut whatever outlives this.
-	if adminSrv != nil {
-		actx, acancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
-		defer acancel()
-		if err := adminSrv.Shutdown(actx); err != nil {
-			// The deferred Close cuts the admin requests still open; a
-			// change among them may or may not have been applied.
-			logger.Warn("admin grace period expired; closing open admin connections", "error", err)
-		}
-	}
+	// After the API, so a scrape during the grace period still answers.
+	// The deferred Close cuts whatever outlives this.
 	if metricsSrv != nil {
 		mctx, mcancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
 		defer mcancel()
@@ -545,6 +570,32 @@ func newAdminServer(h http.Handler, logger *slog.Logger) *http.Server {
 	}
 }
 
+// stopAdmin stops the admin API before the key store it uses is closed: it
+// stops accepting, gives the requests open adminShutdownTimeout to be
+// answered, cuts the connections still open, then waits up to
+// adminDrainTimeout for their handlers. A change whose connection was cut
+// still runs to its end and writes its audit line, and neither the store's
+// Close nor the process's exit may come first. It reports whether every
+// handler finished; if not, the store must stay open, since pgxpool.Close
+// would wait for the connection the stuck call holds.
+func stopAdmin(logger *slog.Logger, srv *http.Server, api *admin.API) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		// A change among the requests cut may or may not be applied; if it
+		// is, the drain below lets it log so.
+		logger.Warn("admin grace period expired; closing open admin connections", "error", err)
+		_ = srv.Close()
+	}
+	dctx, dcancel := context.WithTimeout(context.Background(), adminDrainTimeout)
+	defer dcancel()
+	if err := api.Drain(dctx); err != nil {
+		logger.Warn("admin requests still running; leaving the key store open", "waited", adminDrainTimeout.String())
+		return false
+	}
+	return true
+}
+
 // keyStore is what the gateway needs of the key database: the admin API's
 // calls, the migrations and the key fetch. *store.Store satisfies it.
 type keyStore interface {
@@ -572,16 +623,17 @@ var openStore = func(ctx context.Context, url string) (keyStore, error) {
 // With one, startKeys opens and migrates the database, each within its
 // deadline, and starts a keys.Refreshing on it, which has loaded the keys
 // once when startKeys returns. stop cancels the refresh, waits for it a
-// bounded time, and closes the database.
+// bounded time, and closes the database if closeStore is set; the caller
+// clears it while something else may still be using the store.
 //
 // ctx cancels the startup steps but not the refresh, so keys keep
 // refreshing while the API drains its requests at shutdown, until stop.
 // Every error is safe to log: the store's are sanitized, and none holds
 // the URL.
-func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.Recorder) (src proxy.KeySource, db keyStore, stop func(), err error) {
+func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.Recorder) (src proxy.KeySource, db keyStore, stop func(closeStore bool), err error) {
 	if cfg.databaseURL == "" {
 		logger.Info("client keys from SENTINEL_API_KEYS", "keys", len(cfg.clientKeys))
-		return keys.NewStatic(cfg.clientKeys, rec), nil, func() {}, nil
+		return keys.NewStatic(cfg.clientKeys, rec), nil, func(bool) {}, nil
 	}
 
 	octx, ocancel := context.WithTimeout(ctx, storeOpenTimeout)
@@ -608,6 +660,7 @@ func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.R
 	r, err := keys.NewRefreshing(rctx, keys.Config{
 		Fetch:    db.ActiveDigests,
 		Interval: cfg.keysRefresh,
+		MaxStale: cfg.keysMaxStale,
 		Logger:   logger,
 		Recorder: rec,
 	})
@@ -618,8 +671,8 @@ func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.R
 		return nil, nil, nil, fmt.Errorf("key store: %w", err)
 	}
 	logger.Info("client keys from postgres", "keys", r.Keys().Len(),
-		"refresh", cfg.keysRefresh.String(), "schema_version", version)
-	stop = func() {
+		"refresh", cfg.keysRefresh.String(), "max_stale", cfg.keysMaxStale.String(), "schema_version", version)
+	stop = func(closeStore bool) {
 		rcancel()
 		select {
 		case <-r.Done():
@@ -628,9 +681,20 @@ func startKeys(ctx context.Context, logger *slog.Logger, cfg config, rec proxy.R
 			logger.Warn("key refresh did not stop; leaving the key store open", "waited", keysStopTimeout.String())
 			return
 		}
-		db.Close()
+		if closeStore {
+			db.Close()
+		}
 	}
 	return r, db, stop, nil
+}
+
+// startupInterrupted reports whether startKeys failed because a signal
+// cancelled ctx: the error is the cancellation itself, a Canceled or a
+// DeadlineExceeded (a step's own deadline that ran out as the signal came),
+// and ctx is done. Any other error is a real failure even if a signal
+// arrived meanwhile: ErrSchemaTooNew must not exit 0.
+func startupInterrupted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 // startupError wraps the error of a startup step on the key database. A
@@ -935,13 +999,14 @@ func checkOwnPort(s, what string, others ...listenerAddr) error {
 
 // loadKeyConfig reads where the client keys come from:
 // SENTINEL_API_KEYS, or the database at SENTINEL_DATABASE_URL, never both,
-// and SENTINEL_KEYS_REFRESH for the database. The returned config has only
+// and SENTINEL_KEYS_REFRESH and SENTINEL_KEYS_MAX_STALE for the database. The returned config has only
 // those fields. No error holds the URL, which may carry a password.
 func loadKeyConfig(getenv func(string) string) (config, error) {
 	var kc config
 	rawURL := getenv("SENTINEL_DATABASE_URL")
 	rawKeys := getenv("SENTINEL_API_KEYS")
 	rawRefresh := getenv("SENTINEL_KEYS_REFRESH")
+	rawMaxStale := getenv("SENTINEL_KEYS_MAX_STALE")
 	if rawURL == "" {
 		clientKeys, err := keys.Parse(rawKeys)
 		if err != nil {
@@ -950,6 +1015,9 @@ func loadKeyConfig(getenv func(string) string) (config, error) {
 		kc.clientKeys = clientKeys
 		if rawRefresh != "" {
 			kc.keyWarnings = append(kc.keyWarnings, "SENTINEL_KEYS_REFRESH is set but SENTINEL_DATABASE_URL is not; ignoring")
+		}
+		if rawMaxStale != "" {
+			kc.keyWarnings = append(kc.keyWarnings, "SENTINEL_KEYS_MAX_STALE is set but SENTINEL_DATABASE_URL is not; ignoring")
 		}
 		return kc, nil
 	}
@@ -967,7 +1035,11 @@ func loadKeyConfig(getenv func(string) string) (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("SENTINEL_KEYS_REFRESH: %w", err)
 	}
-	kc.keysRefresh = refresh
+	maxStale, err := parseKeysMaxStale(rawMaxStale, refresh)
+	if err != nil {
+		return config{}, fmt.Errorf("SENTINEL_KEYS_MAX_STALE: %w", err)
+	}
+	kc.keysRefresh, kc.keysMaxStale = refresh, maxStale
 	return kc, nil
 }
 
@@ -986,6 +1058,34 @@ func parseKeysRefresh(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("%q is under the minimum of %s", s, minKeysRefresh)
 	}
 	return d, nil
+}
+
+// parseKeysMaxStale reads SENTINEL_KEYS_MAX_STALE, a Go duration such as
+// 10m, or 0 to never expire the key set. Empty means defaultKeysMaxStale.
+// Anything else must be at least three times refresh. The fetch timeout
+// is at most half of refresh, so a successful refresh comes up to 1.5 x
+// refresh after the last, and after one failed refresh the next success
+// lands by 3 x refresh. With 2 x, a single failed refresh would put every
+// request on a 503. The default is held to the same rule, so a long
+// refresh needs the variable set rather than a limit quietly raised.
+func parseKeysMaxStale(s string, refresh time.Duration) (time.Duration, error) {
+	d := defaultKeysMaxStale
+	if s != "" {
+		var err error
+		if d, err = time.ParseDuration(strings.TrimSpace(s)); err != nil {
+			return 0, fmt.Errorf("%q is not a duration such as 10m, or 0 to never expire the key set", s)
+		}
+		if d < 0 {
+			return 0, fmt.Errorf("%q is negative", s)
+		}
+	}
+	if d == 0 || d >= 3*refresh {
+		return d, nil
+	}
+	if s == "" {
+		return 0, fmt.Errorf("the default of %s is under three times SENTINEL_KEYS_REFRESH (%s); set SENTINEL_KEYS_MAX_STALE to at least %s, or 0 to never expire the key set", d, refresh, 3*refresh)
+	}
+	return 0, fmt.Errorf("%q is under three times SENTINEL_KEYS_REFRESH (%s), so one failed refresh would answer every request with a 503", s, refresh)
 }
 
 // loadAdminConfig reads SENTINEL_ADMIN_ADDR and SENTINEL_ADMIN_TOKEN into

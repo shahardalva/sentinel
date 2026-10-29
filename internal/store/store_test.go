@@ -494,6 +494,7 @@ type refreshCounter struct{ finished, lastOK atomic.Int64 }
 func (*refreshCounter) RecordRequest(context.Context, proxy.RequestInfo) {}
 func (*refreshCounter) RecordAuthRejection(context.Context)              {}
 func (*refreshCounter) RecordKeySetSize(context.Context, int)            {}
+func (*refreshCounter) RecordKeysStale(context.Context, bool)            {}
 func (r *refreshCounter) RecordKeyRefresh(_ context.Context, ok bool) {
 	n := r.finished.Add(1)
 	if ok {

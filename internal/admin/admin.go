@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
@@ -31,13 +32,27 @@ import (
 // name of at most 200 bytes, escaped.
 const maxBodyBytes = 4 << 10
 
-// storeTimeout bounds every store call, so a hung database or an
+// StoreTimeout bounds every store call, so a hung database or an
 // exhausted pool can't hold a request forever; the server's own timeouts
 // don't cancel a running handler. A read also ends when the client goes
 // away. A change doesn't: once started it runs to the end or to this
 // timeout, so a change that commits is always answered or logged as one,
 // never dropped half-way because the client left (see changeContext).
-const storeTimeout = 5 * time.Second
+const StoreTimeout = 5 * time.Second
+
+// MaxInFlight caps the admin requests past the token check at once: 4 of
+// the pool's store.MaxConns (8). Every Store method runs its queries one
+// after another, so a request holds at most one connection while it runs,
+// and the rest stay free for the key refresh, which shares the pool: a
+// flood of admin requests can't starve the refresh that applies a
+// revocation. That holds while Postgres answers: a call that times out
+// frees its slot at once, but pgx may keep its connection for up to 15 s
+// more to clean up (see store.MaxConns). A request over the cap gets a
+// 503 with
+// Retry-After at once, never a place in a queue, where it would wait
+// holding its connection to the gateway. Derived from store.MaxConns, so
+// it stays below it.
+const MaxInFlight = store.MaxConns / 2
 
 // actor names who made a change in the audit log. There is one shared
 // token, so it says no more than that.
@@ -70,6 +85,9 @@ type handler struct {
 	logger *slog.Logger
 	warn   proxy.LogThrottle
 	now    func() time.Time // time.Now; tests replace it
+	// slots holds a token per request past the token check, MaxInFlight
+	// at most.
+	slots chan struct{}
 }
 
 // New returns the admin API. Its routes, JSON in and out:
@@ -85,7 +103,7 @@ type handler struct {
 // gets the same 401 and nothing else is learned. Errors are
 // {"error":{"type","message"}}. New panics if cfg has no Store or Logger
 // or its Token fails ValidateToken; validate the token at startup first.
-func New(cfg Config) http.Handler {
+func New(cfg Config) *API {
 	if cfg.Store == nil || cfg.Logger == nil {
 		panic("admin: New needs a Store and a Logger")
 	}
@@ -97,6 +115,7 @@ func New(cfg Config) http.Handler {
 		token:  sha256.Sum256([]byte(cfg.Token)),
 		logger: cfg.Logger,
 		now:    time.Now,
+		slots:  make(chan struct{}, MaxInFlight),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/tenants", h.createTenant)
@@ -114,7 +133,62 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		rejectEarly(w, http.StatusNotFound, errNotFound, "no such route")
 	})
-	return commonHeaders(h.requireToken(requireCleanPath(mux)))
+	return &API{Handler: commonHeaders(h.requireToken(h.limitInFlight(requireCleanPath(mux)))), h: h}
+}
+
+// API is the admin API, an http.Handler, with Drain for shutdown.
+type API struct {
+	http.Handler
+	h *handler
+	// drainMu serializes Drain calls; drained is set once one has taken
+	// every slot.
+	drainMu sync.Mutex
+	drained bool
+}
+
+// Drain waits for every request past the token check to finish, by taking
+// all MaxInFlight slots, and keeps them: from then on every request is
+// turned away with a 503 before it reaches the store. http.Server.Shutdown
+// stops waiting for handlers when its context ends, and Close never waits,
+// so after them Drain is what tells a change still running from one that
+// has committed and been logged. If ctx ends first, Drain gives the slots
+// it took back and returns ctx's error. A call after one that returned nil
+// returns nil at once: it already holds every slot. Calls don't overlap; a
+// second waits for the first.
+func (a *API) Drain(ctx context.Context) error {
+	a.drainMu.Lock()
+	defer a.drainMu.Unlock()
+	if a.drained {
+		return nil
+	}
+	for taken := range MaxInFlight {
+		select {
+		case a.h.slots <- struct{}{}:
+		case <-ctx.Done():
+			for range taken {
+				<-a.h.slots
+			}
+			return ctx.Err()
+		}
+	}
+	a.drained = true
+	return nil
+}
+
+// limitInFlight runs next only while fewer than MaxInFlight requests are
+// in it, and answers any other with a 503 at once.
+func (h *handler) limitInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case h.slots <- struct{}{}:
+		default:
+			w.Header().Set("Retry-After", "1")
+			rejectEarly(w, http.StatusServiceUnavailable, errOverloaded, "too many admin requests in flight")
+			return
+		}
+		defer func() { <-h.slots }()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *handler) createTenant(w http.ResponseWriter, r *http.Request) {
@@ -230,16 +304,16 @@ func (h *handler) revokeKey(w http.ResponseWriter, r *http.Request) {
 // changeContext is the context for a store call that changes something:
 // r's values, but not its cancellation, so a client that disconnects
 // can't cancel the change after the database has committed it, which
-// would leave a change without its audit line. storeTimeout still bounds
+// would leave a change without its audit line. StoreTimeout still bounds
 // it.
 func changeContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.Context()), storeTimeout)
+	return context.WithTimeout(context.WithoutCancel(r.Context()), StoreTimeout)
 }
 
 // readContext is the context for a store call that only reads: it ends
-// when the client goes away, or after storeTimeout.
+// when the client goes away, or after StoreTimeout.
 func readContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), storeTimeout)
+	return context.WithTimeout(r.Context(), StoreTimeout)
 }
 
 // tenant is a tenant as the API shows it.
@@ -428,6 +502,7 @@ const (
 	errConflict             = "conflict_error"
 	errTooLarge             = "request_too_large_error"
 	errUnsupportedMediaType = "unsupported_media_type_error"
+	errOverloaded           = "overloaded_error"
 	errInternal             = "internal_error"
 )
 

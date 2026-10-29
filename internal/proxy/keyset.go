@@ -10,8 +10,24 @@ import (
 // same KeySet to any number of requests at once. A nil or empty KeySet
 // accepts no key.
 type KeySet struct {
-	digests [][sha256.Size]byte
+	digests     [][sha256.Size]byte
+	unavailable bool
 }
+
+// unavailableSet is the one KeySet UnavailableKeySet returns; it has no
+// digests and can't be changed, so sharing it is safe.
+var unavailableSet = &KeySet{unavailable: true}
+
+// UnavailableKeySet returns the KeySet a KeySource serves when it can't
+// vouch for its keys, such as a refreshing source whose last good set is
+// too old to trust. An Auth answers every request with a 503 for it,
+// rather than the 401 an empty set gets: the client's key may well be
+// valid, and it is the gateway that can't check it.
+func UnavailableKeySet() *KeySet { return unavailableSet }
+
+// Unavailable reports whether s is the UnavailableKeySet; false for a nil
+// KeySet, which is merely empty.
+func (s *KeySet) Unavailable() bool { return s != nil && s.unavailable }
 
 // DigestKeys returns the SHA-256 digests of keys, dropping empty keys: an
 // empty key is never accepted.
@@ -50,8 +66,9 @@ func (s *KeySet) list() [][sha256.Size]byte {
 // per request, on the request's goroutine, before the request goes any
 // further than hashing the presented key; it must be safe for concurrent
 // use and cheap. A source that changes its keys returns a new KeySet rather
-// than changing one already returned. One KeySource serves the whole
-// process (see Recorder.RecordKeySetSize).
+// than changing one already returned. A source that can't vouch for its
+// keys returns UnavailableKeySet(), and the request gets a 503. One
+// KeySource serves the whole process (see Recorder.RecordKeySetSize).
 type KeySource interface {
 	Keys() *KeySet
 }

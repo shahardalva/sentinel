@@ -125,3 +125,41 @@ func TestGateway_CredentialsNotLeaked(t *testing.T) {
 		}
 	}
 }
+
+// unavailableKeys is a KeySource that can't vouch for its keys.
+type unavailableKeys struct{}
+
+func (unavailableKeys) Keys() *proxy.KeySet { return proxy.UnavailableKeySet() }
+
+// A source that can't vouch for its keys makes every request a 503,
+// whatever it presents: the key may well be valid, so a 401 would tell the
+// client to fix what isn't broken. It is not an auth rejection.
+func TestAuth_UnavailableKeysAre503(t *testing.T) {
+	rec := &fakeRecorder{}
+	called := false
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })
+	h := proxy.NewAuthSource(unavailableKeys{}, slog.New(slog.DiscardHandler), rec).Require(anthropicErrors, next)
+	for _, key := range []string{"", "any-key"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		if key != "" {
+			req.Header.Set("X-Api-Key", key)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("key %q: status %d, want 503", key, w.Code)
+		}
+		if typ := errorType(t, w); typ != "api_error" {
+			t.Errorf("key %q: error type %q, want api_error", key, typ)
+		}
+		if c := w.Header().Get("Connection"); c != "close" {
+			t.Errorf("key %q: Connection = %q, want close", key, c)
+		}
+	}
+	if called {
+		t.Error("next ran without verified keys")
+	}
+	if rec.auth != 0 {
+		t.Errorf("%d auth rejections recorded, want 0: no key was found wrong", rec.auth)
+	}
+}

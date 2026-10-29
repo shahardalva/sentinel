@@ -3,15 +3,21 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/shahardalva/sentinel/internal/store"
 )
 
 // dbConfig is a valid config for a gateway on a key database, every
@@ -176,6 +182,65 @@ func TestServe_SignalDuringStartup(t *testing.T) {
 	}
 }
 
+// A real startup failure that happens to coincide with a signal is still
+// a failure: only an error that is itself the cancellation reads as an
+// interrupted startup. Here Migrate fails with ErrSchemaTooNew just as the
+// signal arrives.
+func TestServe_StartupFailureDuringSignalIsAnError(t *testing.T) {
+	f := newFakeStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.migrate = func(context.Context) error {
+		cancel()
+		return store.ErrSchemaTooNew
+	}
+	useStore(t, f, nil)
+	logs := &syncBuffer{}
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, slog.New(slog.NewJSONHandler(logs, nil)), dbConfig(t, nil)) }()
+	err := wait(t, done, 5*time.Second, "serve to return")
+	if !errors.Is(err, store.ErrSchemaTooNew) {
+		t.Errorf("serve = %v, want ErrSchemaTooNew", err)
+	}
+	for _, line := range logs.lines(t) {
+		if line["msg"] == "startup interrupted" {
+			t.Errorf("logged %v for a real failure", line)
+		}
+	}
+}
+
+func TestStartupInterrupted(t *testing.T) {
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	live := context.Background()
+	// A real *store.Error from store's sanitize path: store.Open on a
+	// cancelled context, as Ctrl-C during the connect leaves it, wrapped
+	// with %w by startupError as startKeys does.
+	_, openErr := store.Open(done, "postgres://u@127.0.0.1:1/db?sslmode=disable")
+	if se, ok := errors.AsType[*store.Error](openErr); !ok || !errors.Is(se, context.Canceled) {
+		t.Fatalf("store.Open on a cancelled ctx = %v, want a *store.Error wrapping context.Canceled", openErr)
+	}
+	realCancel := startupError(done, "SENTINEL_DATABASE_URL", openErr, storeOpenTimeout)
+	for _, tt := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"canceled by the signal", done, fmt.Errorf("store: open: %w", context.Canceled), true},
+		{"store.Open canceled by the signal", done, realCancel, true},
+		{"deadline as the signal came", done, fmt.Errorf("store: migrate: %w", context.DeadlineExceeded), true},
+		{"schema too new as the signal came", done, fmt.Errorf("key store migration: %w", store.ErrSchemaTooNew), false},
+		{"store error as the signal came", done, &store.Error{Op: "open"}, false},
+		{"canceled without a signal", live, context.Canceled, false},
+		{"own deadline without a signal", live, context.DeadlineExceeded, false},
+	} {
+		if got := startupInterrupted(tt.ctx, tt.err); got != tt.want {
+			t.Errorf("%s: startupInterrupted = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 // Open and Migrate each get their own deadline. In a synctest bubble the
 // clock moves only when every goroutine is blocked, so a step that waits
 // on its context returns exactly at its deadline; without one it would
@@ -263,11 +328,62 @@ func TestServe_StuckRefreshLeavesStoreOpen(t *testing.T) {
 	}
 }
 
-// An admin request still open when the admin grace period ends is cut,
-// with a WARN, as the API's are.
-func TestServe_AdminShutdownTimeoutWarns(t *testing.T) {
+// An admin change still running when the admin grace period ends keeps
+// running to its end: its connection is cut, but shutdown waits for the
+// handler, so the change that committed is logged, and the store is
+// closed only after it.
+func TestServe_AdminChangeAtShutdownIsAudited(t *testing.T) {
 	defer func(d time.Duration) { adminShutdownTimeout = d }(adminShutdownTimeout)
-	adminShutdownTimeout = 100 * time.Millisecond
+	adminShutdownTimeout = 50 * time.Millisecond
+	f := newFakeStore()
+	inAdmin, release := make(chan struct{}), make(chan struct{})
+	f.createTenant = func(context.Context) {
+		close(inAdmin)
+		<-release
+		f.event("admin call returned")
+	}
+	useStore(t, f, nil)
+	r := startServe(t, dbVars(t, "postgres://fake"))
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+r.admin+"/admin/tenants", strings.NewReader(`{"name":"acme"}`))
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	wait(t, inAdmin, 5*time.Second, "the admin call")
+	r.stop()
+	// Well past the admin grace period: the connection is cut by now.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	if err := wait(t, r.done, 10*time.Second, "serve to return"); err != nil {
+		t.Errorf("serve = %v", err)
+	}
+	r.done <- nil // for the cleanup
+
+	var audited bool
+	for _, line := range r.logs.lines(t) {
+		audited = audited || (line["msg"] == "admin" && line["action"] == "create_tenant")
+	}
+	if !audited {
+		t.Error("no audit line for the change in flight at shutdown")
+	}
+	if got, want := f.eventLog(), []string{"admin call returned", "close"}; !slices.Equal(got, want) {
+		t.Errorf("events %q, want %q: the store closed only after the admin call", got, want)
+	}
+	if _, closed, afterClose := f.state(); !closed || afterClose != 0 {
+		t.Errorf("store closed %v, %d calls after Close; want closed, none after", closed, afterClose)
+	}
+}
+
+// An admin request still open when the admin grace period ends is cut,
+// with a WARN, as the API's are. One whose store call never returns is
+// waited for adminDrainTimeout, with a WARN, and the store is left open:
+// pgxpool.Close would wait for its connection.
+func TestServe_AdminShutdownTimeoutWarns(t *testing.T) {
+	defer func(d, e time.Duration) { adminShutdownTimeout, adminDrainTimeout = d, e }(adminShutdownTimeout, adminDrainTimeout)
+	adminShutdownTimeout, adminDrainTimeout = 100*time.Millisecond, 100*time.Millisecond
 	f := newFakeStore()
 	inAdmin, release := make(chan struct{}), make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -291,11 +407,66 @@ func TestServe_AdminShutdownTimeoutWarns(t *testing.T) {
 		t.Errorf("serve = %v", err)
 	}
 	r.done <- nil
-	var warned bool
+	var warned, leftOpen bool
 	for _, line := range r.logs.lines(t) {
 		warned = warned || (line["msg"] == "admin grace period expired; closing open admin connections" && line["level"] == "WARN")
+		leftOpen = leftOpen || (line["msg"] == "admin requests still running; leaving the key store open" && line["level"] == "WARN")
 	}
 	if !warned {
 		t.Error("no WARN for the admin request cut at shutdown")
+	}
+	if !leftOpen {
+		t.Error("no WARN for the admin request still running")
+	}
+	if _, closed, _ := f.state(); closed {
+		t.Error("store closed under a stuck admin call")
+	}
+}
+
+// The admin API stops accepting as soon as shutdown begins, while the API
+// is still draining, so no change starts once the gateway is stopping.
+func TestServe_AdminStopsAtShutdownStart(t *testing.T) {
+	f := newFakeStore()
+	f.fetch = func(context.Context) ([][sha256.Size]byte, error) {
+		return [][sha256.Size]byte{sha256.Sum256([]byte("k"))}, nil
+	}
+	useStore(t, f, nil)
+	inAPI, release := make(chan struct{}), make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(inAPI)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","content":[]}`)
+	}))
+	defer upstream.Close()
+	defer close(release)
+	vars := dbVars(t, "postgres://fake")
+	vars["ANTHROPIC_BASE_URL"] = upstream.URL
+	r := startServe(t, vars)
+
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+r.api+"/v1/messages", strings.NewReader(`{"model":"m","max_tokens":1,"messages":[]}`))
+		req.Header.Set("X-Api-Key", "k")
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	wait(t, inAPI, 5*time.Second, "the API request")
+	r.stop()
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		conn, err := net.DialTimeout("tcp", r.admin, time.Second)
+		if err != nil {
+			break
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("admin listener still accepting while the API drains")
+		}
+	}
+	select {
+	case err := <-r.done:
+		t.Fatalf("serve returned %v with an API request in flight", err)
+	default:
 	}
 }

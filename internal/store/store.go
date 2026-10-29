@@ -51,11 +51,9 @@ type Store struct {
 // variables (PGHOST, PGPASSWORD...) and ~/.pgpass for anything connString
 // leaves out. The error names neither connString nor any part of it.
 func Open(ctx context.Context, connString string) (*Store, error) {
-	cfg, err := pgxpool.ParseConfig(connString)
+	cfg, err := poolConfig(connString)
 	if err != nil {
-		// pgx's parse errors quote the connection string, password masked
-		// but user and host not.
-		return nil, &Error{Op: "open", desc: "invalid connection string"}
+		return nil, err
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -66,6 +64,43 @@ func Open(ctx context.Context, connString string) (*Store, error) {
 		return nil, sanitize("open", err)
 	}
 	return &Store{pool: pool}, nil
+}
+
+// MaxConns is the pool's size, set whatever the connection string says
+// (its pool_max_conns is overridden) rather than pgx's default of
+// max(4, NumCPU), so the numbers below hold on any machine. A gateway's
+// users of the pool, which it shares between them:
+//
+//   - the admin API: at most admin.MaxInFlight (MaxConns/2 = 4) at once,
+//     one connection per request;
+//   - the key refresh: one connection per fetch, every
+//     SENTINEL_KEYS_REFRESH;
+//   - Migrate: one, at startup, before either of the others.
+//
+// So with the admin API full, 4 connections are still free for the
+// refresh, which needs 1, while Postgres answers. When it doesn't, an
+// admin call that times out frees its admin slot at once, but pgx keeps
+// its connection for up to 15 s more while it cancels the query and
+// cleans up (a CancelRequest on a new connection, then a drain), so
+// repeated timeouts can hold more than 4 and leave the refresh waiting.
+// The refresh is failing then anyway; a pool of its own would make the
+// guarantee unconditional. Close waits for those cleanups too, so
+// shutdown can take up to about 15 s longer after such a timeout. 8 per
+// gateway keeps 12 gateways under Postgres's default max_connections of
+// 100.
+const MaxConns = 8
+
+// poolConfig parses connString into a pool config of MaxConns
+// connections. The error names no part of connString.
+func poolConfig(connString string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		// pgx's parse errors quote the connection string, password masked
+		// but user and host not.
+		return nil, &Error{Op: "open", desc: "invalid connection string"}
+	}
+	cfg.MaxConns = MaxConns
+	return cfg, nil
 }
 
 // Close closes every connection, waiting for those in use.

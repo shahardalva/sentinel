@@ -260,7 +260,7 @@ func TestRecordRequest_NoGaugesWithoutSources(t *testing.T) {
 	got := collect(t, reader)
 	for _, name := range []string{
 		"sentinel.admission.in_use", "sentinel.admission.limit", "sentinel.ratelimit.breaker.open",
-		"sentinel.auth.keys", "sentinel.auth.key_refresh.age", "sentinel.auth.key_refresh.errors",
+		"sentinel.auth.keys", "sentinel.auth.key_refresh.age", "sentinel.auth.key_refresh.errors", "sentinel.auth.keys.stale",
 	} {
 		if _, ok := got.data[name]; ok {
 			t.Errorf("%s registered without a source", name)
@@ -402,4 +402,25 @@ func (c collected) floatGauge(t *testing.T, name string) float64 {
 		t.Fatalf("%s: %#v, want one float64 gauge point", name, c.data[name])
 	}
 	return g.DataPoints[0].Value
+}
+
+// The stale gauge has a point only once a source reports, then 0 or 1.
+func TestRecordKeysStale(t *testing.T) {
+	ctx := context.Background()
+	m, reader := newTestMetrics(t, Config{})
+	if _, ok := collect(t, reader).data["sentinel.auth.keys.stale"]; ok {
+		t.Error("stale gauge reported before a source reported")
+	}
+	m.RecordKeysStale(ctx, false)
+	if v := collect(t, reader).gauge(t, "sentinel.auth.keys.stale"); v != 0 {
+		t.Errorf("stale = %d, want 0", v)
+	}
+	m.RecordKeysStale(ctx, true)
+	if v := collect(t, reader).gauge(t, "sentinel.auth.keys.stale"); v != 1 {
+		t.Errorf("stale = %d, want 1", v)
+	}
+	m.RecordKeysStale(ctx, false)
+	if v := collect(t, reader).gauge(t, "sentinel.auth.keys.stale"); v != 0 {
+		t.Errorf("stale after recovery = %d, want 0", v)
+	}
 }

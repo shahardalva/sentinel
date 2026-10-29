@@ -41,6 +41,7 @@ func scrape(t *testing.T) string {
 	m.RecordKeySetSize(ctx, 2)
 	m.RecordKeyRefresh(ctx, true)
 	m.RecordKeyRefresh(ctx, false)
+	m.RecordKeysStale(ctx, true)
 
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
@@ -188,5 +189,13 @@ func TestDashboard_QueriesExportedNames(t *testing.T) {
 	}
 	if used == 0 {
 		t.Error("dashboard uses no sentinel_ metric")
+	}
+}
+
+// The stale gauge's Prometheus name, for alerts: no unit, no suffix.
+func TestKeysStale_PrometheusName(t *testing.T) {
+	exposition := scrape(t)
+	if !metricNames(exposition)["sentinel_auth_keys_stale"] {
+		t.Errorf("scrape has no sentinel_auth_keys_stale:\n%s", exposition)
 	}
 }

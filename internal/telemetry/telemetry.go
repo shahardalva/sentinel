@@ -147,8 +147,11 @@ type Metrics struct {
 	// refresh plus one; zero until one, so a source that never refreshes
 	// (keys.Static) has no age point.
 	lastRefresh atomic.Int64
-	base        time.Time        // origin of lastRefresh, on the monotonic clock
-	now         func() time.Time // time.Now; tests replace it
+	// keysStale is 0 until a source with a staleness limit reports, then
+	// 1 for fresh and 2 for stale.
+	keysStale atomic.Int64
+	base      time.Time        // origin of lastRefresh, on the monotonic clock
+	now       func() time.Time // time.Now; tests replace it
 
 	routes   map[route]*routeAttrs
 	other    *routeAttrs
@@ -254,6 +257,15 @@ func newMetrics(cfg Config, reader sdkmetric.Reader) (*Metrics, error) {
 		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
 			if last := m.lastRefresh.Load(); last > 0 {
 				o.Observe(max(m.now().Sub(m.base)-time.Duration(last-1), 0).Seconds())
+			}
+			return nil
+		}))
+	check(err)
+	_, err = meter.Int64ObservableGauge("sentinel.auth.keys.stale",
+		metric.WithDescription("1 while the client key set is older than SENTINEL_KEYS_MAX_STALE and every request gets a 503, else 0. Only for a key source with that limit."),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			if v := m.keysStale.Load(); v > 0 {
+				o.Observe(v - 1)
 			}
 			return nil
 		}))
@@ -392,6 +404,15 @@ func (m *Metrics) RecordKeyRefresh(ctx context.Context, ok bool) {
 	// source runs, so rate() over it works before the first failure.
 	m.keyRefreshErrs.Add(ctx, 0)
 	m.lastRefresh.Store(int64(m.now().Sub(m.base)) + 1)
+}
+
+// RecordKeysStale implements proxy.Recorder.
+func (m *Metrics) RecordKeysStale(_ context.Context, stale bool) {
+	v := int64(1)
+	if stale {
+		v = 2
+	}
+	m.keysStale.Store(v)
 }
 
 // Overhead is the time the gateway itself added to a request: the total
