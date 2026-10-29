@@ -69,8 +69,9 @@ func main() {
 // the run is rejected. Output it can't read is a rejection: no metrics
 // means no proof.
 func judge(log, k6out io.Reader) (string, error) {
-	var problems []string
-	logProblem, err := checkLog(log)
+	// The log's problems come first, so a rejection for unreadable k6 output
+	// still names them.
+	problems, err := checkLog(log)
 	if err != nil {
 		return "", err
 	}
@@ -109,9 +110,6 @@ func judge(log, k6out io.Reader) (string, error) {
 		slices.Sort(others)
 		problems = append(problems, strings.Join(others, ", ")+": every request should be allowed by Redis")
 	}
-	if logProblem != "" {
-		problems = append(problems, logProblem)
-	}
 
 	counts := fmt.Sprintf("%s requests, %s allowed, %s fail_open", commas(requests), commas(allowed), commas(failOpen))
 	if len(problems) > 0 {
@@ -120,27 +118,37 @@ func judge(log, k6out io.Reader) (string, error) {
 	return "bench clean: " + counts, nil
 }
 
-// checkLog returns why gateway-bench's log makes the run unclean, or "".
+// checkLog returns every reason gateway-bench's log makes the run unclean.
 // It must hold the "listening" line, so an empty or wrong log can't pass.
-func checkLog(r io.Reader) (string, error) {
-	var listening, redisDown bool
+func checkLog(r io.Reader) ([]string, error) {
+	var listening bool
+	var redisDown string
 	sc := bufio.NewScanner(r)
 	sc.Buffer(nil, 1<<20)
 	for sc.Scan() {
 		line := sc.Bytes()
 		listening = listening || bytes.Contains(line, []byte(`"msg":"listening"`))
-		redisDown = redisDown || bytes.Contains(line, []byte(redisDownMsg))
+		if redisDown == "" && bytes.Contains(line, []byte(redisDownMsg)) {
+			redisDown = `gateway-bench logged "` + redisDownMsg + `"`
+			var rec struct {
+				Error string `json:"error"`
+			}
+			if json.Unmarshal(line, &rec) == nil && rec.Error != "" {
+				redisDown += " (error: " + rec.Error + ")"
+			}
+		}
 	}
 	if err := sc.Err(); err != nil {
-		return "", fmt.Errorf("read gateway-bench log: %w", err)
+		return nil, fmt.Errorf("read gateway-bench log: %w", err)
 	}
-	switch {
-	case redisDown:
-		return `gateway-bench logged "` + redisDownMsg + `"`, nil
-	case !listening:
-		return `gateway-bench log has no "listening" line`, nil
+	var problems []string
+	if redisDown != "" {
+		problems = append(problems, redisDown)
 	}
-	return "", nil
+	if !listening {
+		problems = append(problems, `gateway-bench log has no "listening" line`)
+	}
+	return problems, nil
 }
 
 // sections returns the summary and metrics sections of gateway-verdict.js's

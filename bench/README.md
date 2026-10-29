@@ -214,11 +214,26 @@ How the numbers get out, without publishing a port:
 A rejected run looks like this (the run from the RESULTS.md caveat):
 
 ```
-bench rejected: 4,058 fail_open: those requests skipped Redis or got no answer from it; 42,823 allowed, but k6 sent 46,881 requests: not every request went through Redis exactly once; gateway-bench logged "redis not reachable at startup" (46,881 requests, 42,823 allowed, 4,058 fail_open)
+bench rejected: gateway-bench logged "redis not reachable at startup" (error: ...); 4,058 fail_open: those requests skipped Redis or got no answer from it; 42,823 allowed, but k6 sent 46,881 requests: not every request went through Redis exactly once (46,881 requests, 42,823 allowed, 4,058 fail_open)
 ```
 
+The log's reasons come first and are kept even when the k6 output can't be
+read, so a run with Redis down at startup and a failed metrics fetch names
+both.
+
 The summary files stay in the `k6-out` volume, a few KB each; `make down`
-keeps volumes, and `docker volume rm sentinel_k6-out` clears them.
+keeps volumes. Compose prefixes the volume's name with the project name,
+which defaults to the checkout's directory, so find it by the label compose
+puts on it instead:
+
+```bash
+docker volume rm $(docker volume ls -q --filter label=com.docker.compose.volume=k6-out)
+```
+
+This removes every volume compose created as `k6-out`, in any project on
+this Docker host (one, unless you have several checkouts), and with it the
+summary files; the next `make bench-gateway` creates it again. It fails,
+removing nothing, while a k6-gateway container still uses the volume.
 
 In compose, mockupstream runs with `-delay 100ms`, the method used in
 [RESULTS.md](RESULTS.md): about 100 requests in flight at 1000 req/s, under

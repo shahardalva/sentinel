@@ -16,6 +16,18 @@ func fixture(t *testing.T, name string) string {
 	return string(b)
 }
 
+// allowedValue returns the clean fixture with the allowed series' value
+// replaced by v.
+func allowedValue(t *testing.T, v string) string {
+	t.Helper()
+	clean := fixture(t, "clean")
+	s := strings.Replace(clean, `outcome="allowed"} 47959`, `outcome="allowed"} `+v, 1)
+	if s == clean {
+		t.Fatal("clean fixture has no allowed series of 47959")
+	}
+	return s
+}
+
 // summary is k6's --summary-export JSON with http_reqs as count.
 func summary(count string) string {
 	return `{"root_group":{"name":"","path":"","checks":{}},"metrics":{"http_reqs":{"count":` + count +
@@ -102,7 +114,7 @@ func TestJudge(t *testing.T) {
 			log:      logOK,
 			k6:       output(summary("47959"), fixture(t, "allowed_short")),
 			wantErrs: []string{"47,950 allowed, but k6 sent 47,959 requests"},
-			notErrs:  []string{"fail_open;"},
+			notErrs:  []string{" fail_open: "}, // the fail_open reason, not the counts' "0 fail_open)"
 		},
 		{
 			name:     "more allowed than requests",
@@ -122,24 +134,80 @@ func TestJudge(t *testing.T) {
 			k6:       output(summary("47959"), ""),
 			wantErrs: []string{"no sentinel_ratelimit_decisions_total"},
 		},
+		// Rule 3: no other outcome. Allowed equals the requests, so only
+		// this rule can reject.
 		{
-			name:     "another outcome",
+			name:     "limited",
 			log:      logOK,
 			k6:       output(summary("47959"), fixture(t, "limited")),
-			wantErrs: []string{"3 limited"},
-			notErrs:  []string{"but k6 sent"},
+			wantErrs: []string{"3 limited: every request should be allowed by Redis"},
+			notErrs:  []string{"but k6 sent", " fail_open: "},
+		},
+		{
+			name:     "fail_closed",
+			log:      logOK,
+			k6:       output(summary("47959"), fixture(t, "fail_closed")),
+			wantErrs: []string{"3 fail_closed: every request should be allowed by Redis"},
+			notErrs:  []string{"but k6 sent", " fail_open: "},
+		},
+		{
+			name:     "not_checked",
+			log:      logOK,
+			k6:       output(summary("47959"), fixture(t, "not_checked")),
+			wantErrs: []string{"3 not_checked: every request should be allowed by Redis"},
+			notErrs:  []string{"but k6 sent", " fail_open: "},
 		},
 
-		// Rule 3: Redis answered at startup.
+		// Counters must be whole, finite numbers.
+		{name: "allowed a fraction", log: logOK, k6: output(summary("47959"), allowedValue(t, "47959.5")), wantErrs: []string{"is 47959.5, not a count"}},
+		{name: "allowed NaN", log: logOK, k6: output(summary("47959"), allowedValue(t, "NaN")), wantErrs: []string{"is NaN, not a count"}},
+		{name: "allowed +Inf", log: logOK, k6: output(summary("47959"), allowedValue(t, "+Inf")), wantErrs: []string{"is +Inf, not a count"}},
+
+		// Rule 4: Redis answered at startup, and the log is gateway-bench's.
 		{
 			name:     "redis not reachable at startup",
 			log:      logRedisDown,
 			k6:       output(summary("47959"), fixture(t, "clean")),
+			wantErrs: []string{`gateway-bench logged "redis not reachable at startup" (error: dial tcp: i/o timeout)`},
+		},
+		{
+			name:     "redis not reachable at startup, no error field",
+			log:      strings.Replace(logRedisDown, `,"error":"dial tcp: i/o timeout"`, "", 1),
+			k6:       output(summary("47959"), fixture(t, "clean")),
 			wantErrs: []string{`gateway-bench logged "redis not reachable at startup"`},
+			notErrs:  []string{"(error:"},
+		},
+		{
+			name: "redis not reachable at startup and no metrics",
+			log:  logRedisDown,
+			k6:   markSummary + "\n" + summary("47959") + "\n",
+			wantErrs: []string{
+				`gateway-bench logged "redis not reachable at startup" (error: dial tcp: i/o timeout)`,
+				"no gateway-bench metrics",
+			},
+		},
+		{
+			name:     "redis not reachable at startup and no summary",
+			log:      logRedisDown,
+			k6:       "",
+			wantErrs: []string{`gateway-bench logged "redis not reachable at startup"`, "no k6 summary"},
+		},
+		{
+			name:     "redis not reachable and no listening line",
+			log:      strings.Replace(logRedisDown, `"msg":"listening"`, `"msg":"starting"`, 1),
+			k6:       output(summary("47959"), fixture(t, "clean")),
+			wantErrs: []string{`gateway-bench logged "redis not reachable at startup"`, `no "listening" line`},
 		},
 		{
 			name:     "empty log",
 			log:      "",
+			k6:       output(summary("47959"), fixture(t, "clean")),
+			wantErrs: []string{`gateway-bench log has no "listening" line`},
+		},
+		{
+			// "metrics listening" binds first and must never count.
+			name:     "only metrics listening",
+			log:      strings.Replace(logOK, `{"time":"2026-10-25T10:00:00Z","level":"INFO","msg":"listening","addr":"0.0.0.0:8081"}`+"\n", "", 1),
 			k6:       output(summary("47959"), fixture(t, "clean")),
 			wantErrs: []string{`gateway-bench log has no "listening" line`},
 		},
