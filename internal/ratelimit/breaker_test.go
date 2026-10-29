@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
@@ -42,7 +43,14 @@ const (
 // logging to the returned buffer.
 func breakerLimiter(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer) {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, breakerTimeout, 0)
+	l, logs, _ := breakerLimiterClient(t, url)
+	return l, logs
+}
+
+// breakerLimiterClient is breakerLimiter, also returning its Redis client.
+func breakerLimiterClient(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer, *redis.Client) {
+	t.Helper()
+	client, err := ratelimit.NewClient(url, breakerTimeout, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +66,7 @@ func breakerLimiter(t *testing.T, url string) (*ratelimit.Limiter, *syncBuffer) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return l, logs
+	return l, logs, client
 }
 
 // failN makes n calls that must fail at Redis, not at the breaker.
@@ -90,12 +98,24 @@ func TestBreaker_OpensAfterConsecutiveFailures(t *testing.T) {
 
 func TestBreaker_FewerFailuresStayClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
-	l, _ := breakerLimiter(t, "redis://"+mr.Addr())
 	addr := mr.Addr()
+	// Down before the client exists, so this tests only the count reset:
+	// no connection is left over from the first server. Over TLS, or on
+	// Windows, go-redis can't tell such a dead idle connection before using
+	// it, and a call on one retries with a backoff that can use up its
+	// timeout, which counts.
 	mr.Close()
+	l, _, client := breakerLimiterClient(t, "redis://"+addr)
 	failN(t, l, ratelimit.BreakerThreshold-1)
 	if err := mr.StartAddr(addr); err != nil {
 		t.Fatal(err)
+	}
+	// The pool's dials run in the background and outlast a call's timeout,
+	// so wait for one to reach the new server instead of racing them.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("Redis back: ping: %v", err)
 	}
 	// A success resets the count, so four more failures don't open it.
 	if _, err := l.Allow(context.Background(), "client"); err != nil {
@@ -103,6 +123,9 @@ func TestBreaker_FewerFailuresStayClosed(t *testing.T) {
 	}
 	mr.Close()
 	failN(t, l, ratelimit.BreakerThreshold-1)
+	if l.BreakerOpen() {
+		t.Error("breaker open after a success and fewer failures than the threshold")
+	}
 }
 
 func TestBreaker_ProbeAfterCooldownCloses(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shahardalva/sentinel/internal/ratelimit"
 )
@@ -30,7 +31,7 @@ func newLimiter(t *testing.T, perMinute int) (*ratelimit.Limiter, *miniredis.Min
 
 func limiterFor(t *testing.T, url string, perMinute int, timeout time.Duration) *ratelimit.Limiter {
 	t.Helper()
-	client, err := ratelimit.NewClient(url, timeout, 0)
+	client, err := ratelimit.NewClient(url, timeout, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,15 +287,19 @@ func TestRouteClientLogs(t *testing.T) {
 	logs := new(syncBuffer)
 	ratelimit.RouteClientLogs(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { ratelimit.RouteClientLogs(slog.New(slog.NewTextHandler(io.Discard, nil))) })
-	l := limiterFor(t, "redis://127.0.0.1:1", 60, 200*time.Millisecond) // nothing listens
-	l.Allow(context.Background(), "client")
+	// NewClient's dials run in the background for up to PoolDialTimeout an
+	// attempt, so a failed dial would log after the test; this client
+	// fails its one dial attempt within the Ping.
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond, DialerRetries: 1}) // nothing listens
+	defer client.Close()
+	client.Ping(context.Background())
 	if out := logs.String(); !strings.Contains(out, `"level":"DEBUG"`) || !strings.Contains(out, `"component":"go-redis"`) {
 		t.Errorf("go-redis output not routed to the logger at DEBUG: %q", out)
 	}
 }
 
 func TestNew_Validates(t *testing.T) {
-	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0, 0)
+	client, err := ratelimit.NewClient("redis://127.0.0.1:1", 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +310,7 @@ func TestNew_Validates(t *testing.T) {
 	if _, err := ratelimit.New(ratelimit.Config{PerMinute: 60}); err == nil {
 		t.Error("New with no client: no error")
 	}
-	if _, err := ratelimit.NewClient("http://example.com", 0, 0); err == nil {
+	if _, err := ratelimit.NewClient("http://example.com", 0, 4); err == nil {
 		t.Error("NewClient with an http URL: no error")
 	}
 }

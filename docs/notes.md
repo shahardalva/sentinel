@@ -2,6 +2,205 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: the load-start fail-open window is not a cold pool (#55)
+
+### Learned (from a later make bench-gateway run)
+- With the warm-up in place ("redis pool warm" ready=16), the load-start
+  window came back: 5 concurrent rate-limit calls, all on warm
+  connections, hit the 50 ms ceiling at load start (rate_limit_us about
+  50,100 each, against about 200 mid-run), and the breaker opened for
+  5 s. No connection was being set up; the pool had 16 ready.
+- So the cause of #55 is a global stall over 50 ms at load start (Redis,
+  the host or the Docker VM busy as k6 starts), which hits every call in
+  flight at once and counts as 5 consecutive failures. The cold pool was
+  a second, smaller problem with the same symptom, and the earlier
+  entries below took it for the cause.
+- What the warm-up and PoolDialTimeout do fix: DialTimeout was the call's
+  50 ms, which cut off every slower dial, the background ones that fill
+  the pool included, so a pool could stay cold under load; and the first
+  calls had to dial and handshake within their 50 ms. Both are gone: dials
+  get 2 s off any call's clock, and 16 connections are ready before
+  serving. They do not fix #55.
+- The fix for #55 belongs to the breaker issue, #57: a stall that fails
+  every call in flight together should not count as 5 independent
+  failures in a row.
+
+### Next
+- #55 stays open; carry this evidence to #57.
+
+## 2026-10-29: review of the warm pool: no MinIdleConns
+
+### Done (test first, then a mutation check per item)
+- MinIdleConns dropped. It doubled the warm-up to 32 (every Get refills
+  it, and WarmUp's 16 held count as missing), dialed from loadConfig on,
+  held pool turns so a pool of 16 or less failed the startup ping
+  ("connection pool timeout") and skipped the warm-up, and tripped the
+  pool's dial-error gate 16x sooner in an outage. WarmUp alone removes the
+  cold pool; the pool keeps what it set up while idle (go-redis closes an
+  idle connection only after ConnMaxIdleTime, 30 min).
+- ratelimit.WarmUp(ctx, client, n): n explicit, at most the pool size
+  (the caller caps it; WarmUp holds all n at once). Through
+  client.WithTimeout(PoolDialTimeout), so its reads aren't capped at the
+  50 ms (that clone shares the pool and is never closed). Returns as soon
+  as ctx is done, with ctx's error; PINGs still waiting return their
+  connections when they end, and a dial still running lands in the pool
+  without its handshake. ratelimit.WarmConns = 16.
+- cmd/gateway: logRateLimit is startRateLimit(ctx, ...), on serve's ctx;
+  warms min(WarmConns, pool size), computed only there. A signal during
+  the ping or the warm-up logs INFO "startup interrupted" with step
+  "redis ping" or "redis warm-up", like startKeys, not a WARN (make
+  bench-gateway rejects "redis not reachable at startup"). It checks
+  serve's ctx, not the error: a signal doesn't cut a go-redis read short,
+  so an interrupted ping can end in a read timeout. redisWarmUpTimeout
+  stays a var, which tests shorten.
+- Tests: WarmUp reads not capped (replies 150 ms late), leaves exactly n
+  idle. Gateway: miniredis CommandCount and connection count after
+  startup (2 commands and 1 connection without the warm-up, at least 32
+  and exactly 16 with it), a 200 ms bound, a pool of 4 warmed to 4, and a
+  signal during the warm-up and during the ping (INFO, no WARN, at once).
+  TestBreaker_FewerFailuresStayClosed asserts the breaker closed at the
+  end. Every test client gets an explicit pool size.
+- Mutations, each failing a test: MinIdleConns back; DialTimeout back to
+  50 ms; WarmUp reads capped (client.Conn); WarmUp waiting out PINGs on
+  ctx done; WarmUp returning before its connections are back; no warm-up
+  at startup (CommandCount, connection count); no pool-size cap;
+  warm-up on Background; a signal during the ping or the warm-up logged
+  as WARN; warm-up after a failed ping.
+- Burst test at -cpu 1,2 -count 10: 20 of 20 pass, with and without
+  -race (the review saw 6 of 20 fail at 1 and 2 with reads capped).
+
+### Decided
+- Scope: this PR ships the warm-up and dial timeout only (a cold pool,
+  not the cause of #55, see the entry above). The breaker change below
+  (connection errors not counted, zero retry backoff) was built, reviewed
+  and taken out again; it is on branch wip/breaker-conn-errors, for the
+  circuit-breaker PR.
+- Maintenance notifications stay off: nothing used them; on Redis Cloud
+  or Enterprise we lose their graceful handoff (relaxed timeouts, MOVING)
+  during maintenance, which then looks like dropped connections. In ADR
+  0002.
+
+### Learned
+- Deferred, not fixed here: a Redis restart under a warm pool can open the
+  breaker, and so can one under load on dev, with no warm-up at all.
+  go-redis doesn't health-check idle TLS connections (or any on Windows),
+  so after a restart the calls use dead ones, and go-redis retries them
+  with a backoff (10 ms to 1 s) slept inside the 50 ms: the calls end
+  with context deadline exceeded, which counts, 5 in a row. A probe on
+  dev's code (pool grown to 32 by 32 concurrent callers, restart behind a
+  TLS proxy, calls 10 ms apart) opened it in 3 of 3 runs. The fix is
+  designed (a bounded count of connection errors, zero backoff,
+  MaxRetries 1) but needs its own PR: skipping connection errors outright
+  means an endpoint that accepts and then closes never opens the breaker,
+  and an open one re-probes with no cooldown. Issue: #57.
+- A canceled ctx doesn't interrupt a go-redis read in progress: only a
+  deadline does (the socket deadline is the earlier of ctx's and the
+  read timeout). Hence WarmUp returning on ctx.Done instead of waiting
+  for its PINGs, and startRateLimit checking ctx itself.
+- TestBreaker_ConcurrentOutage (#41) fails 6 of 20 here at -race -cpu
+  1,2 and 7 of 20 on dev: not this change.
+
+### Next
+- Re-run make bench-gateway (needs docker): "redis pool warm" ready=16
+  and a clean verdict, as before.
+- The breaker issue above, from wip/breaker-conn-errors.
+
+## 2026-10-29: warm Redis pool, dials outside the 50 ms
+
+### Done (test first, then a mutation check per part)
+- Evidence (#55): a bench-gateway run at 100 req/s, startup ping OK; the
+  first 5 rate-limit calls failed with "context deadline exceeded"
+  within ~50 ms of the first request, the breaker opened for 5 s, and
+  ~490 requests failed open. The pool had one connection, the ping's;
+  every other one had to be dialed inside the 50 ms. (Taken for the
+  cause; a later bench with a warm pool showed the same window, see the
+  top entry: the cold pool was real but not the cause.)
+- ratelimit.NewClient: DialTimeout is PoolDialTimeout (2 s), no longer the
+  call's timeout; MinIdleConns 16, at most the pool size. Read, write and
+  pool timeouts and the 50 ms call context are unchanged.
+- NewClient also disables go-redis maintenance notifications (see
+  Learned: a data race in go-redis otherwise).
+- ratelimit.WarmUp holds MinIdleConns connections and PINGs each, then
+  returns them. cmd/gateway runs it in logRateLimit after a successful
+  ping, bounded by 5 s: INFO "redis pool warm" ready=N, or WARN "redis
+  pool warm-up incomplete" ready, want, fail_mode, error; startup goes on.
+- Tests: coldRedis, a TLS proxy to miniredis whose handshakes wait
+  300 ms (a local TCP connect is instant, so the handshake is the part of
+  a dial a test can slow down, and the dial timeout covers it). 16
+  concurrent calls at the real 50 ms after WarmUp: before the fix 16 of
+  16 failed and the breaker opened, the bench in miniature; after, 0.
+  Gateway: the INFO line with ready=16 on miniredis, and the WARN with
+  ready=4 want=16 against a proxy serving only the first 4 connections.
+- Mutations, each failing a test: no MinIdleConns (both packages);
+  DialTimeout back to 50 ms (the burst: WarmUp 0, 16 of 16 calls fail,
+  breaker open); no warm-up call at startup (both gateway tests, on the
+  log lines; the connection count alone doesn't catch it, since
+  go-redis's own background dials get there anyway).
+
+### Decided
+- 16 idle: 1000 req/s x 1-5 ms per call is 1-5 in flight; 16 covers a
+  burst at load start for 16 sockets per gateway. 2 s per dial: a cold
+  DNS lookup, TCP and TLS on a slow network, or a retried DNS query; the
+  dial is never on a request's clock, and a dead Redis holds a dial
+  goroutine at most 2 s per attempt (5 attempts). 5 s for the warm-up:
+  two dial timeouts and some. (After review: 16 is WarmConns, not idle
+  connections the pool keeps.)
+- Warm-up skipped when the startup ping fails: it could only wait out
+  its 5 s. (After review: both now stop on a signal.)
+- synctest doesn't fit: the dial runs on real sockets (go-redis's own
+  dialer), which aren't durably blocking. The tests rely on margins
+  instead: 300 ms against 50 ms and 2 s, no sleep-to-wait.
+
+### Learned
+- The breaker turned 5 failures into ~490 fail-opens: 5 calls in a row
+  failing at load start opened it (blamed here on the cold pool; the top
+  entry corrects that), and for its 5 s cooldown every request
+  (~100 req/s) got the fail mode with Redis healthy. A ~100x amplifier of
+  a startup transient; breaker behavior unchanged here, for the upstream
+  circuit breaker work next.
+- go-redis v9.23.0: a Get that finds no idle connection queues a dial on
+  its own goroutine with context.Background(), DialTimeout per attempt,
+  up to 5 attempts (100 ms backoff). The caller waits on its own context
+  and gives up at 50 ms; the dial carries on and the connection goes to
+  the next waiter or the idle list. So DialTimeout, not the call, bounded
+  the dial, and at 50 ms it killed slow dials outright. The default dialer
+  is net.Dialer{Timeout: DialTimeout} (DNS + TCP); for rediss://,
+  tls.DialWithDialer, where Timeout covers TLS too and the context is
+  ignored.
+- MinIdleConns is filled in the background: NewConnPool starts one
+  goroutine per missing connection (Background context, DialTimeout per
+  attempt), and every Get refills it (popIdle defers checkMinIdleConns;
+  corrected after review, this said "after removals"). Nothing waits for
+  them, and they are dialed but not initialized: HELLO/AUTH/SELECT run on
+  the first Get, under that caller's context. Hence WarmUp's PINGs.
+  (Dropped after review, see the next entry.)
+- go-redis checks an idle connection for a closed peer on Get only when
+  it is a raw socket (syscall.Conn) on Unix: never over TLS (a *tls.Conn
+  isn't one, on purpose, conn_check.go) and never on Windows
+  (conn_check_dummy.go). Corrected after review: this said Windows only,
+  and "the gateway runs on Linux" doesn't help a rediss:// Redis. After a
+  restart such dead connections are found by the calls that use them.
+  TestBreaker_FewerFailuresStayClosed creates its client with Redis
+  already down and pings before the "Redis back" call, so it tests only
+  the count reset; a restart under a warm pool is deferred (next entry).
+- go-redis data race (-race caught it in WarmUp): each client.Conn()
+  shares the client's *Options but has its own optLock, and in the
+  default maint-notifications "auto" mode a Redis that refuses CLIENT
+  MAINT_NOTIFICATIONS (miniredis, OSS Redis) makes initConn write
+  Options.MaintNotificationsConfig.Mode = disabled. Concurrent handshakes
+  on several Conns race on it. NewClient disables maint notifications (a
+  Redis Cloud/Enterprise feature; also one handshake command less per
+  connection), and a test checks it.
+- TestRouteClientLogs used a call's failed dial to get a go-redis log
+  line; that dial now outlasts the test, so it uses its own client with a
+  50 ms dial and one attempt.
+
+### Next
+- Re-run make bench-gateway (needs docker, for the user): expect
+  "redis pool warm" ready=16 in gateway-bench's log and a clean verdict.
+- Upstream circuit breaker; revisit the Redis breaker's amplification
+  then (e.g. not counting failures while the pool is still dialing).
+
 ## 2026-10-29: make bench-gateway rejects unclean runs (#42)
 
 ### Done (test first, then a mutation check per rule)

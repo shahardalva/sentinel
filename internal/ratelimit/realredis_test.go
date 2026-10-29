@@ -21,7 +21,7 @@ func realLimiter(t *testing.T, perMinute int) (*ratelimit.Limiter, string) {
 	if url == "" {
 		t.Skip("SENTINEL_TEST_REDIS_URL not set")
 	}
-	client, err := ratelimit.NewClient(url, time.Second, 0)
+	client, err := ratelimit.NewClient(url, time.Second, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestRealRedis_RefillsOnRedisClock(t *testing.T) {
 func TestRealRedis_KeyExpires(t *testing.T) {
 	l, name := realLimiter(t, 60)
 	allow(t, l, name)
-	client, err := ratelimit.NewClient(os.Getenv("SENTINEL_TEST_REDIS_URL"), time.Second, 0)
+	client, err := ratelimit.NewClient(os.Getenv("SENTINEL_TEST_REDIS_URL"), time.Second, 64)
 	if err != nil {
 		t.Fatal(err)
 	}

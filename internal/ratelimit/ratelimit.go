@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
 )
@@ -18,6 +20,30 @@ import (
 // DefaultTimeout bounds each Redis call, so a slow or unreachable Redis
 // adds at most this much to a request.
 const DefaultTimeout = 50 * time.Millisecond
+
+// PoolDialTimeout bounds each attempt to set up a new pool connection: the
+// DNS lookup, TCP and, for rediss://, TLS. go-redis dials on a goroutine of
+// its own, never under a call's context, so this is not part of a call's
+// budget: a call that has to wait for a new connection still gives up at
+// its own timeout, and the dial goes on to fill the pool. 2 s covers a
+// cold dial on a slow network or a retried DNS query; a dead Redis keeps a
+// dial goroutine at most this long per attempt (go-redis tries 5 times).
+// It used to be the call's 50 ms, which cut off every slower dial, the
+// background ones that fill the pool included. WarmUp's reads get it too.
+const PoolDialTimeout = 2 * time.Second
+
+// WarmConns is how many connections the gateway sets up with WarmUp before
+// serving, so a burst of calls at load start finds them dialed and past the
+// handshake instead of setting them up within its timeout. That removes
+// the cold pool, not every way a call at load start can take 50 ms: a
+// stall of Redis or the host fails warm connections as well. At 1000 req/s
+// and a Redis round trip
+// of about 1 ms, one or two calls are in flight at once; 5 ms under load
+// makes it 5. 16 leaves room for bursts (a load test starting, Poisson
+// arrivals). The pool keeps them open while idle, but doesn't keep a
+// minimum: go-redis's MinIdleConns would dial at construction, add as many
+// again during WarmUp, and refill after every use.
+const WarmConns = 16
 
 const keyPrefix = "sentinel:ratelimit:"
 
@@ -123,9 +149,11 @@ func New(cfg Config) (*Limiter, error) {
 
 // NewClient returns a Redis client for url (redis:// or rediss://) whose
 // calls honor context deadlines, so Limiter's timeout bounds every call,
-// including dialing. poolSize caps its connections; zero keeps go-redis's
-// default of 10 per CPU. Pass at least the number of requests expected to
-// check their limit at once, or the extra ones get ErrBusy.
+// including one waiting for a new connection. New connections are dialed
+// outside that budget, under PoolDialTimeout; WarmUp sets them up ahead of
+// time. poolSize caps its connections; zero keeps go-redis's default of 10
+// per CPU. Pass at least the number of requests expected to check their
+// limit at once, or the extra ones get ErrBusy.
 func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
@@ -135,7 +163,7 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 		timeout = DefaultTimeout
 	}
 	opts.ContextTimeoutEnabled = true
-	opts.DialTimeout = timeout
+	opts.DialTimeout = PoolDialTimeout
 	opts.ReadTimeout = timeout
 	opts.WriteTimeout = timeout
 	opts.PoolTimeout = timeout
@@ -143,7 +171,66 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 		opts.PoolSize = poolSize
 	}
 	opts.DisableIdentity = true // skip CLIENT SETINFO on connect
+	// Maintenance notifications are a Redis Cloud and Enterprise feature.
+	// In go-redis's default "auto" mode every new connection asks for them,
+	// and on a Redis without them the first refusal switches the mode off in
+	// the client's Options, which every Conn shares under a lock of its own:
+	// a data race when WarmUp's connections handshake at once.
+	opts.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
 	return redis.NewClient(opts), nil
+}
+
+// WarmUp sets up n of the client's connections and sends a PING on each,
+// so they are dialed and past the handshake (HELLO, AUTH, SELECT) before
+// the first request needs them; they then go back to the pool, idle. n
+// must be at most the pool size: all n are held at once, so more would
+// wait for connections the pool can't open until ctx ends. It runs outside
+// any request, so its reads get PoolDialTimeout rather than the client's
+// call timeout. It returns how many connections are ready and the first
+// failure; once ctx is done it returns at once, with ctx's error, and
+// leaves the PINGs still waiting to return their connections when they
+// end. A connection whose dial was still running then lands in the pool
+// later, dialed but without its handshake, which the first call to use it
+// runs within its own timeout. Call it once at startup, before serving.
+func WarmUp(ctx context.Context, client *redis.Client, n int) (int, error) {
+	n = max(n, 0)
+	// Shares the client's pool; never closed, since that would close it.
+	slow := client.WithTimeout(PoolDialTimeout)
+	// Every connection is held until all have answered or WarmUp returns,
+	// so each PING gets a connection of its own.
+	release := make(chan struct{})
+	results := make(chan error, n)
+	var returned sync.WaitGroup
+	for range n {
+		c := slow.Conn()
+		returned.Go(func() {
+			results <- c.Ping(ctx).Err()
+			<-release
+			c.Close()
+		})
+	}
+	var ready int
+	var first error
+	for range n {
+		select {
+		case err := <-results:
+			if err == nil {
+				ready++
+			} else if first == nil {
+				first = err
+			}
+		case <-ctx.Done():
+			close(release)
+			return ready, ctx.Err()
+		}
+	}
+	close(release)
+	returned.Wait()
+	// A PING cut off by ctx's deadline says "i/o timeout"; say why.
+	if ready < n && ctx.Err() != nil {
+		return ready, ctx.Err()
+	}
+	return ready, first
 }
 
 // Allow takes a token from client's bucket. client identifies the caller and

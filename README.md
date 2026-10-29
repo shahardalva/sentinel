@@ -288,6 +288,7 @@ Built-in limits:
 | Concurrent upstream requests | 128 (`SENTINEL_MAX_CONCURRENT`) | Bounds memory and upstream connections |
 | Rate limit | 60 requests/min per key (`SENTINEL_RATE_LIMIT_RPM`) | Stops one key from using the whole budget. Off without `SENTINEL_REDIS_URL` |
 | Redis call timeout | 50 ms | A slow Redis adds at most this much to a request |
+| Redis warm-up | 16 connections, 2 s per dial | Set up at startup, before serving (at most 5 s), so the first requests don't dial within their 50 ms |
 | Body read timeout | 2 min | Bounds slow uploads |
 | Time to first byte | 10 min | Non-streaming requests send nothing until generation finishes |
 | Stream idle timeout | 60 s | Aborts a stream that stops producing data |
@@ -607,7 +608,7 @@ The tests exercise behavior end to end against fake upstream servers, including:
 - a mid-stream upstream failure and a client disconnect mid-stream
 - oversized bodies, declared and actual, and a slow body that must not hold a slot
 - the concurrency cap returning `503`
-- rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, and the circuit breaker opening, probing and closing
+- rate limiting: under and over the limit with the right `Retry-After`, refill over time, separate buckets per key, only a hash of the key in Redis, a `429` before the body is read, Redis down in fail-open and fail-closed mode, a stalled Redis cut off by the timeout, a burst right after startup against a Redis whose connections take longer than the timeout to set up (all succeed once the pool is warmed), a warm-up cut off by its bound or a signal, a signal during the startup ping, and the circuit breaker opening, probing and closing
 - the upstream rejecting the gateway's key
 - response header filtering and `anthropic-version` validation
 - a stub provider that breaks its contract (no response, no body, a `1xx` or `3xx` status, a status over `599`) answered with `502`, its body closed; `RequestError` statuses outside `4xx`, and `401`, `407`, `429` and `499`, becoming `400`; hop-by-hop headers, including ones named in `Connection`, stripped whatever the provider returns; and a provider's lowercase `x-request-id` never reaching the client beside the gateway's own
