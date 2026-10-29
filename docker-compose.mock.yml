@@ -38,7 +38,9 @@ services:
       # stop startup: the gateway refuses keys from both places.
       SENTINEL_API_KEYS: ""
       # The admin API on all interfaces inside the container; the host port
-      # below is bound to loopback only.
+      # below is bound to loopback only. The gateway's startup WARN that
+      # this address is not loopback is expected here: the port is
+      # published on 127.0.0.1 only, so only the host's loopback reaches it.
       SENTINEL_ADMIN_ADDR: 0.0.0.0:9465
       # From .env, never defaulted: generate one with openssl rand -hex 32.
       SENTINEL_ADMIN_TOKEN: ${SENTINEL_ADMIN_TOKEN:?set SENTINEL_ADMIN_TOKEN in .env, for example to the output of openssl rand -hex 32 (see .env.example)}

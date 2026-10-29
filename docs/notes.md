@@ -2,6 +2,33 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: v0.6.0 polish (review of PR #51)
+
+### Done (behavioral items test first, then a mutation check)
+- Admin bind WARN: a SENTINEL_ADMIN_ADDR host other than localhost or a
+  loopback IP (empty, 0.0.0.0, ::, any other name) logs one WARN: plain
+  HTTP, so the token and new keys cross the network. Expected under
+  compose (0.0.0.0 in the container, published on 127.0.0.1 only).
+- TestServe_DatabaseURLNotLeaked: DNS failure and connection refused in
+  key=value form, which reach the connect path (the old bad port and bad
+  sslmode cases fail at parsing). Wrong user and password against
+  SENTINEL_TEST_POSTGRES_URL, gated on it.
+- SENTINEL_API_KEYS of only commas or spaces: "has no keys", not "is not
+  set".
+- Revocation latency docs: refresh plus up to two fetch timeouts. The
+  fetch timeout is min(refresh/2, 10 s), so at most 2 x refresh, 50 s with
+  the defaults (not 1.5 x / 45 s: the default caps it at 10 s, and the
+  read and the swap can each be a fetch timeout apart).
+- Grafana: "Key set stale" state timeline (0 fresh green, 1 stale red)
+  beside the other key panels, now four across.
+
+### Skipped
+- An extra SchemaVersion call after Migrate: startup only, two queries;
+  not worth folding into Migrate's result.
+
+### Next
+- alert on sentinel_auth_keys_stale; needs alerting infra (none yet).
+
 ## 2026-10-29: v0.6.0 release blockers (review of PR #51)
 
 ### Done (each test first, then the fix, then a mutation check)
@@ -72,7 +99,8 @@ Newest entries first. Short: what was done, what was decided, what's next.
 ### Next
 - A separate small pool for the key refresh (S1), so admin timeouts
   against an unresponsive Postgres can never hold its connection.
-- Grafana panel and an alert rule for sentinel_auth_keys_stale.
+- Grafana panel (done in the polish entry above) and an alert rule for
+  sentinel_auth_keys_stale.
 
 ## 2026-10-27: gateway wiring (Postgres keys, PR 1d)
 
