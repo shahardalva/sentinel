@@ -159,6 +159,82 @@ buckets in database 0. The request log's `rate_limit_us` shows the Redis time
 on its own. Results from before this change, such as those in
 [RESULTS.md](RESULTS.md), have no Redis call, so compare them with care.
 
+### Checking the run
+
+A gateway that can't reach Redis in time still answers: with the default
+fail mode, `open`, the request goes ahead, and while the breaker is open it
+skips Redis altogether. k6 sees a normal `200`, but the request was cheaper
+than a real one, so the run measures less than it claims. After k6
+finishes, `make bench-gateway` therefore checks the run with
+`cmd/benchverdict` and prints one line either way:
+
+```
+bench clean: 47,959 requests, 47,959 allowed, 0 fail_open
+```
+
+It rejects the run, with `bench rejected:` and every reason, and exits 1
+unless:
+
+1. `sentinel_ratelimit_decisions_total{outcome="fail_open"}` is 0 (absent
+   counts as 0);
+2. the `allowed` decisions, summed over every series, equal the requests k6
+   sent, its `http_reqs` count; every request went through Redis exactly
+   once. Any other outcome (`limited`, `fail_closed`, `not_checked`) also
+   rejects. A scrape without `sentinel_ratelimit_decisions_total`, or one
+   that can't be read, rejects too: no metrics means no proof;
+3. gateway-bench's log has its `listening` line and no
+   `redis not reachable at startup`.
+
+gateway-bench is recreated for every run, so its counters start at 0 and
+cover exactly that run. A clean run exits with k6's own status, so a failed
+`http_req_failed` threshold still fails the target.
+
+How the numbers get out, without publishing a port:
+
+- k6's request count comes from its `--summary-export` JSON, set through
+  `K6_SUMMARY_EXPORT`, not from its text summary: it is k6's own
+  `http_reqs` counter, machine-readable, and it keeps k6's usual summary on
+  the terminal (a `handleSummary` in `messages.js` would replace it). It
+  counts every request k6 sent, including ones that timed out, so a request
+  that never reached the gateway shows up as a mismatch. The file goes into
+  the `k6-out` volume of the `k6-gateway` service (`k6` plus that volume, so
+  `make bench` is untouched), under a name unique to the run, so a k6 that
+  failed to write one can't pass with an older one.
+- gateway-bench's `/metrics` is fetched by a second, one-iteration k6 run,
+  `bench/k6/gateway-verdict.js`, in the same image on the compose network:
+  gateway-bench is distroless (no shell or curl for `docker exec`), its
+  metrics port stays unpublished, and no new image is pulled. Prometheus
+  isn't used: it scrapes on an interval, so its last sample can miss the
+  end of the run. The script prints the summary and the scrape between
+  `# benchverdict:` markers, and `cmd/benchverdict` ignores anything else
+  k6 prints. The script name reaches compose as `BENCH_K6_SCRIPT` and the
+  summary as a bare file name, since Git Bash rewrites an argument that
+  starts with `/`.
+
+A rejected run looks like this (the run from the RESULTS.md caveat):
+
+```
+bench rejected: gateway-bench logged "redis not reachable at startup" (error: ...); 4,058 fail_open: those requests skipped Redis or got no answer from it; 42,823 allowed, but k6 sent 46,881 requests: not every request went through Redis exactly once (46,881 requests, 42,823 allowed, 4,058 fail_open)
+```
+
+The log's reasons come first and are kept even when the k6 output can't be
+read, so a run with Redis down at startup and a failed metrics fetch names
+both.
+
+The summary files stay in the `k6-out` volume, a few KB each; `make down`
+keeps volumes. Compose prefixes the volume's name with the project name,
+which defaults to the checkout's directory, so find it by the label compose
+puts on it instead:
+
+```bash
+docker volume rm $(docker volume ls -q --filter label=com.docker.compose.volume=k6-out)
+```
+
+This removes every volume compose created as `k6-out`, in any project on
+this Docker host (one, unless you have several checkouts), and with it the
+summary files; the next `make bench-gateway` creates it again. It fails,
+removing nothing, while a k6-gateway container still uses the volume.
+
 In compose, mockupstream runs with `-delay 100ms`, the method used in
 [RESULTS.md](RESULTS.md): about 100 requests in flight at 1000 req/s, under
 the gateway's concurrency cap of 128 (see below). Compare compose runs with

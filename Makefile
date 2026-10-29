@@ -81,7 +81,25 @@ bench: ## Load test mockupstream directly with k6 (after make up); BENCH_API, DU
 #
 # BENCH_UPSTREAM is a bare name (mockcompat), not a path: Git Bash rewrites
 # an argument starting with "/" into a Windows path.
-bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock; BENCH_API, BENCH_UPSTREAM, DURATION_S and STREAM pass through
+#
+# After k6, cmd/benchverdict decides whether the run was a clean
+# measurement, from gateway-bench's own counters (it is recreated every run,
+# so they start at 0): no fail_open decision, the allowed decisions equal
+# k6's http_reqs count, no other outcome, and no "redis not reachable at
+# startup" in its log. k6 writes its summary with K6_SUMMARY_EXPORT (a name
+# unique to this run, so a k6 that never wrote one can't pass with an old
+# one) into the k6-out volume; bench/k6/gateway-verdict.js then prints it
+# with gateway-bench's /metrics, fetched on the compose network, so no port
+# is published. It prints one verdict line either way, and "k6 exited N"
+# when k6 failed, rejected or not. A rejected run exits 1; a clean one exits
+# with k6's own status, non-zero when a threshold failed. See
+# bench/README.md.
+#
+# The load run sets BENCH_K6_SCRIPT=messages.js itself: compose fills the
+# k6-gateway command from the shell and .env, so a leftover value there
+# (gateway-verdict.js, a script being tried out) would replace the load
+# test, and a run that wasn't messages.js could still come out clean.
+bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the mock, then reject a run with fail_open or unmatched counts; BENCH_API, BENCH_UPSTREAM, DURATION_S and STREAM pass through
 	$(COMPOSE_BENCH) up -d --build --force-recreate --always-recreate-deps gateway-bench
 	@id="$$($(COMPOSE_BENCH) ps -q gateway-bench)"; \
 	if [ -z "$$id" ]; then echo "bench-gateway: gateway-bench is not running" >&2; exit 1; fi; \
@@ -91,4 +109,14 @@ bench-gateway: certs ## Load test through gateway-bench, a gateway fixed to the 
 		sleep 0.5; i=$$((i + 1)); \
 	done; \
 	docker logs "$$id" 2>&1 | go run ./cmd/benchguard -mock $(MOCK_URL)
-	$(COMPOSE_BENCH) run --rm --no-deps -e TARGET_URL=http://gateway-bench:8081 k6
+	@id="$$($(COMPOSE_BENCH) ps -q gateway-bench)"; \
+	summary="summary-$$(date +%Y%m%d%H%M%S)-$$$$.json"; \
+	out="$$(mktemp)"; trap 'rm -f "$$out"' EXIT; \
+	status=0; verdict=0; \
+	BENCH_K6_SCRIPT=messages.js $(COMPOSE_BENCH) run --rm --no-deps -e TARGET_URL=http://gateway-bench:8081 -e K6_SUMMARY_EXPORT="$$summary" k6-gateway || status=$$?; \
+	echo "bench-gateway: checking gateway-bench's metrics"; \
+	BENCH_K6_SCRIPT=gateway-verdict.js $(COMPOSE_BENCH) run --rm --no-deps -T -e BENCH_SUMMARY="$$summary" k6-gateway >"$$out" || true; \
+	docker logs "$$id" 2>&1 | go run ./cmd/benchverdict -k6 "$$out" || verdict=1; \
+	if [ $$status -ne 0 ]; then echo "bench-gateway: k6 exited $$status; see its thresholds above" >&2; fi; \
+	if [ $$verdict -ne 0 ]; then exit 1; fi; \
+	exit $$status

@@ -120,7 +120,17 @@ tool policies, and writes an audit log.
   cmd/benchguard refuses
   to run unless there is at least one "upstream enabled" line and each has
   exactly one base_url (logged as scheme://host:port), equal to
-  https://mockupstream:9090; a line it can't read refuses too. BENCH_API
+  https://mockupstream:9090; a line it can't read refuses too. After k6,
+  cmd/benchverdict rejects the run (exit 1, one "bench rejected:" line)
+  unless gateway-bench's own counters show 0 fail_open, allowed equal to
+  k6's http_reqs count, no other outcome, and its log has "listening" and
+  no "redis not reachable at startup"; missing or unreadable metrics
+  reject too. A clean run prints "bench clean: N requests, N allowed, 0
+  fail_open" and exits with k6's status. k6 runs as k6-gateway (extends
+  k6, volume k6-out on /home/k6): K6_SUMMARY_EXPORT writes a per-run
+  summary file there, then bench/k6/gateway-verdict.js prints it with
+  gateway-bench:9464/metrics between markers, from the compose network (no
+  published port). BENCH_API
   ("anthropic" or "openai"), BENCH_UPSTREAM (a bare name such as
   mockcompat, never a path: Git Bash rewrites a leading "/"), DURATION_S
   and STREAM pass through.
