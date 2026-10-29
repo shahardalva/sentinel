@@ -156,8 +156,9 @@ measure includes it. Its limit is `SENTINEL_RATE_LIMIT_RPM=1000000`, far above
 anything the script sends (1000 req/s is 60,000 a minute), so the bench never
 gets a `429`. It uses Redis database 1, apart from the `make up` gateway's
 buckets in database 0. The request log's `rate_limit_us` shows the Redis time
-on its own. Results from before this change, such as those in
-[RESULTS.md](RESULTS.md), have no Redis call, so compare them with care.
+on its own. The current [RESULTS.md](RESULTS.md) includes the Redis call;
+results from before this change (in its git history) have none, so
+compare them with care.
 
 ### Checking the run
 
@@ -211,7 +212,8 @@ How the numbers get out, without publishing a port:
   summary as a bare file name, since Git Bash rewrites an argument that
   starts with `/`.
 
-A rejected run looks like this (the run from the RESULTS.md caveat):
+A rejected run looks like this (the 2026-10-25 run described in
+[RESULTS.md](RESULTS.md#earlier-results-before-benchverdict)):
 
 ```
 bench rejected: gateway-bench logged "redis not reachable at startup" (error: ...); 4,058 fail_open: those requests skipped Redis or got no answer from it; 42,823 allowed, but k6 sent 46,881 requests: not every request went through Redis exactly once (46,881 requests, 42,823 allowed, 4,058 fail_open)

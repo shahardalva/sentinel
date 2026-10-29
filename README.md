@@ -513,13 +513,15 @@ Traces are not exported yet; see [Known limitations](#known-limitations). The de
 
 ## Performance
 
-Load tests against a mock upstream measure the time the gateway itself adds to each request.
+Load tests against a mock upstream (100 ms per request) measure the time the gateway itself adds to each request, including its Redis rate-limit call. Overhead from two run pairs on 2026-10-29, as the range over both:
 
-- Median gateway overhead is about 1 ms or less at every tested rate up to 1000 req/s.
-- p99 spikes moved between runs, which points at the shared test machine rather than a fixed cost in the gateway.
-- In one of two runs at 1000 req/s, the concurrency cap shed 0.22% of requests with `503`.
+| Rate | p50 overhead | p99 overhead |
+| --- | --- | --- |
+| 100 req/s | +0.76 to +0.96 ms | +0.98 to +2.61 ms |
+| 500 req/s | +0.81 to +0.88 ms | +1.16 to +1.21 ms |
+| 1000 req/s | +0.61 to +0.70 ms | +1.91 to +2.76 ms |
 
-Full numbers are in [bench/RESULTS.md](bench/RESULTS.md). To reproduce them, see [bench/README.md](bench/README.md).
+Each pair runs k6 straight at the mock, then through the gateway, in Docker Compose on one machine, and every gateway run is checked against the gateway's own rate-limit counters (no `fail_open`, every request allowed exactly once); a run that fails the check is rejected. One of three was. Full numbers, the rejected run and the limits are in [bench/RESULTS.md](bench/RESULTS.md); to reproduce them, see [bench/README.md](bench/README.md).
 
 ## Design decisions
 
