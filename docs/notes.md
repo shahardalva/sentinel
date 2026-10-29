@@ -10,7 +10,7 @@ Newest entries first. Short: what was done, what was decided, what's next.
   and proxy.Auth answers every request 503 (api_error), not 401. ERROR
   once on entering, INFO once on recovering, from a request or a refresh,
   whichever sees it first. Gauge sentinel_auth_keys_stale through a new
-  Recorder.RecordKeysStale. Config: negative, or under twice
+  Recorder.RecordKeysStale. Config: negative, or under three times
   SENTINEL_KEYS_REFRESH (the default too), stops startup; without a DB
   only a WARN. Compose passes it like SENTINEL_KEYS_REFRESH.
 - Admin shutdown: the admin server stops accepting when shutdown starts,
@@ -29,14 +29,49 @@ Newest entries first. Short: what was done, what was decided, what's next.
 - Stale travels in the KeySet (UnavailableKeySet), not a second
   KeySource method or an error return: one call per request, one answer,
   no change to Static or the fakes' Keys.
-- The max-stale floor is 2 x refresh, stricter than "at least the
-  refresh": a healthy refresh comes up to refresh + fetch timeout (<= 1.5
-  x refresh) after the last, so anything less could go stale with nothing
-  failing. keys.NewRefreshing enforces the exact bound.
+- The max-stale floor is 3 x refresh (first 2 x, raised after review):
+  the fetch timeout is <= refresh/2, so after one failed refresh the next
+  success lands by 3 x refresh; with 2 x, a single failed refresh puts
+  every request on a 503. keys.NewRefreshing enforces 2 x (Interval +
+  FetchTimeout), the same bound for any fetch timeout.
 - Admin cap is a constant derived from the pool size, not configurable.
 - 503s for stale keys aren't auth rejections; no per-request counter.
 
+### After review (go-reviewer), tests first
+- S2: the stale log and gauge could stick at "stale" while fresh keys
+  were served: a request deciding "stale" under staleMu, paused before
+  recording it, while a refresh succeeded and its lock-free check saw
+  nothing to change. store() and refresh() now always recheck under
+  staleMu (recheckStale); requests keep the lock-free path. Test drives
+  the interleaving with two hooks (export_test.go), no sleeps.
+- S3: TestServe_StaleKeysAre503 reads the sentinel_auth_keys_stale line
+  itself (1 while stale, 0 after recovery); the old check matched the
+  key-count gauge's "} 1".
+- N1: a Drain after one that returned nil returns nil at once; Drain
+  calls are serialized.
+- N5: floor raised to 3 x refresh (above).
+- TestStartupInterrupted covers a real *store.Error from store.Open on a
+  cancelled ctx, wrapped by startupError.
+- S1 (docs only): the "4 connections always free" guarantee holds only
+  while Postgres answers; a timed-out admin call frees its slot at once
+  but pgx keeps its connection up to 15 s to clean up, and Close waits
+  for it, so shutdown can run ~15 s longer.
+
+### Accepted
+- N2: the admin slot is taken before the body is read, so a holder of
+  the token sending slow bodies can keep slots for up to the 10 s read
+  timeout. Token required; the refresh is unaffected.
+- N3: an own-deadline timeout (DeadlineExceeded) can read as "startup
+  interrupted" and exit 0 if a signal arrives between the step returning
+  and the check. The window is tiny and the exit code barely matters
+  there.
+- N4: the stale 503 has no Retry-After and sends Connection: close, so
+  during a stale period every request reconnects. The gateway can't know
+  when the database is back; SDKs back off on 503.
+
 ### Next
+- A separate small pool for the key refresh (S1), so admin timeouts
+  against an unresponsive Postgres can never hold its connection.
 - Grafana panel and an alert rule for sentinel_auth_keys_stale.
 
 ## 2026-10-27: gateway wiring (Postgres keys, PR 1d)

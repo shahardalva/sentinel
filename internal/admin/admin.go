@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shahardalva/sentinel/internal/proxy"
@@ -41,10 +42,13 @@ const StoreTimeout = 5 * time.Second
 
 // MaxInFlight caps the admin requests past the token check at once: 4 of
 // the pool's store.MaxConns (8). Every Store method runs its queries one
-// after another, so a request holds at most one connection, and admin
-// holds at most MaxInFlight. The rest stay free for the key refresh, which
-// shares the pool: a flood of admin requests can't starve the refresh that
-// applies a revocation. A request over the cap gets a 503 with
+// after another, so a request holds at most one connection while it runs,
+// and the rest stay free for the key refresh, which shares the pool: a
+// flood of admin requests can't starve the refresh that applies a
+// revocation. That holds while Postgres answers: a call that times out
+// frees its slot at once, but pgx may keep its connection for up to 15 s
+// more to clean up (see store.MaxConns). A request over the cap gets a
+// 503 with
 // Retry-After at once, never a place in a queue, where it would wait
 // holding its connection to the gateway. Derived from store.MaxConns, so
 // it stays below it.
@@ -136,6 +140,10 @@ func New(cfg Config) *API {
 type API struct {
 	http.Handler
 	h *handler
+	// drainMu serializes Drain calls; drained is set once one has taken
+	// every slot.
+	drainMu sync.Mutex
+	drained bool
 }
 
 // Drain waits for every request past the token check to finish, by taking
@@ -144,8 +152,15 @@ type API struct {
 // stops waiting for handlers when its context ends, and Close never waits,
 // so after them Drain is what tells a change still running from one that
 // has committed and been logged. If ctx ends first, Drain gives the slots
-// it took back and returns ctx's error.
+// it took back and returns ctx's error. A call after one that returned nil
+// returns nil at once: it already holds every slot. Calls don't overlap; a
+// second waits for the first.
 func (a *API) Drain(ctx context.Context) error {
+	a.drainMu.Lock()
+	defer a.drainMu.Unlock()
+	if a.drained {
+		return nil
+	}
 	for taken := range MaxInFlight {
 		select {
 		case a.h.slots <- struct{}{}:
@@ -156,6 +171,7 @@ func (a *API) Drain(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	a.drained = true
 	return nil
 }
 

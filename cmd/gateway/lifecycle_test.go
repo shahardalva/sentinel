@@ -213,6 +213,14 @@ func TestStartupInterrupted(t *testing.T) {
 	done, cancel := context.WithCancel(context.Background())
 	cancel()
 	live := context.Background()
+	// A real *store.Error from store's sanitize path: store.Open on a
+	// cancelled context, as Ctrl-C during the connect leaves it, wrapped
+	// with %w by startupError as startKeys does.
+	_, openErr := store.Open(done, "postgres://u@127.0.0.1:1/db?sslmode=disable")
+	if se, ok := errors.AsType[*store.Error](openErr); !ok || !errors.Is(se, context.Canceled) {
+		t.Fatalf("store.Open on a cancelled ctx = %v, want a *store.Error wrapping context.Canceled", openErr)
+	}
+	realCancel := startupError(done, "SENTINEL_DATABASE_URL", openErr, storeOpenTimeout)
 	for _, tt := range []struct {
 		name string
 		ctx  context.Context
@@ -220,6 +228,7 @@ func TestStartupInterrupted(t *testing.T) {
 		want bool
 	}{
 		{"canceled by the signal", done, fmt.Errorf("store: open: %w", context.Canceled), true},
+		{"store.Open canceled by the signal", done, realCancel, true},
 		{"deadline as the signal came", done, fmt.Errorf("store: migrate: %w", context.DeadlineExceeded), true},
 		{"schema too new as the signal came", done, fmt.Errorf("key store migration: %w", store.ErrSchemaTooNew), false},
 		{"store error as the signal came", done, &store.Error{Op: "open"}, false},

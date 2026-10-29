@@ -1062,11 +1062,12 @@ func parseKeysRefresh(s string) (time.Duration, error) {
 
 // parseKeysMaxStale reads SENTINEL_KEYS_MAX_STALE, a Go duration such as
 // 10m, or 0 to never expire the key set. Empty means defaultKeysMaxStale.
-// Anything else must be at least twice refresh: a successful refresh comes
-// up to refresh plus its fetch timeout (at most half of refresh) after the
-// last, so a shorter limit could expire a set refreshed on time. The
-// default is held to the same rule, so a long refresh needs the variable
-// set rather than a limit quietly raised.
+// Anything else must be at least three times refresh. The fetch timeout
+// is at most half of refresh, so a successful refresh comes up to 1.5 x
+// refresh after the last, and after one failed refresh the next success
+// lands by 3 x refresh. With 2 x, a single failed refresh would put every
+// request on a 503. The default is held to the same rule, so a long
+// refresh needs the variable set rather than a limit quietly raised.
 func parseKeysMaxStale(s string, refresh time.Duration) (time.Duration, error) {
 	d := defaultKeysMaxStale
 	if s != "" {
@@ -1078,13 +1079,13 @@ func parseKeysMaxStale(s string, refresh time.Duration) (time.Duration, error) {
 			return 0, fmt.Errorf("%q is negative", s)
 		}
 	}
-	if d == 0 || d >= 2*refresh {
+	if d == 0 || d >= 3*refresh {
 		return d, nil
 	}
 	if s == "" {
-		return 0, fmt.Errorf("the default of %s is under twice SENTINEL_KEYS_REFRESH (%s); set SENTINEL_KEYS_MAX_STALE to at least %s, or 0 to never expire the key set", d, refresh, 2*refresh)
+		return 0, fmt.Errorf("the default of %s is under three times SENTINEL_KEYS_REFRESH (%s); set SENTINEL_KEYS_MAX_STALE to at least %s, or 0 to never expire the key set", d, refresh, 3*refresh)
 	}
-	return 0, fmt.Errorf("%q is under twice SENTINEL_KEYS_REFRESH (%s)", s, refresh)
+	return 0, fmt.Errorf("%q is under three times SENTINEL_KEYS_REFRESH (%s), so one failed refresh would answer every request with a 503", s, refresh)
 }
 
 // loadAdminConfig reads SENTINEL_ADMIN_ADDR and SENTINEL_ADMIN_TOKEN into

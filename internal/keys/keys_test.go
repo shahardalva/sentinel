@@ -607,6 +607,9 @@ func TestNewRefreshing_RejectsBadConfig(t *testing.T) {
 			// apart, so a MaxStale within that would go stale between them.
 			"max stale under interval": {Fetch: fetch, Interval: interval, MaxStale: interval / 2},
 			"max stale one cycle":      {Fetch: fetch, Interval: interval, MaxStale: interval + 10*time.Second},
+			// One failed refresh puts the next success up to two cycles,
+			// 2 x (Interval + FetchTimeout), after the last.
+			"max stale under two cycles": {Fetch: fetch, Interval: interval, MaxStale: 2*(interval+10*time.Second) - time.Nanosecond},
 		} {
 			if r, err := keys.NewRefreshing(t.Context(), cfg); r != nil || err == nil {
 				t.Errorf("%s: NewRefreshing = %v, %v; want an error", name, r, err)
@@ -1036,6 +1039,121 @@ func TestRefreshing_MaxStaleZeroNeverExpires(t *testing.T) {
 		}
 		if got := rec.staleReports(); len(got) != 0 {
 			t.Errorf("stale reports %v with MaxStale 0, want none", got)
+		}
+		cancel()
+		<-r.Done()
+	})
+}
+
+// waitFor receives from ch, or fails the test after 5 s.
+func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+// A request finds the set stale and is paused, holding staleMu, before it
+// records that; a refresh succeeds meanwhile. The refresh's check must
+// wait for the request's and then record the recovery, or the log and the
+// stale gauge stay "stale" while fresh keys are served. The hooks fix the
+// interleaving, so the test is deterministic, not a race to win.
+func TestRefreshing_StaleFlagAfterConcurrentRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	start := time.Now()
+	var offset atomic.Int64
+	now := func() time.Time { return start.Add(time.Duration(offset.Load())) }
+
+	var armed, paused atomic.Bool
+	decided, release := make(chan struct{}), make(chan struct{})
+	afterDecide := func() {
+		if armed.Load() && paused.CompareAndSwap(false, true) {
+			close(decided)
+			<-release
+		}
+	}
+	rechecking := make(chan struct{}, 1)
+	beforeRecheck := func() {
+		if armed.Load() {
+			select {
+			case rechecking <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	var logs logBuffer
+	rec := &fakeRecorder{}
+	f := &fakeFetch{set: digests("k")}
+	const maxStale = 3 * time.Hour
+	r, err := keys.NewRefreshingForTest(ctx, keys.Config{
+		Fetch:    f.fetch,
+		Interval: time.Hour, // the loop never refreshes on its own here
+		MaxStale: maxStale,
+		Logger:   slog.New(slog.NewJSONHandler(&logs, nil)),
+		Recorder: rec,
+		Now:      now,
+	}, beforeRecheck, afterDecide)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	offset.Store(int64(maxStale + 1))
+	armed.Store(true)
+	served := make(chan *proxy.KeySet, 1)
+	go func() { served <- r.Keys() }() // the request
+	waitFor(t, decided, "the request to decide the set is stale")
+
+	refreshed := make(chan struct{})
+	go func() { keys.RefreshForTest(ctx, r); close(refreshed) }()
+	// Either the refresh has finished its check without waiting for the
+	// request (the bug), or it is about to wait for the request's lock.
+	select {
+	case <-refreshed:
+	case <-rechecking:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresh neither finished nor reached its stale check")
+	}
+	close(release)
+	waitFor(t, refreshed, "the refresh")
+	if set := waitFor(t, served, "the request"); !set.Unavailable() {
+		t.Error("the request that found the set stale was served it")
+	}
+
+	// Before any other Keys() call, which would itself notice the flag is
+	// wrong and repair it: with no traffic, nothing would.
+	if got := rec.staleReports(); !slices.Equal(got, []bool{false, true, false}) {
+		t.Errorf("stale reports %v, want [false true false]: the gauge must end fresh", got)
+	}
+	infos := 0
+	for _, l := range logLines(t, &logs, "INFO") {
+		if l["msg"] == "client keys are fresh again; accepting requests" {
+			infos++
+		}
+	}
+	if infos != 1 {
+		t.Errorf("%d recovery INFO lines, want 1", infos)
+	}
+	if r.Keys().Unavailable() {
+		t.Error("Keys() after the refresh: unavailable, want the fresh set")
+	}
+}
+
+// MaxStale of exactly two cycles, 2 x (Interval + FetchTimeout), rides out
+// one failed refresh, so it is accepted.
+func TestNewRefreshing_MaxStaleTwoCycles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		f := &fakeFetch{set: digests("k")}
+		r, err := keys.NewRefreshing(ctx, keys.Config{Fetch: f.fetch, Interval: interval, MaxStale: 2 * (interval + 10*time.Second)})
+		if err != nil {
+			t.Fatalf("NewRefreshing = %v, want two cycles accepted", err)
 		}
 		cancel()
 		<-r.Done()

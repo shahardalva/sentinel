@@ -78,9 +78,16 @@ func Open(ctx context.Context, connString string) (*Store, error) {
 //   - Migrate: one, at startup, before either of the others.
 //
 // So with the admin API full, 4 connections are still free for the
-// refresh, which needs 1; the others absorb a connection pgx is still
-// cleaning up after a cancelled query. 8 per gateway keeps 12 gateways
-// under Postgres's default max_connections of 100.
+// refresh, which needs 1, while Postgres answers. When it doesn't, an
+// admin call that times out frees its admin slot at once, but pgx keeps
+// its connection for up to 15 s more while it cancels the query and
+// cleans up (a CancelRequest on a new connection, then a drain), so
+// repeated timeouts can hold more than 4 and leave the refresh waiting.
+// The refresh is failing then anyway; a pool of its own would make the
+// guarantee unconditional. Close waits for those cleanups too, so
+// shutdown can take up to about 15 s longer after such a timeout. 8 per
+// gateway keeps 12 gateways under Postgres's default max_connections of
+// 100.
 const MaxConns = 8
 
 // poolConfig parses connString into a pool config of MaxConns

@@ -177,3 +177,27 @@ func TestDrain(t *testing.T) {
 		}
 	})
 }
+
+// A Drain after one that succeeded returns nil at once: it already holds
+// every slot, and waiting for a slot it holds would only time out and
+// read as admin requests still running.
+func TestDrainTwice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := admin.New(admin.Config{Store: newPoolStore(), Token: token, Logger: slog.New(slog.DiscardHandler)})
+		if err := h.Drain(t.Context()); err != nil {
+			t.Fatalf("first Drain = %v", err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := h.Drain(ctx); err != nil {
+			t.Errorf("second Drain = %v, want nil", err)
+		}
+		if waited := time.Since(start); waited != 0 {
+			t.Errorf("second Drain waited %s, want none", waited)
+		}
+		if rec := do(h, http.MethodGet, "/admin/tenants", "", authed()); rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("after two Drains: %d, want 503", rec.Code)
+		}
+	})
+}

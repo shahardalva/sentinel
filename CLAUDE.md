@@ -175,8 +175,9 @@ tool policies, and writes an audit log.
   a database: one WARN, ignored.
 - SENTINEL_KEYS_MAX_STALE (optional): how long the last good key set is
   served while refreshes fail, default 10m, 0 never expires. Past it every
-  request gets 503 (sentinel_auth_keys_stale 1). Negative or under twice
-  SENTINEL_KEYS_REFRESH (the default too) stops startup. Set without a
+  request gets 503 (sentinel_auth_keys_stale 1). Negative or under three
+  times SENTINEL_KEYS_REFRESH (the default too) stops startup;
+  keys.NewRefreshing needs MaxStale >= 2 x (Interval + FetchTimeout). Set without a
   database: one WARN, ignored.
 - SENTINEL_ADMIN_ADDR (optional): admin API listener, default
   127.0.0.1:9465 with a database, "off" disables. Same parsing as the

@@ -152,16 +152,16 @@ func TestParseKeysMaxStale(t *testing.T) {
 		"":     10 * time.Minute,
 		"0":    0,
 		"0s":   0,
-		"1m":   time.Minute, // twice the refresh
+		"90s":  90 * time.Second, // three times the refresh
 		" 1h ": time.Hour,
 	} {
 		if got, err := parseKeysMaxStale(in, refresh); err != nil || got != want {
 			t.Errorf("parseKeysMaxStale(%q, 30s) = %s, %v; want %s", in, got, err, want)
 		}
 	}
-	// Under twice the refresh, a set refreshed on time could go stale
-	// between two refreshes.
-	for _, in := range []string{"-1m", "-0.5s", "10", "soon", "10 m", "29s", "30s", "59s"} {
+	// Under three times the refresh, a single failed refresh could put the
+	// gateway on 503s.
+	for _, in := range []string{"-1m", "-0.5s", "10", "soon", "10 m", "29s", "30s", "59s", "1m", "89s"} {
 		if got, err := parseKeysMaxStale(in, refresh); err == nil {
 			t.Errorf("parseKeysMaxStale(%q, 30s) = %s, want an error", in, got)
 		}
@@ -169,9 +169,12 @@ func TestParseKeysMaxStale(t *testing.T) {
 	if _, err := parseKeysMaxStale("-1m", refresh); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Errorf("parseKeysMaxStale(-1m) = %v, want it called negative", err)
 	}
-	// The default too: a refresh over 5m needs a max stale set.
-	if got, err := parseKeysMaxStale("", 6*time.Minute); err == nil || !strings.Contains(err.Error(), "set SENTINEL_KEYS_MAX_STALE") {
-		t.Errorf("default with a 6m refresh = %s, %v; want an error asking to set it", got, err)
+	// The default too: a refresh over 3m20s needs a max stale set.
+	if got, err := parseKeysMaxStale("", 4*time.Minute); err == nil || !strings.Contains(err.Error(), "set SENTINEL_KEYS_MAX_STALE") {
+		t.Errorf("default with a 4m refresh = %s, %v; want an error asking to set it", got, err)
+	}
+	if got, err := parseKeysMaxStale("", 200*time.Second); err != nil || got != 10*time.Minute {
+		t.Errorf("default with a 3m20s refresh = %s, %v; want 10m, exactly three times", got, err)
 	}
 	if got, err := parseKeysMaxStale("0", 6*time.Minute); err != nil || got != 0 {
 		t.Errorf("0 with a 6m refresh = %s, %v; want 0", got, err)
@@ -222,12 +225,37 @@ func TestServe_StaleKeysAre503(t *testing.T) {
 	if code := apiStatus(t, r, "wrong"); code != http.StatusServiceUnavailable {
 		t.Errorf("wrong key while stale: %d, want 503", code)
 	}
-	_, body := get(t, http.MethodGet, "http://"+r.metrics+"/metrics", nil)
-	if !strings.Contains(body, "sentinel_auth_keys_stale{") || !strings.Contains(body, "} 1\n") {
-		t.Errorf("scrape while stale has no sentinel_auth_keys_stale at 1")
+	if v := staleGauge(t, r); v != "1" {
+		t.Errorf("sentinel_auth_keys_stale while stale = %s, want 1", v)
 	}
 	down.Store(false)
 	waitStatus(t, r, "k", http.StatusOK)
+	if v := staleGauge(t, r); v != "0" {
+		t.Errorf("sentinel_auth_keys_stale after recovery = %s, want 0", v)
+	}
+}
+
+// staleGauge scrapes r's metrics and returns the value on the
+// sentinel_auth_keys_stale line, failing unless there is exactly one.
+func staleGauge(t *testing.T, r *running) string {
+	t.Helper()
+	_, body := get(t, http.MethodGet, "http://"+r.metrics+"/metrics", nil)
+	var values []string
+	for line := range strings.SplitSeq(body, "\n") {
+		name, rest, _ := strings.Cut(line, "{")
+		if name != "sentinel_auth_keys_stale" {
+			continue
+		}
+		_, value, ok := strings.Cut(rest, "} ")
+		if !ok {
+			t.Fatalf("unreadable line %q", line)
+		}
+		values = append(values, value)
+	}
+	if len(values) != 1 {
+		t.Fatalf("scrape has %d sentinel_auth_keys_stale lines, want 1", len(values))
+	}
+	return values[0]
 }
 
 func TestLoadConfig_AdminAddr(t *testing.T) {
