@@ -1204,7 +1204,9 @@ var redisWarmUpTimeout = 5 * time.Second
 // Redis or an incomplete warm-up is only a warning: Redis may still be
 // starting, and the fail mode decides what requests get until it is up. A
 // failed ping skips the warm-up, which could only wait out its timeout.
-// Both stop when ctx is done, so a signal during startup isn't held up.
+// Both stop when ctx is done, so a signal during startup isn't held up, and
+// that is logged at INFO as "startup interrupted", like a signal while the
+// key database starts: a stop that was asked for, not a failure.
 func startRateLimit(ctx context.Context, logger *slog.Logger, cfg config) {
 	mode := "open"
 	if cfg.rateFailClosed {
@@ -1216,6 +1218,12 @@ func startRateLimit(ctx context.Context, logger *slog.Logger, cfg config) {
 	pingCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	if err := cfg.redis.Ping(pingCtx).Err(); err != nil {
+		// Whatever the error says: a signal doesn't cut a read short, so a
+		// ping it interrupted can end in a read timeout.
+		if ctx.Err() != nil {
+			logger.Info("startup interrupted", "step", "redis ping", "error", err)
+			return
+		}
 		logger.Warn("redis not reachable at startup", "redis", cfg.redis.Options().Addr,
 			"fail_mode", mode, "error", err)
 		return
@@ -1223,11 +1231,16 @@ func startRateLimit(ctx context.Context, logger *slog.Logger, cfg config) {
 
 	warmCtx, cancel := context.WithTimeout(ctx, redisWarmUpTimeout)
 	defer cancel()
+	// WarmUp holds all of them at once, so no more than the pool holds.
 	want := min(ratelimit.WarmConns, cfg.redis.Options().PoolSize)
-	if ready, err := ratelimit.WarmUp(warmCtx, cfg.redis, want); err != nil {
+	ready, err := ratelimit.WarmUp(warmCtx, cfg.redis, want)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		logger.Info("startup interrupted", "step", "redis warm-up", "ready", ready, "want", want, "error", err)
+	case err != nil:
 		logger.Warn("redis pool warm-up incomplete", "redis", cfg.redis.Options().Addr,
 			"ready", ready, "want", want, "fail_mode", mode, "error", err)
-	} else {
+	default:
 		logger.Info("redis pool warm", "ready", ready)
 	}
 }

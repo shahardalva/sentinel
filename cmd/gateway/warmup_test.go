@@ -97,7 +97,8 @@ func TestStartRateLimit_WarmUpIncomplete(t *testing.T) {
 	}
 }
 
-// A signal during the warm-up ends it at once instead of after its bound.
+// A signal during the warm-up ends it at once instead of after its bound,
+// and is logged as an interruption, not a warning.
 func TestStartRateLimit_SignalStopsWarmUp(t *testing.T) {
 	shortWarmUp(t, time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,8 +112,57 @@ func TestStartRateLimit_SignalStopsWarmUp(t *testing.T) {
 	if d := time.Since(start); d >= ratelimit.PoolDialTimeout/2 {
 		t.Errorf("startup took %v after the signal, want it to stop at once", d)
 	}
-	if out := buf.String(); !strings.Contains(out, "redis pool warm-up incomplete") || !strings.Contains(out, "context canceled") {
-		t.Errorf("want the warm-up warning with context canceled:\n%s", out)
+	out := buf.String()
+	if !strings.Contains(out, `level=INFO msg="startup interrupted" step="redis warm-up"`) {
+		t.Errorf("want an INFO interruption for the warm-up:\n%s", out)
+	}
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("a signal logged as a warning:\n%s", out)
+	}
+}
+
+// A signal during the startup ping: an interruption, not "redis not
+// reachable at startup" (which make bench-gateway rejects), and no
+// warm-up after it.
+func TestStartRateLimit_SignalDuringPing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mr := miniredis.RunT(t)
+	// Nothing is served; the signal arrives once the ping waits on Redis.
+	cfg := redisConfig(t, servesFirst(t, mr.Addr(), 0, cancel))
+	var buf bytes.Buffer
+	startRateLimit(ctx, slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	out := buf.String()
+	if !strings.Contains(out, `level=INFO msg="startup interrupted" step="redis ping"`) {
+		t.Errorf("want an INFO interruption for the ping:\n%s", out)
+	}
+	if strings.Contains(out, "level=WARN") || strings.Contains(out, "redis pool warm") {
+		t.Errorf("want neither a warning nor a warm-up:\n%s", out)
+	}
+}
+
+// A pool smaller than WarmConns is warmed to its size: asking WarmUp for
+// more would hold the pool and wait out the whole bound.
+func TestStartRateLimit_WarmsAtMostPoolSize(t *testing.T) {
+	shortWarmUp(t, time.Second)
+	mr := miniredis.RunT(t)
+	cfg, err := loadConfig(env(map[string]string{
+		"ANTHROPIC_API_KEY":       "sk",
+		"SENTINEL_API_KEYS":       "k1",
+		"SENTINEL_REDIS_URL":      "redis://" + mr.Addr(),
+		"SENTINEL_MAX_CONCURRENT": "4",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cfg.redis.Close() })
+	var buf bytes.Buffer
+	startRateLimit(context.Background(), slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	if out := buf.String(); !strings.Contains(out, `msg="redis pool warm" ready=4`) {
+		t.Errorf("want ready=4 for a pool of 4:\n%s", out)
+	}
+	if n := mr.CurrentConnectionCount(); n != 4 {
+		t.Errorf("Redis has %d connections, want 4", n)
 	}
 }
 

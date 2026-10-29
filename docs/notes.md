@@ -2,7 +2,7 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
-## 2026-10-29: review of the warm pool (#55): no MinIdleConns, restarts
+## 2026-10-29: review of the warm pool (#55): no MinIdleConns
 
 ### Done (test first, then a mutation check per item)
 - MinIdleConns dropped. It doubled the warm-up to 32 (every Get refills
@@ -12,72 +12,71 @@ Newest entries first. Short: what was done, what was decided, what's next.
   pool's dial-error gate 16x sooner in an outage. WarmUp alone fixes the
   cold start; the pool keeps what it set up while idle (go-redis closes an
   idle connection only after ConnMaxIdleTime, 30 min).
-- ratelimit.WarmUp(ctx, client, n): n explicit, capped at PoolSize;
-  through client.WithTimeout(PoolDialTimeout), so its reads aren't capped
-  at the 50 ms (that clone shares the pool and is never closed). Returns
-  as soon as ctx is done, with ctx's error; PINGs still waiting return
-  their connections when they end. ratelimit.WarmConns = 16.
-- Breaker (C1): a connection-level error (io.EOF, io.ErrUnexpectedEOF,
-  net.ErrClosed, ECONNRESET, ECONNABORTED, EPIPE; WSAECONNRESET and
-  WSAECONNABORTED on Windows) doesn't count toward the consecutive
-  failures, and a probe that gets one is released. A dial error always
-  counts. The request still gets the fail mode. NewClient also sets the
-  retry backoff to 0 (MinRetryBackoff = MaxRetryBackoff = -1).
+- ratelimit.WarmUp(ctx, client, n): n explicit, at most the pool size
+  (the caller caps it; WarmUp holds all n at once). Through
+  client.WithTimeout(PoolDialTimeout), so its reads aren't capped at the
+  50 ms (that clone shares the pool and is never closed). Returns as soon
+  as ctx is done, with ctx's error; PINGs still waiting return their
+  connections when they end, and a dial still running lands in the pool
+  without its handshake. ratelimit.WarmConns = 16.
 - cmd/gateway: logRateLimit is startRateLimit(ctx, ...), on serve's ctx;
-  warms min(WarmConns, pool size). redisWarmUpTimeout stays a var, which
-  a test shortens.
-- Tests: TestBreaker_RestartUnderWarmPool (TLS proxy, WarmUp 32, restart,
-  64 calls 10 ms apart: breaker closed, last call OK; before: 48 failed,
-  breaker open). TestIsConnError. WarmUp: reads not capped (replies 150 ms
-  late), capped at pool size, leaves exactly n idle. Gateway: miniredis
-  CommandCount and connection count after startup (2 commands and 1
-  connection without the warm-up, at least 32 and exactly 16 with it), a
-  200 ms bound, and a canceled ctx ending the warm-up at once.
+  warms min(WarmConns, pool size), computed only there. A signal during
+  the ping or the warm-up logs INFO "startup interrupted" with step
+  "redis ping" or "redis warm-up", like startKeys, not a WARN (make
+  bench-gateway rejects "redis not reachable at startup"). It checks
+  serve's ctx, not the error: a signal doesn't cut a go-redis read short,
+  so an interrupted ping can end in a read timeout. redisWarmUpTimeout
+  stays a var, which tests shorten.
+- Tests: WarmUp reads not capped (replies 150 ms late), leaves exactly n
+  idle. Gateway: miniredis CommandCount and connection count after
+  startup (2 commands and 1 connection without the warm-up, at least 32
+  and exactly 16 with it), a 200 ms bound, a pool of 4 warmed to 4, and a
+  signal during the warm-up and during the ping (INFO, no WARN, at once).
   TestBreaker_FewerFailuresStayClosed asserts the breaker closed at the
   end. Every test client gets an explicit pool size.
-- Mutations, each failing a test: connection errors counted again;
-  retry backoff back to go-redis's default; MinIdleConns back; WarmUp
-  reads capped (client.Conn); no pool-size cap; DialTimeout back to
-  50 ms; no warm-up at startup (now behavioral: CommandCount);
-  Background ctx at startup; WarmUp waiting out PINGs on ctx done; dial
-  errors classified as connection errors.
+- Mutations, each failing a test: MinIdleConns back; DialTimeout back to
+  50 ms; WarmUp reads capped (client.Conn); WarmUp waiting out PINGs on
+  ctx done; WarmUp returning before its connections are back; no warm-up
+  at startup (CommandCount, connection count); no pool-size cap;
+  warm-up on Background; a signal during the ping or the warm-up logged
+  as WARN; warm-up after a failed ping.
 - Burst test at -cpu 1,2 -count 10: 20 of 20 pass, with and without
   -race (the review saw 6 of 20 fail at 1 and 2 with reads capped).
 
 ### Decided
-- Zero retry backoff, with the classifier: what go-redis returns after a
-  restart is a timeout, not EOF. It retries a call that hit a dead
-  connection, but sleeps 10 ms to 1 s first under the call's context, so
-  within 50 ms the call ends with context deadline exceeded, which counts.
-  With no backoff the retries are immediate (up to 4 connections a call)
-  and a call ends with the connection error, or succeeds on a live one.
-- The restart test warms 32, not 16: at 4 connections a call, 16 dead ones
-  fail only 4 calls, below the threshold even when counted, so the
-  "count them again" mutation survived. 32 is what dev's pool reached in
-  the probe below.
+- Scope: this PR ships the cold-start fix only. The breaker change below
+  (connection errors not counted, zero retry backoff) was built, reviewed
+  and taken out again; it is on branch wip/breaker-conn-errors, for the
+  circuit-breaker PR.
 - Maintenance notifications stay off: nothing used them; on Redis Cloud
   or Enterprise we lose their graceful handoff (relaxed timeouts, MOVING)
-  during maintenance, which then looks like dropped connections: those
-  calls fail open, and don't open the breaker. In ADR 0002.
+  during maintenance, which then looks like dropped connections. In ADR
+  0002.
 
 ### Learned
-- Dev has C1 too, without any warm-up: a probe on dev's code grew the
-  pool to 32 with 32 concurrent callers for 300 ms, restarted Redis behind
-  a TLS proxy, then called every 10 ms: all 3 runs opened the breaker
-  (every call a timeout until it did). Plain TCP did the same, but on
-  Windows only; on Linux go-redis checks plain TCP idle connections. This
-  branch, same probe: 8 calls fail open, breaker closed, 3 of 3 (TLS and
-  plain).
+- Deferred, not fixed here: a Redis restart under a warm pool can open the
+  breaker, and so can one under load on dev, with no warm-up at all.
+  go-redis doesn't health-check idle TLS connections (or any on Windows),
+  so after a restart the calls use dead ones, and go-redis retries them
+  with a backoff (10 ms to 1 s) slept inside the 50 ms: the calls end
+  with context deadline exceeded, which counts, 5 in a row. A probe on
+  dev's code (pool grown to 32 by 32 concurrent callers, restart behind a
+  TLS proxy, calls 10 ms apart) opened it in 3 of 3 runs. The fix is
+  designed (a bounded count of connection errors, zero backoff,
+  MaxRetries 1) but needs its own PR: skipping connection errors outright
+  means an endpoint that accepts and then closes never opens the breaker,
+  and an open one re-probes with no cooldown. Issue: #57.
 - A canceled ctx doesn't interrupt a go-redis read in progress: only a
   deadline does (the socket deadline is the earlier of ctx's and the
   read timeout). Hence WarmUp returning on ctx.Done instead of waiting
-  for its PINGs.
+  for its PINGs, and startRateLimit checking ctx itself.
 - TestBreaker_ConcurrentOutage (#41) fails 6 of 20 here at -race -cpu
   1,2 and 7 of 20 on dev: not this change.
 
 ### Next
 - Re-run make bench-gateway (needs docker): "redis pool warm" ready=16
   and a clean verdict, as before.
+- The breaker issue above, from wip/breaker-conn-errors.
 
 ## 2026-10-29: warm Redis pool, dials outside the 50 ms (#55)
 
@@ -153,7 +152,7 @@ Newest entries first. Short: what was done, what was decided, what's next.
   restart such dead connections are found by the calls that use them.
   TestBreaker_FewerFailuresStayClosed creates its client with Redis
   already down and pings before the "Redis back" call, so it tests only
-  the count reset; TestBreaker_RestartUnderWarmPool covers the restart.
+  the count reset; a restart under a warm pool is deferred (next entry).
 - go-redis data race (-race caught it in WarmUp): each client.Conn()
   shares the client's *Options but has its own optLock, and in the
   default maint-notifications "auto" mode a Redis that refuses CLIENT

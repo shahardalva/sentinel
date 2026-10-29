@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"sync"
 	"time"
 
@@ -167,13 +166,6 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 	if poolSize > 0 {
 		opts.PoolSize = poolSize
 	}
-	// go-redis retries a call that hit a dead connection on another one,
-	// but sleeps 10 ms to 1 s first, under the call's context. Within 50 ms
-	// that sleep only turns a fast connection error, which the breaker
-	// skips, into a timeout, which it counts: after a Redis restart every
-	// call on a dead pooled connection would count toward opening it.
-	opts.MinRetryBackoff = -1
-	opts.MaxRetryBackoff = -1
 	opts.DisableIdentity = true // skip CLIENT SETINFO on connect
 	// Maintenance notifications are a Redis Cloud and Enterprise feature.
 	// In go-redis's default "auto" mode every new connection asks for them,
@@ -184,17 +176,20 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 	return redis.NewClient(opts), nil
 }
 
-// WarmUp sets up n of the client's connections, at most its pool size, and
-// sends a PING on each, so they are dialed and past the handshake (HELLO,
-// AUTH, SELECT) before the first request needs them; they then go back to
-// the pool, idle. It runs outside any request, so its reads get
-// PoolDialTimeout rather than the client's call timeout. It returns how
-// many connections are ready and the first failure; once ctx is done it
-// returns at once, with ctx's error, and leaves the PINGs still waiting to
-// return their connections when they end. Call it once at startup, before
-// serving.
+// WarmUp sets up n of the client's connections and sends a PING on each,
+// so they are dialed and past the handshake (HELLO, AUTH, SELECT) before
+// the first request needs them; they then go back to the pool, idle. n
+// must be at most the pool size: all n are held at once, so more would
+// wait for connections the pool can't open until ctx ends. It runs outside
+// any request, so its reads get PoolDialTimeout rather than the client's
+// call timeout. It returns how many connections are ready and the first
+// failure; once ctx is done it returns at once, with ctx's error, and
+// leaves the PINGs still waiting to return their connections when they
+// end. A connection whose dial was still running then lands in the pool
+// later, dialed but without its handshake, which the first call to use it
+// runs within its own timeout. Call it once at startup, before serving.
 func WarmUp(ctx context.Context, client *redis.Client, n int) (int, error) {
-	n = max(min(n, client.Options().PoolSize), 0)
+	n = max(n, 0)
 	// Shares the client's pool; never closed, since that would close it.
 	slow := client.WithTimeout(PoolDialTimeout)
 	// Every connection is held until all have answered or WarmUp returns,
@@ -270,10 +265,8 @@ func (l *Limiter) Allow(ctx context.Context, client string) (proxy.RateLimit, er
 	switch {
 	case err == nil:
 		l.breaker.record(time.Now(), probe, nil)
-	// A caller that gave up says nothing about Redis's health, and neither
-	// does a pooled connection found closed: go-redis drops it, and the
-	// next call gets another one or a new one.
-	case ctx.Err() == nil && fair && !isConnError(err):
+	// A caller that gave up says nothing about Redis's health.
+	case ctx.Err() == nil && fair:
 		l.breaker.record(time.Now(), probe, err)
 	case probe:
 		l.breaker.release()
@@ -299,24 +292,6 @@ func (l *Limiter) run(ctx context.Context, client string) (proxy.RateLimit, erro
 		Remaining:  res[1],
 		RetryAfter: time.Duration(res[2]) * time.Microsecond,
 	}, nil
-}
-
-// isConnError reports whether err says only that an open connection was
-// closed under the call, as every pooled connection is when Redis restarts
-// or fails over. Over TLS, and on Windows, go-redis can't check an idle
-// connection for that before using it. A dial error is not one: failing to
-// connect is what an outage looks like.
-func isConnError(err error) bool {
-	var op *net.OpError
-	if errors.As(err, &op) && op.Op == "dial" {
-		return false
-	}
-	for _, target := range []error{io.EOF, io.ErrUnexpectedEOF, net.ErrClosed, errReset, errAborted, errPipe} {
-		if errors.Is(err, target) {
-			return true
-		}
-	}
-	return false
 }
 
 // RouteClientLogs sends go-redis's own log output, such as a line for every

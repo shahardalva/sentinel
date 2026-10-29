@@ -447,6 +447,11 @@ func TestStartRateLimit(t *testing.T) {
 	if strings.Contains(out, "hunter2") {
 		t.Errorf("log contains the Redis password:\n%s", out)
 	}
+	// A Redis that didn't answer the ping isn't warmed: that could only
+	// wait out the warm-up's bound.
+	if strings.Contains(out, "redis pool warm") {
+		t.Errorf("warm-up ran after a failed ping:\n%s", out)
+	}
 }
 
 func upstreamNames(cfg config) []string {

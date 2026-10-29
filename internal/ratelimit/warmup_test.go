@@ -28,21 +28,6 @@ const coldDial = 300 * time.Millisecond
 // dial timeout covers it, the call's context does not get to wait for it.
 func coldRedis(t *testing.T, target string) string {
 	t.Helper()
-	return tlsRedis(t, target, coldDial)
-}
-
-// tlsRedis is coldRedis with a handshake delay of delay.
-func tlsRedis(t *testing.T, target string, delay time.Duration) string {
-	t.Helper()
-	url, _ := tlsRedisConns(t, target, delay)
-	return url
-}
-
-// tlsRedisConns is tlsRedis, also returning how many client connections
-// the proxy has open. It closes one as soon as its Redis connection ends.
-func tlsRedisConns(t *testing.T, target string, delay time.Duration) (string, *atomic.Int64) {
-	t.Helper()
-	open := new(atomic.Int64)
 	b, err := devcert.Generate([]string{"127.0.0.1"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -62,11 +47,9 @@ func tlsRedisConns(t *testing.T, target string, delay time.Duration) (string, *a
 			if err != nil {
 				return
 			}
-			open.Add(1)
 			go func() {
-				defer open.Add(-1)
 				defer c.Close()
-				time.Sleep(delay)
+				time.Sleep(coldDial)
 				tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
 				if tc.Handshake() != nil {
 					return
@@ -81,7 +64,7 @@ func tlsRedisConns(t *testing.T, target string, delay time.Duration) (string, *a
 			}()
 		}
 	}()
-	return "rediss://" + ln.Addr().String() + "?skip_verify=true", open
+	return "rediss://" + ln.Addr().String() + "?skip_verify=true"
 }
 
 // warmUp runs WarmUp for n connections with a generous bound and fails the
@@ -149,25 +132,6 @@ func TestWarmUp_ReadsNotCappedByCallTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { client.Close() })
 	warmUp(t, client, 4)
-}
-
-// WarmUp sets up at most the pool's size: holding more would wait for
-// connections that can't exist until ctx ends.
-func TestWarmUp_CappedByPoolSize(t *testing.T) {
-	mr := miniredis.RunT(t)
-	client, err := ratelimit.NewClient("redis://"+mr.Addr(), ratelimit.DefaultTimeout, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { client.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if ready, err := ratelimit.WarmUp(ctx, client, 16); ready != 4 || err != nil {
-		t.Errorf("WarmUp(16) on a pool of 4 = %d, %v; want 4, nil", ready, err)
-	}
-	if n := client.PoolStats().TotalConns; n != 4 {
-		t.Errorf("pool has %d connections, want 4", n)
-	}
 }
 
 // Only what WarmUp sets up: the pool doesn't keep idle connections of its
