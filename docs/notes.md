@@ -2,6 +2,62 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-10-29: make bench-gateway rejects unclean runs (#42)
+
+### Done (test first, then a mutation check per rule)
+- cmd/benchverdict, run after k6: rejects unless gateway-bench's own
+  counters show 0 fail_open (absent is 0), allowed summed over all series
+  equal to k6's http_reqs, no other outcome, and its log has "listening"
+  and no "redis not reachable at startup". No decisions metric, or output
+  it can't read, rejects: no metrics, no proof. One line either way,
+  "bench clean: N requests, N allowed, 0 fail_open" or "bench rejected:"
+  with every reason; exit 1 on a rejection, else k6's own status.
+- Prometheus text parsed with expfmt (prometheus/common, already in the
+  module graph, now direct), so label order and escaping don't matter.
+  Fixtures in cmd/benchverdict/testdata from a real scrape, plus a test
+  on a live internal/telemetry scrape, so a renamed metric fails a test,
+  not a bench.
+- Compose: k6-gateway extends k6 with a k6-out volume on /home/k6 and the
+  script from BENCH_K6_SCRIPT; make bench and the k6 service are
+  unchanged. bench/k6/gateway-verdict.js prints the summary and
+  gateway-bench:9464/metrics between "# benchverdict:" markers.
+
+### Decided
+- k6's count from K6_SUMMARY_EXPORT: k6's own http_reqs, machine-readable,
+  and the terminal summary stays (handleSummary in messages.js would
+  replace it). A file name unique per run, so a k6 that wrote none can't
+  pass with an old one.
+- Metrics fetched by a second k6 run on the compose network: no published
+  port, no new image, and gateway-bench is distroless (nothing to docker
+  exec). Not Prometheus: its last scrape can miss the end of the run.
+- The startup-log rule is checked after k6 too, not before it, as asked;
+  failing fast before the load would save the 105 s of a run that will be
+  rejected anyway. Revisit if it rejects often.
+
+### Learned (hypothesis, not verified: needs a bench run)
+- "redis not reachable at startup" despite depends_on redis
+  service_healthy: the startup Ping has a 1 s context, but
+  ratelimit.NewClient sets DialTimeout and ReadTimeout to
+  DefaultTimeout, 50 ms, and net.Dialer's Timeout includes the DNS
+  lookup. So the first connection of a fresh container gets 50 ms for
+  "redis" through Docker's embedded DNS (127.0.0.11), the TCP connect,
+  HELLO and SELECT 1, on a Docker Desktop VM busy right after --build
+  and recreating its dependencies. "i/o timeout" is that dialer's
+  timeout; a Redis that wasn't up would say "connection refused", and
+  the healthcheck had already passed redis-cli ping. DB 1 adds only the
+  SELECT round trip. The breaker trips at 100 and 500 req/s fit the same
+  budget: the pool (up to 128) dials new connections as concurrency
+  rises, each with a DNS lookup under 50 ms, with k6 on the same CPU.
+- To confirm: the WARN's error field says which step timed out ("lookup
+  redis on 127.0.0.11:53" is DNS, "dial tcp <ip>:6379" the connect,
+  "read tcp" a reply), and the breaker's open lines should cluster at
+  stage starts (0 s, 35 s, 70 s). No startup change until then.
+
+### Next
+- Re-run the RESULTS.md baselines under the check (#42 part 3).
+- If the hypothesis holds: a warm-up stage, or a startup Ping that gets
+  more than 50 ms to dial (#42 part 1).
+
 ## 2026-10-29: v0.6.0 polish (review of PR #51)
 
 ### Done (behavioral items test first, then a mutation check)

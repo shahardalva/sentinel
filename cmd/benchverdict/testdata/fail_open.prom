@@ -1,0 +1,10 @@
+# HELP sentinel_ratelimit_decisions_total Rate limit outcomes, one per request.
+# TYPE sentinel_ratelimit_decisions_total counter
+sentinel_ratelimit_decisions_total{otel_scope_name="github.com/shahardalva/sentinel/internal/telemetry",otel_scope_schema_url="",otel_scope_version="",outcome="allowed"} 42823
+sentinel_ratelimit_decisions_total{otel_scope_name="github.com/shahardalva/sentinel/internal/telemetry",otel_scope_schema_url="",otel_scope_version="",outcome="fail_open"} 4058
+# HELP sentinel_requests_total Requests handled.
+# TYPE sentinel_requests_total counter
+sentinel_requests_total{otel_scope_name="github.com/shahardalva/sentinel/internal/telemetry",otel_scope_schema_url="",otel_scope_version="",protocol="anthropic",status_class="2xx",upstream="anthropic"} 47959
+# HELP target_info Target metadata
+# TYPE target_info gauge
+target_info{service_name="sentinel"} 1

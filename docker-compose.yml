@@ -318,7 +318,25 @@ services:
         read_only: true
     command: ["run", "/scripts/messages.js"]
 
+  # k6 for make bench-gateway, which runs it twice. First messages.js, with
+  # K6_SUMMARY_EXPORT writing k6's summary into its working directory, the
+  # k6-out volume. Then, with BENCH_K6_SCRIPT=gateway-verdict.js, a script
+  # that prints that summary and gateway-bench's /metrics, fetched here on
+  # the compose network, for cmd/benchverdict. The volume is mounted on
+  # /home/k6, which the image owns as the k6 user: a new named volume takes
+  # the ownership of the directory it is mounted on, so k6 can write to it.
+  # The script name is interpolated rather than passed as an argument,
+  # since Git Bash rewrites an argument that starts with "/".
+  k6-gateway:
+    extends:
+      service: k6
+    profiles: [bench]
+    volumes:
+      - k6-out:/home/k6
+    command: ["run", "/scripts/${BENCH_K6_SCRIPT:-messages.js}"]
+
 volumes:
+  k6-out:
   mockupstream-key:
   postgres-data:
   prometheus-data:
