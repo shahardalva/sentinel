@@ -28,6 +28,16 @@ const coldDial = 300 * time.Millisecond
 // dial timeout covers it, the call's context does not get to wait for it.
 func coldRedis(t *testing.T, target string) string {
 	t.Helper()
+	url, _ := tlsRedisConns(t, target, coldDial)
+	return url
+}
+
+// tlsRedisConns is coldRedis with a handshake delay of delay, also
+// returning how many client connections the proxy has open. It closes one
+// as soon as its Redis connection ends, as a restarting Redis does.
+func tlsRedisConns(t *testing.T, target string, delay time.Duration) (string, *atomic.Int64) {
+	t.Helper()
+	open := new(atomic.Int64)
 	b, err := devcert.Generate([]string{"127.0.0.1"}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -47,9 +57,11 @@ func coldRedis(t *testing.T, target string) string {
 			if err != nil {
 				return
 			}
+			open.Add(1)
 			go func() {
+				defer open.Add(-1)
 				defer c.Close()
-				time.Sleep(coldDial)
+				time.Sleep(delay)
 				tc := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}})
 				if tc.Handshake() != nil {
 					return
@@ -64,7 +76,7 @@ func coldRedis(t *testing.T, target string) string {
 			}()
 		}
 	}()
-	return "rediss://" + ln.Addr().String() + "?skip_verify=true"
+	return "rediss://" + ln.Addr().String() + "?skip_verify=true", open
 }
 
 // warmUp runs WarmUp for n connections with a generous bound and fails the
@@ -163,6 +175,12 @@ func TestNewClient_Options(t *testing.T) {
 	if opts.DialTimeout != ratelimit.PoolDialTimeout || opts.ReadTimeout != ratelimit.DefaultTimeout {
 		t.Errorf("DialTimeout %v, ReadTimeout %v; want %v, %v",
 			opts.DialTimeout, opts.ReadTimeout, ratelimit.PoolDialTimeout, ratelimit.DefaultTimeout)
+	}
+	// One immediate retry: a call that got a dead pooled connection tries
+	// another at once, instead of sleeping a backoff inside its timeout.
+	if opts.MaxRetries != 1 || opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 {
+		t.Errorf("MaxRetries %d, backoff %v-%v; want 1, no backoff",
+			opts.MaxRetries, opts.MinRetryBackoff, opts.MaxRetryBackoff)
 	}
 	// In auto mode, connections handshaking at once in WarmUp race in
 	// go-redis (see NewClient).
