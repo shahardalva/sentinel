@@ -103,7 +103,7 @@ type Config struct {
 	// Timeout bounds each Redis call; zero selects DefaultTimeout.
 	Timeout time.Duration
 	// BreakerCooldown is how long Redis is skipped once BreakerThreshold
-	// calls in a row have failed; zero selects DefaultBreakerCooldown.
+	// failures in a row have counted; zero selects DefaultBreakerCooldown.
 	BreakerCooldown time.Duration
 	// Logger records the breaker opening and closing; nil discards.
 	Logger *slog.Logger
@@ -137,13 +137,18 @@ func New(cfg Config) (*Limiter, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	opts := cfg.Client.Options() // MaxRetries already normalized by go-redis
 	return &Limiter{
 		client:   cfg.Client,
 		capacity: cfg.PerMinute,
 		period:   float64(time.Minute/time.Microsecond) / float64(cfg.PerMinute),
 		timeout:  cfg.Timeout,
-		breaker:  &breaker{logger: cfg.Logger, cooldown: cfg.BreakerCooldown},
-		slots:    make(chan struct{}, cfg.Client.Options().PoolSize),
+		breaker: &breaker{
+			logger:    cfg.Logger,
+			cooldown:  cfg.BreakerCooldown,
+			connSlack: opts.PoolSize / (opts.MaxRetries + 1),
+		},
+		slots: make(chan struct{}, opts.PoolSize),
 	}, nil
 }
 
@@ -170,6 +175,15 @@ func NewClient(url string, timeout time.Duration, poolSize int) (*redis.Client, 
 	if poolSize > 0 {
 		opts.PoolSize = poolSize
 	}
+	// A call that hits a dead pooled connection (after a Redis restart)
+	// tries one more at once. go-redis's default sleeps 10 ms to 1 s
+	// between up to 3 retries, under the call's context, which turned a
+	// fast connection error into a timeout. One retry, not 3: with no sleep,
+	// each retry is another command or connection against a failing Redis.
+	// These override max_retries and *_retry_backoff in the URL.
+	opts.MaxRetries = 1
+	opts.MinRetryBackoff = -1 // none
+	opts.MaxRetryBackoff = -1
 	opts.DisableIdentity = true // skip CLIENT SETINFO on connect
 	// Maintenance notifications are a Redis Cloud and Enterprise feature.
 	// In go-redis's default "auto" mode every new connection asks for them,
@@ -262,16 +276,19 @@ func (l *Limiter) Allow(ctx context.Context, client string) (proxy.RateLimit, er
 	}
 	// A call left with less than half the timeout after waiting didn't get a
 	// fair chance; if it times out, that's the wait's fault, not Redis's.
+	// One clock read for both: a pause between two could give a call
+	// already out of time a start after the stall's counted failure.
 	d, _ := callCtx.Deadline()
-	fair := time.Until(d) >= l.timeout/2
+	start := time.Now()
+	fair := d.Sub(start) >= l.timeout/2
 
 	res, err := l.run(callCtx, client)
 	switch {
 	case err == nil:
-		l.breaker.record(time.Now(), probe, nil)
+		l.breaker.record(start, time.Now(), probe, nil)
 	// A caller that gave up says nothing about Redis's health.
 	case ctx.Err() == nil && fair:
-		l.breaker.record(time.Now(), probe, err)
+		l.breaker.record(start, time.Now(), probe, err)
 	case probe:
 		l.breaker.release()
 	}

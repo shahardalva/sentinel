@@ -248,6 +248,14 @@ tool policies, and writes an audit log.
   startup. After 5 Redis failures in a row a circuit breaker skips Redis
   for 5s and applies the fail mode at once, then lets one request try
   again; opening and closing are logged. Only that probe can close it.
+  A failure counts only if its call started after the last counted one
+  ended (one stall = one failure; only counted ones move that line).
+  Connection errors (isConnError: EOF, reset, aborted, broken pipe,
+  net.ErrClosed; never an OpError "dial", though a failed TLS handshake
+  or HELLO on a new connection can be one) don't count up to connSlack =
+  PoolSize/(MaxRetries+1) since the last success, and a probe getting
+  one is released; past it they count and a probe rearms the cooldown.
+  NewClient sets MaxRetries 1 and no retry backoff (overrides the URL).
   When every Redis connection stays busy for the 50 ms, the request gets
   the fail mode but the breaker doesn't count it. The 50 ms is the call's
   context; new connections are dialed outside it (ratelimit.PoolDialTimeout
@@ -257,9 +265,8 @@ tool policies, and writes an audit log.
   pool warm" ready=N, or WARN "redis pool warm-up incomplete" with ready
   and want, and startup goes on; a failed ping skips it. A signal during
   either logs INFO "startup interrupted" (step "redis ping" or "redis
-  warm-up"). go-redis doesn't check idle TLS connections, so a Redis
-  restart under a warm pool can open the breaker (deferred to the
-  circuit-breaker work). NewClient
+  warm-up"). go-redis doesn't check idle TLS connections; the connection
+  error slack covers a restart under a full warm pool. NewClient
   disables go-redis maint notifications (auto mode races across
   concurrent Conn handshakes). A client that disconnects
   during the check is logged as 499, not as a Redis failure.

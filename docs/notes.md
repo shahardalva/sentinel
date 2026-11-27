@@ -2,6 +2,50 @@
 
 Newest entries first. Short: what was done, what was decided, what's next.
 
+## 2026-11-22: the Redis breaker counts failures, not calls (#57, #55, #41)
+
+### Done
+- A failure counts only if its call started after the last counted
+  failure ended: one stall failing every call in flight is one failure.
+  A dead Redis that times out opens it after 5 rounds (~250 ms).
+- Connection errors bounded: up to PoolSize/(MaxRetries+1) since the
+  last success don't count (a restart's dead pooled connections), and a
+  probe getting one is released; past it they count and rearm.
+- NewClient: MaxRetries 1, no retry backoff.
+- Tests from the issue's design, against go-redis and fake endpoints
+  (accept-close, reset, maxclients, TLS close and handshake reset);
+  isConnError checked on errors go-redis really returns, under the
+  call's deadline. Mutation checks: 12 of 12 caught, including start == end
+  in Allow (the #55 regression), which the first round missed: every
+  generation test called record with made-up times. go-reviewer found
+  that; TestBreaker_StallThroughAllowCountsOnce now goes through Allow.
+
+### Learned
+- #41 was the test, not the breaker: 16 goroutines spinning on an open
+  breaker (it answers in nanoseconds) starved miniredis and the probe
+  under -race on one CPU, so the probe timed out every cooldown. With a
+  100 us pause on ErrCircuitOpen: 40 of 40 at -cpu 1,2.
+- go-redis stops dialing after PoolSize failed dials and tries one dial
+  a second (tryDial), so recovery after a Redis outage can take ~1 s
+  plus a cooldown. The test waits for it instead of a fixed time.
+- A TLS handshake failure (close or reset) times out under the call's
+  deadline (the pool's dial retries outlast it) rather than giving a
+  connection error, so it counts at once. Pinned in TestIsConnError.
+- Windows: ERROR_NETNAME_DELETED and WSAESHUTDOWN are resets too;
+  syscall.EPIPE there is an invented value Winsock never returns.
+
+### Review findings left as issues
+- A saturated pool (over ~PoolSize/(timeout/2) req/s against a Redis
+  dropping packets) can keep the breaker from opening: every slot
+  waiter fails the fair check.
+- After a DNS failover, probes drain black-holed idle connections one
+  per cooldown.
+- Connection errors absorbed by the slack show in no metric.
+
+### Next
+- Smoke: make bench-gateway pairs, check fail_open stays 0 at load start.
+- Upstream circuit breaker with a metric (PR 2).
+
 ## 2026-10-29: bench results under benchverdict
 
 ### Done
