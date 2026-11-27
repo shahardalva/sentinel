@@ -276,10 +276,12 @@ func (l *Limiter) Allow(ctx context.Context, client string) (proxy.RateLimit, er
 	}
 	// A call left with less than half the timeout after waiting didn't get a
 	// fair chance; if it times out, that's the wait's fault, not Redis's.
+	// One clock read for both: a pause between two could give a call
+	// already out of time a start after the stall's counted failure.
 	d, _ := callCtx.Deadline()
-	fair := time.Until(d) >= l.timeout/2
-
 	start := time.Now()
+	fair := d.Sub(start) >= l.timeout/2
+
 	res, err := l.run(callCtx, client)
 	switch {
 	case err == nil:

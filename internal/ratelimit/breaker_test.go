@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,17 +162,22 @@ func TestBreaker_RestartUnderWarmPool(t *testing.T) {
 
 	var failed int
 	var last error
+	kinds := map[string]int{} // so a flake says whether timeouts opened it
 	for range 2 * pool {
 		if _, last = l.Allow(context.Background(), "client"); last != nil {
 			failed++
+			kinds[last.Error()]++
 		}
 		time.Sleep(10 * time.Millisecond) // a steady trickle of requests
 	}
 	if failed == 0 {
 		t.Error("no call hit a dead connection; the test did not exercise the restart")
 	}
+	// All pool/2 failing calls are connection errors, exactly the slack; a
+	// retry whose new TLS connection takes over the timeout to set up is a
+	// timeout instead, which counts. Five of those open it.
 	if l.BreakerOpen() || strings.Contains(logs.String(), "redis circuit open") {
-		t.Errorf("breaker opened after a restart (%d calls failed):\n%s", failed, logs)
+		t.Errorf("breaker opened after a restart (%d calls failed, by error: %v):\n%s", failed, kinds, logs)
 	}
 	if last != nil {
 		t.Errorf("last call: %v; want the pool healed", last)
@@ -187,6 +193,56 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// One stall through Allow, not record with made-up times: every call in
+// flight times out together and must count once, so 2x BreakerThreshold
+// of them leave the breaker closed. Calls that then start one after
+// another and keep failing open it.
+func TestBreaker_StallThroughAllowCountsOnce(t *testing.T) {
+	mr := miniredis.RunT(t)
+	delay := new(atomic.Int64)
+	client, err := ratelimit.NewClient("redis://"+slowRedis(t, mr.Addr(), delay), breakerTimeout, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	logs := new(syncBuffer)
+	l, err := ratelimit.New(ratelimit.Config{Client: client, PerMinute: 1_000_000, Timeout: breakerTimeout,
+		BreakerCooldown: time.Minute, Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 2 * ratelimit.BreakerThreshold
+	warmUp(t, client, n) // so every call has a connection and starts at once
+
+	delay.Store(int64(breakerTimeout * 3 / 2)) // the stall: no reply within the timeout
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			_, err := l.Allow(context.Background(), "client")
+			errs <- err
+		}()
+	}
+	for range n {
+		if err := <-errs; err == nil || errors.Is(err, ratelimit.ErrBusy) || errors.Is(err, ratelimit.ErrCircuitOpen) {
+			t.Fatalf("stalled call: err = %v, want a Redis timeout", err)
+		}
+	}
+	if l.BreakerOpen() || strings.Contains(logs.String(), "redis circuit open") {
+		t.Fatalf("%d calls in one stall opened the breaker:\n%s", n, logs)
+	}
+
+	// The stall goes on: sequential calls are new failures each.
+	for i := range ratelimit.BreakerThreshold {
+		if _, err := l.Allow(context.Background(), "client"); errors.Is(err, ratelimit.ErrCircuitOpen) {
+			if i < ratelimit.BreakerThreshold-1 {
+				t.Errorf("opened after %d sequential calls, want %d (the stall counts as 1)", i, ratelimit.BreakerThreshold-1)
+			}
+			return
+		}
+	}
+	t.Error("a stall that went on did not open the breaker")
 }
 
 func TestBreaker_ProbeAfterCooldownCloses(t *testing.T) {

@@ -182,6 +182,21 @@ func TestBreaker_ProbeConnErrorRearmsPastSlack(t *testing.T) {
 	}
 }
 
+// While open only the probe decides, connection errors included: calls in
+// flight when it opened must not use up the slack, or the probes after a
+// restart would find it gone.
+func TestBreaker_OpenIgnoresInFlightConnErrors(t *testing.T) {
+	b := newBreaker(time.Second)
+	b.connSlack = 4
+	now := trip(t, b, time.Now())
+	for range 2 * b.connSlack {
+		now = fail(b, now, false, errConn)
+	}
+	if b.connFailures != 0 {
+		t.Errorf("connFailures = %d after in-flight calls while open, want 0", b.connFailures)
+	}
+}
+
 // Many requests at once, across tripping, probing and closing: at most one
 // probe is ever in flight, and the breaker ends closed once Redis recovers.
 func TestBreaker_ConcurrentSingleProbe(t *testing.T) {

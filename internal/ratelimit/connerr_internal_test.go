@@ -107,9 +107,13 @@ func TestIsConnError(t *testing.T) {
 	}{
 		{"accept and close", "redis://" + addr(acceptClose), true},
 		{"reset after HELLO", "redis://" + addr(acceptReadReset), true},
-		{"TLS accept and close", "rediss://" + addr(acceptClose) + "?skip_verify=true", true},
-		{"TLS reset in handshake", "rediss://" + addr(acceptReadReset) + "?skip_verify=true", true},
-		// What an outage looks like: these count from the first one.
+		// What an outage looks like: these count from the first one. A
+		// TLS handshake fails inside the dial, which go-redis retries in
+		// the background past the call's deadline, so the call times out.
+		// (Once failed dials reach PoolSize, go-redis replays the last one
+		// at once, and that can be a connection error: the slack bounds it.)
+		{"TLS accept and close", "rediss://" + addr(acceptClose) + "?skip_verify=true", false},
+		{"TLS reset in handshake", "rediss://" + addr(acceptReadReset) + "?skip_verify=true", false},
 		{"stalled", "redis://" + addr(stall), false},
 		{"refused", "redis://" + refused(), false},
 	}
@@ -120,7 +124,10 @@ func TestIsConnError(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer client.Close()
-			err = client.Ping(context.Background()).Err()
+			// The Limiter's budget, so the error is the one a call gets.
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			err = client.Ping(ctx).Err()
 			if err == nil {
 				t.Fatal("ping succeeded")
 			}
@@ -137,10 +144,12 @@ func TestIsConnError(t *testing.T) {
 	}
 }
 
-// An endpoint that accepts and then closes every connection: each failure
-// is a connection error, but past the slack they are an outage. The breaker
-// opens within connSlack+BreakerThreshold calls, and then stops the
-// connections too.
+// An endpoint that accepts and then closes every connection. Over plain
+// TCP each failure is a connection error, and past the slack they are an
+// outage; over TLS the handshake fails in the dial and the calls time out,
+// which counts at once (see TestIsConnError). Either way the breaker opens
+// within connSlack+BreakerThreshold calls, and then stops the connections
+// too.
 func TestBreaker_AcceptThenClose(t *testing.T) {
 	shapes := []struct {
 		name   string
@@ -172,6 +181,18 @@ func TestBreaker_AcceptThenClose(t *testing.T) {
 			if !l.BreakerOpen() {
 				t.Fatalf("breaker still closed after %d calls (%d accepts)", bound, accepts.Load())
 			}
+			l.breaker.mu.Lock()
+			conn := l.breaker.connFailures
+			l.breaker.mu.Unlock()
+			if s.tls && conn != 0 {
+				t.Errorf("TLS: %d connection errors, want 0 (opened by timeouts)", conn)
+			}
+			if !s.tls && conn <= l.breaker.connSlack {
+				t.Errorf("%d connection errors, want past the slack of %d", conn, l.breaker.connSlack)
+			}
+			// MaxRetries+1 connections per call holds where dials succeed;
+			// a failed dial is tried up to 5 times, which the TLS cases stay
+			// under only because they open after BreakerThreshold calls.
 			tries := int64(client.Options().MaxRetries + 1)
 			if n := accepts.Load(); n > tries*int64(bound) {
 				t.Errorf("%d accepts for %d calls, want at most %d", n, bound, tries*int64(bound))

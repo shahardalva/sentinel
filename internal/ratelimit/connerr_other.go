@@ -4,8 +4,6 @@ package ratelimit
 
 import "syscall"
 
-var (
-	errReset   error = syscall.ECONNRESET
-	errAborted error = syscall.ECONNABORTED
-	errPipe    error = syscall.EPIPE
-)
+// connErrnos are the system errors that mean an open connection was
+// closed or reset under a call.
+var connErrnos = []error{syscall.ECONNRESET, syscall.ECONNABORTED, syscall.EPIPE}

@@ -149,7 +149,12 @@ func isConnError(err error) bool {
 	if errors.As(err, &op) && op.Op == "dial" {
 		return false
 	}
-	for _, target := range []error{io.EOF, io.ErrUnexpectedEOF, net.ErrClosed, errReset, errAborted, errPipe} {
+	for _, target := range []error{io.EOF, io.ErrUnexpectedEOF, net.ErrClosed} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	for _, target := range connErrnos {
 		if errors.Is(err, target) {
 			return true
 		}

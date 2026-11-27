@@ -251,7 +251,8 @@ tool policies, and writes an audit log.
   A failure counts only if its call started after the last counted one
   ended (one stall = one failure; only counted ones move that line).
   Connection errors (isConnError: EOF, reset, aborted, broken pipe,
-  net.ErrClosed; never a dial error) don't count up to connSlack =
+  net.ErrClosed; never an OpError "dial", though a failed TLS handshake
+  or HELLO on a new connection can be one) don't count up to connSlack =
   PoolSize/(MaxRetries+1) since the last success, and a probe getting
   one is released; past it they count and a probe rearms the cooldown.
   NewClient sets MaxRetries 1 and no retry backoff (overrides the URL).
